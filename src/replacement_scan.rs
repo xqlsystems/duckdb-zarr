@@ -47,8 +47,13 @@ fn looks_like_zarr(name: &str) -> bool {
     let trimmed = name.trim_end_matches('/');
     let lower = trimmed.to_ascii_lowercase();
 
-    // HTTP/HTTPS: trust the .zarr suffix; can't probe the filesystem.
-    if lower.starts_with("http://") || lower.starts_with("https://") {
+    // Remote URIs: trust the .zarr suffix; probing requires a live DuckDB connection.
+    if lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("s3://")
+        || lower.starts_with("gs://")
+        || lower.starts_with("az://")
+    {
         return lower.ends_with(".zarr");
     }
 

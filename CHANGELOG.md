@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+**Phase 4 — Remote stores, community extension**
+- Storage adapter shim: dispatch `s3://`, `gs://`, `az://` paths to DuckDB's FileSystem FFI, enabling S3/GCS/Azure stores via `httpfs` + secrets manager (#19, #20)
+- Community extension manifest + submission to duckdb/community-extensions (#22)
+
 **Phase 3 — HTTP/S stores, multi-dim-group selection**
 - HTTP/HTTPS store support via `zarrs_http` (#71)
 - `read_zarr(path, dims=[...])` named parameter for multi-dim-group selection (#70, #14)

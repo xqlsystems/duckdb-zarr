@@ -6,8 +6,8 @@ use duckdb::core::{DataChunkHandle, LogicalTypeId};
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
 
 use crate::zarr_reader::meta::{
-    build_column_defs, build_work_units, infer_dim_groups, load_coord_array, open_array,
-    open_store, ZarrArray, ZarrStore,
+    build_column_defs, build_work_units, extract_file_system, infer_dim_groups, load_coord_array,
+    open_array, open_store, ZarrArray, ZarrStore,
 };
 use crate::zarr_reader::types::{ColumnDef, CoordArray, DimGroup, WorkUnit, ZarrDtype};
 
@@ -79,7 +79,8 @@ impl VTab for ReadZarrVTab {
             .map(|v| parse_dims_param(&v.to_string()))
             .transpose()?;
 
-        let store = open_store(&store_path)?;
+        let fs = unsafe { extract_file_system(bind) };
+        let store = open_store(&store_path, Some(fs))?;
         let array_names = crate::zarr_reader::meta::list_array_names(&store_path, &store)?;
 
         if array_names.is_empty() {
