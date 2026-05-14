@@ -93,8 +93,14 @@ impl ReadableStorageTraits for DuckDbStore {
                 continue;
             }
             let mut buf = vec![0u8; length as usize];
-            unsafe {
-                duckdb_file_handle_read(handle, buf.as_mut_ptr().cast(), length as i64);
+            let bytes_read = unsafe {
+                duckdb_file_handle_read(handle, buf.as_mut_ptr().cast(), length as i64)
+            };
+            if bytes_read < 0 || bytes_read as u64 != length {
+                results.push(Err(StorageError::Other(format!(
+                    "read of {length} bytes at offset {offset} returned {bytes_read}"
+                ))));
+                continue;
             }
             results.push(Ok(Bytes::from(buf)));
         }

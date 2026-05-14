@@ -29,6 +29,11 @@ pub type ZarrArray = Array<dyn ReadableStorageTraits>;
 pub unsafe fn extract_file_system(bind: &duckdb::vtab::BindInfo) -> duckdb_file_system {
     // SAFETY: BindInfo is `struct BindInfo { ptr: duckdb_bind_info }` — one pointer-sized field,
     // no padding, offset 0. transmute_copy reads those pointer bytes as a duckdb_bind_info.
+    // The assert catches any future duckdb-rs version that adds fields to BindInfo.
+    const _: () = assert!(
+        std::mem::size_of::<duckdb::vtab::BindInfo>()
+            == std::mem::size_of::<duckdb::ffi::duckdb_bind_info>()
+    );
     let raw: duckdb::ffi::duckdb_bind_info = std::mem::transmute_copy(bind);
     let mut ctx: duckdb_client_context = std::ptr::null_mut();
     duckdb_table_function_get_client_context(raw, &mut ctx);
@@ -131,7 +136,7 @@ fn list_array_names_remote(store: &ZarrStore) -> Result<Vec<String>, Box<dyn std
     let group = Group::open(store.clone(), "/")?;
     let consolidated = group.consolidated_metadata().ok_or(
         "remote Zarr store has no consolidated metadata in zarr.json; \
-         write with consolidated=True or use a local path"
+         re-write the store with consolidated=True (xarray: zarr.consolidate_metadata(store))"
     )?;
     let mut names: Vec<String> = consolidated
         .metadata
