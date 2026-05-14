@@ -71,6 +71,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `ColumnDef.dim_idx: Option<usize>` replaces fragile `dim_col_k` counter in `fill_chunk_slice` (#81)
 
 ### Changed
+- S3/GCS/Azure stores without consolidated metadata produce unhelpful error — no fallback listing (#161)
+- description.yml extended_description omits S3/GCS/Azure — manifest doesn't document Phase 4 feature (#159)
+- description.yml has wrong language and build fields — will break community extension CI (#158)
+- extract_file_system uses transmute_copy with no compile-time layout assertion — silent UB risk on duckdb-rs upgrade (#157)
+- Duplicate test sections in read_zarr.test — merge artifact produces 4 redundant section blocks (#156)
+- duckdb_file_handle_read return value unchecked — silent data corruption on read failure (#155)
 - read_zarr dims= named parameter for multi-dim-group selection (#70)
 - Write comprehensive SQL tests mirroring xarray-sql test_sql.py (#124)
 - wire generate_fixtures as Makefile test prerequisite so CI generates zarr fixtures before running tests (#127)
