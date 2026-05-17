@@ -1,0 +1,50 @@
+extension:
+  name: duckdb_zarr
+  description: Query Zarr array stores (v2 and v3) with SQL — read xarray-convention datasets as tables
+  version: 0.1.0
+  language: Rust
+  build: cargo
+  license: MIT
+  maintainers:
+    - alxmrs
+
+repo:
+  github: alxmrs/duckdb-zarr
+  # Update ref to the tagged release commit before submitting the PR to duckdb/community-extensions.
+  ref: main
+
+docs:
+  hello_world: |
+    -- Read a local Zarr store as a table
+    SELECT time, lat, lon, temperature
+    FROM read_zarr('path/to/store.zarr')
+    LIMIT 10;
+  extended_description: |
+    The `duckdb_zarr` extension exposes [Zarr](https://zarr.dev/) array stores as SQL tables,
+    following the [xarray](https://xarray.dev/) dimension convention used by climate science,
+    geospatial, and bioimaging datasets.
+
+    **Functions**
+
+    - `read_zarr(path)` — scan all rows from a single-group Zarr store.
+    - `read_zarr(path, dims=['time','lat','lon'])` — select one dim group from a multi-group store.
+    - `read_zarr_metadata(path)` — inspect array names, dtypes, shapes, and roles.
+    - `read_zarr_groups(path)` — enumerate distinct dimension groups in a store.
+
+    **Automatic path interception**
+
+    Any path ending in `.zarr` is automatically routed to `read_zarr`:
+
+    ```sql
+    SELECT * FROM 'era5.zarr' LIMIT 5;
+    SELECT * FROM 'https://example.org/data.zarr' LIMIT 5;
+    ```
+
+    **Supported formats**
+
+    - Zarr v2 and v3
+    - Codecs: gzip, zstd, blosc, crc32c, sharding, transpose, bytes (big/little endian)
+    - CF conventions: `scale_factor`/`add_offset` packed integers, `_FillValue`/`missing_value` null masking
+    - Local filesystem, HTTP/HTTPS, S3, GCS, and Azure Blob Storage
+      (consolidated metadata required for remote array listing; S3/GCS/Azure credentials
+      are read from DuckDB's secrets manager — `CREATE SECRET ... TYPE S3` etc.)

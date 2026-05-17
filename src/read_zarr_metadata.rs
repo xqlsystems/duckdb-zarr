@@ -5,7 +5,7 @@ use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
 
 use crate::zarr_reader::meta::{
     collect_auxiliary_coords, collect_bounds_vars, dimension_names as get_dim_names,
-    list_array_names, open_array, open_store,
+    extract_file_system, list_array_names, open_array, open_store,
 };
 
 /// One metadata row per array.
@@ -50,7 +50,8 @@ impl VTab for ReadZarrMetaVTab {
         bind.add_result_column("role", LogicalTypeId::Varchar.into());
 
         let store_path = bind.get_parameter(0).to_string();
-        let store = open_store(&store_path)?;
+        let fs = unsafe { extract_file_system(bind) };
+        let store = open_store(&store_path, Some(fs))?;
         let array_names = list_array_names(&store_path, &store)?;
 
         let aux_coords = collect_auxiliary_coords(&store, &array_names);

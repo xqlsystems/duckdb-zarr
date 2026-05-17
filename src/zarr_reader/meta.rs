@@ -3,10 +3,15 @@ use std::path::Path;
 use std::sync::Arc;
 
 use base64::Engine as _;
+use duckdb::ffi::{
+    duckdb_client_context, duckdb_client_context_get_file_system, duckdb_destroy_client_context,
+    duckdb_destroy_file_system, duckdb_file_system, duckdb_table_function_get_client_context,
+};
 use zarrs::array::Array;
 use zarrs::filesystem::FilesystemStore;
 use zarrs::storage::ReadableStorageTraits;
 
+use super::duckdb_store::DuckDbStore;
 use super::types::{
     ColumnDef, ColumnEncoding, CoordArray, DimGroup, FillSentinel, WorkUnit, ZarrDtype,
 };
@@ -14,21 +19,77 @@ use super::types::{
 pub type ZarrStore = Arc<dyn ReadableStorageTraits>;
 pub type ZarrArray = Array<dyn ReadableStorageTraits>;
 
-pub fn open_store(path: &str) -> Result<ZarrStore, Box<dyn std::error::Error>> {
-    if path.starts_with("http://") || path.starts_with("https://") {
+/// Extract a DuckDB FileSystem handle from a table-function BindInfo.
+///
+/// The returned handle must be passed to [`open_store`], which either adopts it (remote stores)
+/// or destroys it immediately (local / HTTP stores).
+///
+/// # Safety
+/// Must be called from within a DuckDB table-function bind callback.
+pub unsafe fn extract_file_system(bind: &duckdb::vtab::BindInfo) -> duckdb_file_system {
+    // SAFETY: BindInfo is `struct BindInfo { ptr: duckdb_bind_info }` — one pointer-sized field,
+    // no padding, offset 0. transmute_copy reads those pointer bytes as a duckdb_bind_info.
+    // The assert catches any future duckdb-rs version that adds fields to BindInfo.
+    const _: () = assert!(
+        std::mem::size_of::<duckdb::vtab::BindInfo>()
+            == std::mem::size_of::<duckdb::ffi::duckdb_bind_info>()
+    );
+    let raw: duckdb::ffi::duckdb_bind_info = std::mem::transmute_copy(bind);
+    let mut ctx: duckdb_client_context = std::ptr::null_mut();
+    duckdb_table_function_get_client_context(raw, &mut ctx);
+    let fs = duckdb_client_context_get_file_system(ctx);
+    duckdb_destroy_client_context(&mut ctx);
+    fs
+}
+
+pub fn is_remote_scheme(path: &str) -> bool {
+    let l = path.to_ascii_lowercase();
+    l.starts_with("http://")
+        || l.starts_with("https://")
+        || l.starts_with("s3://")
+        || l.starts_with("gs://")
+        || l.starts_with("az://")
+}
+
+/// Open a Zarr store.
+///
+/// - HTTP/HTTPS → `zarrs_http::HTTPStore` (no DuckDB filesystem needed)
+/// - S3/GCS/Azure → `DuckDbStore` backed by the provided `file_system` handle
+///   (the store takes ownership and destroys it on drop)
+/// - Local path → `zarrs::FilesystemStore` (destroys the handle if provided)
+pub fn open_store(
+    path: &str,
+    file_system: Option<duckdb_file_system>,
+) -> Result<ZarrStore, Box<dyn std::error::Error>> {
+    let lower = path.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        if let Some(mut fs) = file_system {
+            unsafe { duckdb_destroy_file_system(&mut fs) };
+        }
         Ok(Arc::new(zarrs_http::HTTPStore::new(path)?))
+    } else if lower.starts_with("s3://") || lower.starts_with("gs://") || lower.starts_with("az://") {
+        let fs = file_system.ok_or(
+            "remote store requires a DuckDB FileSystem handle (call from a table function bind)",
+        )?;
+        Ok(Arc::new(DuckDbStore::new(fs, path)))
     } else {
+        if let Some(mut fs) = file_system {
+            unsafe { duckdb_destroy_file_system(&mut fs) };
+        }
         Ok(Arc::new(FilesystemStore::new(path)?))
     }
 }
 
 /// List the names of all top-level arrays in the Zarr store root.
 ///
-/// For local paths: scans for child directories containing `zarr.json` (v3) or `.zarray` (v2),
-/// checking `node_type` to skip nested groups. For http/https URLs: reads consolidated metadata.
-pub fn list_array_names(store_path: &str, store: &ZarrStore) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    if store_path.starts_with("http://") || store_path.starts_with("https://") {
-        list_array_names_http(store)
+/// - Local paths: scans for child directories containing `zarr.json` (v3) or `.zarray` (v2).
+/// - Remote paths (HTTP/HTTPS/S3/GCS/Azure): reads consolidated metadata from the root zarr.json.
+pub fn list_array_names(
+    store_path: &str,
+    store: &ZarrStore,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    if is_remote_scheme(store_path) {
+        list_array_names_remote(store)
     } else {
         list_array_names_local(store_path)
     }
@@ -68,14 +129,14 @@ fn list_array_names_local(store_path: &str) -> Result<Vec<String>, Box<dyn std::
     Ok(names)
 }
 
-fn list_array_names_http(store: &ZarrStore) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+fn list_array_names_remote(store: &ZarrStore) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     use zarrs::group::Group;
     use zarrs::metadata::NodeMetadata;
 
     let group = Group::open(store.clone(), "/")?;
     let consolidated = group.consolidated_metadata().ok_or(
-        "HTTP Zarr store has no consolidated metadata in zarr.json; \
-         write with consolidated=True or use a local path"
+        "remote Zarr store has no consolidated metadata in zarr.json; \
+         re-write the store with consolidated=True (xarray: zarr.consolidate_metadata(store))"
     )?;
     let mut names: Vec<String> = consolidated
         .metadata
