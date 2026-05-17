@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use duckdb::core::LogicalTypeId;
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
 
-use crate::zarr_reader::meta::{infer_dim_groups, list_array_names, open_store};
+use crate::zarr_reader::meta::{extract_file_system, infer_dim_groups, list_array_names, open_store};
 
 #[derive(Debug, Clone)]
 struct GroupRow {
@@ -42,7 +42,8 @@ impl VTab for ReadZarrGroupsVTab {
         bind.add_result_column("coord_vars", LogicalTypeId::Varchar.into());
 
         let store_path = bind.get_parameter(0).to_string();
-        let store = open_store(&store_path)?;
+        let fs = unsafe { extract_file_system(bind) };
+        let store = open_store(&store_path, Some(fs))?;
         let array_names = list_array_names(&store_path, &store)?;
         let (dim_groups, _) = infer_dim_groups(&store, &array_names)?;
 

@@ -2,6 +2,11 @@
 name = "duckdb_zarr"
 version = "0.1.0"
 edition = "2021"
+description = "DuckDB extension for querying Zarr array stores with SQL"
+repository = "https://github.com/alxmrs/duckdb-zarr"
+license = "MIT"
+keywords = ["duckdb", "zarr", "xarray", "sql", "netcdf"]
+categories = ["database", "science"]
 
 [lib]
 crate-type = ["cdylib"]
