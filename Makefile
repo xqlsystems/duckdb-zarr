@@ -43,7 +43,7 @@ generate_fixtures:
 	@if command -v uv >/dev/null 2>&1; then \
 		uv run scripts/generate_fixtures.py; \
 	elif [ -f "$(PYTHON_VENV_BIN)" ]; then \
-		$(PYTHON_VENV_BIN) -m pip install --quiet "xarray" "zarr>=3.0.0" numpy scipy h5netcdf h5py pooch zstandard; \
+		$(PYTHON_VENV_BIN) -m pip install --quiet "xarray" "zarr>=3.0.0" numpy scipy h5netcdf h5py pooch; \
 		$(PYTHON_VENV_BIN) scripts/generate_fixtures.py; \
 	else \
 		echo "Error: neither uv nor configure/venv found. Run 'make configure' or install uv." >&2; \
