@@ -9,7 +9,7 @@ EXTENSION_NAME=duckdb_zarr
 USE_UNSTABLE_C_API=1
 
 # Target DuckDB version
-TARGET_DUCKDB_VERSION=v1.5.2
+TARGET_DUCKDB_VERSION=v1.5.4
 
 all: configure debug
 
