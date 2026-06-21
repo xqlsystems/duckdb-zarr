@@ -20,7 +20,7 @@ path = "src/wasm_lib.rs"
 crate-type = ["staticlib"]
 
 [dependencies]
-duckdb = { version = "=1.10502.0", features = ["loadable-extension"] }
+duckdb = { version = "=1.10504.0", features = ["loadable-extension"] }
 # Base zarrs features: no blosc here — blosc_src bundles pthreads that conflict
 # with Rtools42's libpthread on windows_amd64_mingw (x86_64-pc-windows-gnu).
 # Blosc is re-added below for all other targets.

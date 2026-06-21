@@ -32,7 +32,7 @@ The `zarr_reader` seam (§Architecture) is correct for plain Zarr v2/v3 today. N
 
 ## Implementability risks (spike resolved 2026-05-04)
 
-The pinned `duckdb` crate (`=1.10502.0`) exposes the `VTab` trait (bind/init/func) and scalar-function registration that v0.1 requires. Below are the resolved findings for the four APIs that were open questions:
+The pinned `duckdb` crate (`=1.10504.0`) exposes the `VTab` trait (bind/init/func) and scalar-function registration that v0.1 requires. Below are the resolved findings for the four APIs that were open questions:
 
 **(a) Replacement-scan registration** — `Connection::register_replacement_scan` does **not** exist in duckdb-rs. However, `libduckdb-sys` (the underlying C FFI layer that ships with the crate) exposes `duckdb_add_replacement_scan`, `duckdb_replacement_scan_set_function_name`, `duckdb_replacement_scan_add_parameter`, and `duckdb_replacement_scan_set_error`. Replacement scan for `.zarr` path interception lands behind a thin `unsafe` FFI wrapper calling these symbols directly. This unblocks the v0.2 work.
 
@@ -60,7 +60,7 @@ A Zarr store with coordinates `lat(L)`, `lon(M)`, `time(T)` and data variables `
 
 Logical row count is `T × L × M`. The nD → 2D mapping is the same `ravel()`/metadata reshape that xarray-sql relies on: we never materialize the cartesian product in memory; we generate it row-major on the fly inside each chunk-sized scan.
 
-Coordinate columns within a single chunk are highly repetitive. `duckdb-rs 1.10502.0` does not expose dictionary-vector construction (confirmed spike — see §Implementability risks), so coord columns are emitted as flat `FlatVector` values gathered from the cached coord array. Correctness is identical to the dictionary-encoding approach zarr-datafusion uses via Arrow `DictionaryArray`; the cost is more bytes per scan for high-cardinality coord columns, which in practice are rare since time/lat/lon repeat heavily within each chunk.
+Coordinate columns within a single chunk are highly repetitive. `duckdb-rs 1.10504.0` does not expose dictionary-vector construction (confirmed spike — see §Implementability risks), so coord columns are emitted as flat `FlatVector` values gathered from the cached coord array. Correctness is identical to the dictionary-encoding approach zarr-datafusion uses via Arrow `DictionaryArray`; the cost is more bytes per scan for high-cardinality coord columns, which in practice are rare since time/lat/lon repeat heavily within each chunk.
 
 ### One table per dimension group
 
@@ -170,7 +170,7 @@ Both are read-no-chunks. `read_zarr_metadata` enumerates arrays for inspection a
               └─────────────────────┘
 ```
 
-We follow DuckDB extension conventions: a flat top-level layout with one Rust module per registered SQL entry point and a thin extension entrypoint that wires them in (against `duckdb` pinned to `=1.10502.0` in Cargo.toml).
+We follow DuckDB extension conventions: a flat top-level layout with one Rust module per registered SQL entry point and a thin extension entrypoint that wires them in (against `duckdb` pinned to `=1.10504.0` in Cargo.toml).
 
 The `zarr_reader` module is the natural seam — it depends on [`zarrs`](https://lib.rs/crates/zarrs) and `ndarray` and exposes a small interface (open store, read schema, decode chunk into `ndarray::ArrayD`, storage adapter trait) that has no DuckDB types in its public API. Keeping that seam clean costs us nothing today and means the reader could be lifted into a shared crate later if it becomes useful to other Rust projects (e.g. zarr-datafusion). We're not designing for that reuse up front — DataFusion is async-first and DuckDB is sync-with-morsels, and trying to factor across that boundary on day one is more design overhead than it's worth.
 

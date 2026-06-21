@@ -408,8 +408,10 @@ fn fill_chunk_slice(
                     );
                 } else {
                     // Unindexed dim → synthesize range.
-                    let slot = vector.as_mut_ptr::<i64>();
-                    unsafe { *slot.add(dst) = global_indices[dim_k] as i64; }
+                    unsafe {
+                        let slot = vector.as_mut_ptr::<i64>();
+                        *slot.add(dst) = global_indices[dim_k] as i64;
+                    }
                 }
             } else {
                 // Data variable: use zarrs_flat to index into the physical byte buffer.
@@ -464,8 +466,10 @@ fn fill_data_element(
             if is_null {
                 vector.set_null(dst);
             } else {
-                let slot = vector.as_mut_ptr::<f64>();
-                unsafe { *slot.add(dst) = raw as f64 * scale_factor + add_offset; }
+                unsafe {
+                    let slot = vector.as_mut_ptr::<f64>();
+                    *slot.add(dst) = raw as f64 * scale_factor + add_offset;
+                }
             }
         }
     }

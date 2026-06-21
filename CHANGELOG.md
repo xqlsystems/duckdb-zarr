@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+- CI: align DuckDB to v1.5.4 (crate `=1.10504.0`, workflow `duckdb_version`) so the built extension loads in the `duckdb_sqllogictest` test runner, which had moved to 1.5.4 — fixes macOS-arm64/Windows test-load version-mismatch failures. Wrapped now-`unsafe` `FlatVector::as_mut_ptr` calls per the 1.10504.0 API.
+
 ### Added
 
 **Phase 4 — Remote stores, community extension**
