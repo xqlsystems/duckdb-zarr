@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+- CI: align DuckDB to v1.5.4 across all three version sites — crate `=1.10504.0`, workflow `duckdb_version`, and `Makefile` `TARGET_DUCKDB_VERSION` (the last stamps the extension metadata `duckdb_version`; with `USE_UNSTABLE_C_API=1` the loader requires an *exact* match) — so the built extension loads in the `duckdb_sqllogictest` test runner, which had moved to 1.5.4. Fixes macOS-arm64/Windows test-load version-mismatch failures. Wrapped now-`unsafe` `FlatVector::as_mut_ptr` calls per the 1.10504.0 API.
+- CI: make `generate_fixtures.py` resilient to transient xarray-tutorial downloads — skip the network when a fixture is already cached, and retry 5xx with exponential backoff (a GitHub-raw 500 on `ersstv5` was failing the build).
+
 ### Added
 
 **Phase 4 — Remote stores, community extension**

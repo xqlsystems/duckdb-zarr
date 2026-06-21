@@ -18,8 +18,10 @@ pub fn fill_scalar_element_pub(
     match dtype {
         ZarrDtype::Bool => {
             let val = bytes[src_idx] != 0;
-            let slot = vector.as_mut_ptr::<bool>();
-            unsafe { *slot.add(dst_idx) = val; }
+            unsafe {
+                let slot = vector.as_mut_ptr::<bool>();
+                *slot.add(dst_idx) = val;
+            }
         }
         ZarrDtype::Int8 => copy_scalar!(vector, bytes, i8, src_idx, dst_idx, sentinel),
         ZarrDtype::Int16 => copy_scalar!(vector, bytes, i16, src_idx, dst_idx, sentinel),
@@ -61,8 +63,10 @@ macro_rules! copy_scalar {
         if is_fill(val, $sentinel) {
             $vector.set_null($dst_idx);
         } else {
-            let slot = $vector.as_mut_ptr::<$T>();
-            unsafe { *slot.add($dst_idx) = val; }
+            unsafe {
+                let slot = $vector.as_mut_ptr::<$T>();
+                *slot.add($dst_idx) = val;
+            }
         }
     }};
 }

@@ -1,0 +1,129 @@
+#
+# Detects when the pinned DuckDB version has drifted from the version the
+# sqllogictest test runner installs (pip `duckdb`, latest patch of the active
+# minor line), and opens a PR bumping the three pinned sites. The PR's normal
+# build/test pipeline is the validation gate — a human reviews and merges.
+#
+# Why three sites: the extension links the `duckdb` crate, the distribution
+# workflow checks out DuckDB at `duckdb_version`, and the Makefile stamps the
+# extension-metadata version via TARGET_DUCKDB_VERSION. With USE_UNSTABLE_C_API=1
+# the loader requires an EXACT version match, so all three must agree with the
+# runner or `Test extension` fails to load the built extension.
+#
+name: DuckDB Version Drift
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # 06:00 UTC every Monday
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check-and-bump:
+    name: Check DuckDB version drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read currently pinned version
+        id: current
+        run: |
+          cur=$(grep -oE 'TARGET_DUCKDB_VERSION=v[0-9]+\.[0-9]+\.[0-9]+' Makefile | cut -d= -f2)
+          if [ -z "$cur" ]; then
+            echo "::error::could not parse TARGET_DUCKDB_VERSION from Makefile"; exit 1
+          fi
+          echo "version=$cur" >> "$GITHUB_OUTPUT"
+          echo "Currently pinned: $cur"
+
+      - name: Resolve latest test-runner DuckDB version
+        id: latest
+        run: |
+          # The sqllogictest runner installs the pip `duckdb` package. Stay within
+          # the current minor line — a major/minor jump is a deliberate, manual
+          # upgrade (it usually needs code changes), not an automated bump.
+          minor=$(echo "${{ steps.current.outputs.version }}" | sed -E 's/^v([0-9]+\.[0-9]+)\..*/\1/')
+          latest=$(curl -fsSL https://pypi.org/pypi/duckdb/json \
+            | jq -r --arg m "$minor." '
+                .releases | keys[]
+                | select(startswith($m))
+                | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' \
+            | sort -V | tail -1)
+          if [ -z "$latest" ]; then
+            echo "::error::no stable pip duckdb release found in the $minor line"; exit 1
+          fi
+          echo "version=v$latest" >> "$GITHUB_OUTPUT"
+          echo "Latest runner version: v$latest"
+
+      - name: Report drift
+        id: drift
+        run: |
+          if [ "${{ steps.current.outputs.version }}" = "${{ steps.latest.outputs.version }}" ]; then
+            echo "drifted=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::DuckDB pin ${{ steps.current.outputs.version }} is up to date."
+          else
+            echo "drifted=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Drift: pinned ${{ steps.current.outputs.version }} -> runner ${{ steps.latest.outputs.version }}"
+          fi
+
+      - name: Compute crate version
+        id: crate
+        if: steps.drift.outputs.drifted == 'true'
+        run: |
+          # duckdb-rs encodes the DuckDB version: v1.5.4 -> 1.10504.0 (1.1<minor:02><patch:02>.0)
+          ver="${{ steps.latest.outputs.version }}"; ver="${ver#v}"
+          IFS=. read -r _maj min pat <<< "$ver"
+          crate=$(printf '1.1%02d%02d.0' "$min" "$pat")
+          echo "version=$crate" >> "$GITHUB_OUTPUT"
+          # crates.io requires a User-Agent; verify the matching crate is published.
+          if curl -fsSL -H 'User-Agent: duckdb-zarr-drift-bot' \
+               "https://crates.io/api/v1/crates/duckdb/$crate" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Target crate: duckdb $crate"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::duckdb crate $crate is not yet published on crates.io; skipping bump this run."
+          fi
+
+      - name: Apply bump
+        id: bump
+        if: steps.drift.outputs.drifted == 'true' && steps.crate.outputs.exists == 'true'
+        run: |
+          new="${{ steps.latest.outputs.version }}"
+          crate="${{ steps.crate.outputs.version }}"
+          # 1. Makefile target (stamps extension metadata)
+          sed -i -E "s/^TARGET_DUCKDB_VERSION=.*/TARGET_DUCKDB_VERSION=$new/" Makefile
+          # 2. Distribution workflow duckdb_version
+          sed -i -E "s/(duckdb_version:[[:space:]]*)v[0-9]+\.[0-9]+\.[0-9]+/\1$new/" \
+            .github/workflows/MainDistributionPipeline.yml
+          # 3. Cargo.toml exact crate pin (the only `version = "=...` line) + lockfile
+          sed -i -E "s/(version = \")=[0-9]+\.[0-9]+\.[0-9]+/\1=$crate/" Cargo.toml
+          cargo update -p duckdb --precise "$crate"
+
+      - name: Open bump PR
+        if: steps.drift.outputs.drifted == 'true' && steps.crate.outputs.exists == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: chore/bump-duckdb-${{ steps.latest.outputs.version }}
+          title: "chore: bump DuckDB to ${{ steps.latest.outputs.version }}"
+          commit-message: "chore: bump DuckDB to ${{ steps.latest.outputs.version }}"
+          labels: dependencies
+          body: |
+            Automated DuckDB version bump.
+
+            The sqllogictest test runner (pip `duckdb`) moved to
+            **${{ steps.latest.outputs.version }}**. This updates the three pinned
+            sites that must match it (exact match is required because
+            `USE_UNSTABLE_C_API=1`):
+
+            - `Makefile` → `TARGET_DUCKDB_VERSION=${{ steps.latest.outputs.version }}`
+            - `.github/workflows/MainDistributionPipeline.yml` → `duckdb_version: ${{ steps.latest.outputs.version }}`
+            - `Cargo.toml` → `duckdb = "=${{ steps.crate.outputs.version }}"` (+ `Cargo.lock`)
+
+            ⚠️ A crate API change may require manual source edits (e.g. the
+            1.10504.0 bump made `FlatVector::as_mut_ptr` `unsafe`). **Rely on this
+            PR's build/test pipeline** before merging.
+
+            Generated by `.github/workflows/duckdb-version-drift.yml`.
