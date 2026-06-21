@@ -25,6 +25,7 @@ import os
 import pathlib
 import shutil
 import subprocess
+import time
 
 # zarr 2.x gates v3 writes behind an env var; zarr 3.x ignores it.
 # Must be set before zarr is imported.
@@ -82,6 +83,31 @@ def ensure_attr(ds: xr.Dataset, var: str, key: str, value) -> xr.Dataset:
     return ds.assign({var: da})
 
 
+def fixture_exists(name: str) -> bool:
+    """True if the fixture is already materialised (cached from a prior run)."""
+    return (FIXTURES / f"{name}.zarr" / "zarr.json").exists()
+
+
+def open_tutorial(name: str, **kwargs) -> xr.Dataset:
+    """Download an xarray tutorial dataset, retrying transient network failures.
+
+    xarray.tutorial fetches from github pydata/xarray-data via pooch; GitHub raw
+    intermittently returns 5xx, which would otherwise fail the whole CI build on
+    a cold fixture cache. Retry with exponential backoff before giving up.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(5):
+        try:
+            return xr.tutorial.open_dataset(name, **kwargs)
+        except Exception as exc:  # pooch surfaces requests.HTTPError / URLError
+            last_exc = exc
+            wait = 2 ** attempt
+            print(f"  download of {name!r} failed ({exc}); "
+                  f"retry {attempt + 1}/5 in {wait}s")
+            time.sleep(wait)
+    raise last_exc
+
+
 def main() -> None:
     FIXTURES.mkdir(parents=True, exist_ok=True)
 
@@ -104,9 +130,12 @@ def main() -> None:
     # On-disk dtype is int16 with scale_factor=0.01 (xarray re-encodes using the
     # original NetCDF encoding dict). Tests: packed int16 decoding, coord
     # classification, CF-encoded time passthrough (float32 units/calendar).
-    print("air_temperature...")
-    ds = xr.tutorial.open_dataset("air_temperature")
-    write_zarr(ds, "air_temperature")
+    if fixture_exists("air_temperature"):
+        print("air_temperature... (cached)")
+    else:
+        print("air_temperature...")
+        ds = open_tutorial("air_temperature")
+        write_zarr(ds, "air_temperature")
 
     # ── air_temperature_gradient (synthetic, small) ──────────────────────────
     # Tests: scale_factor/add_offset packed decoding (Tair as int16), PLUS
@@ -145,26 +174,32 @@ def main() -> None:
     # ── ersstv5 ──────────────────────────────────────────────────────────────
     # Tests: CF bounds variable suppression (time.bounds='time_bnds', shape (624,2));
     # also missing_value sentinel masking on sst.
-    print("ersstv5...")
-    ds = xr.tutorial.open_dataset("ersstv5", mask_and_scale=False)
-    if "missing_value" not in ds["sst"].attrs and "missing_value" in ds["sst"].encoding:
-        ds = ensure_attr(ds, "sst", "missing_value", ds["sst"].encoding["missing_value"])
-    if "_FillValue" not in ds["sst"].attrs and "_FillValue" in ds["sst"].encoding:
-        ds = ensure_attr(ds, "sst", "_FillValue", ds["sst"].encoding["_FillValue"])
-    # Add explicit bounds attr — the raw NetCDF omits it but time_bnds is present.
-    # Exercises the primary CF bounds detection path (attr-based); the name-pattern
-    # fallback is exercised by any store that has a *_bnds variable without the attr.
-    ds = ensure_attr(ds, "time", "bounds", "time_bnds")
-    write_zarr(ds, "ersstv5")
+    if fixture_exists("ersstv5"):
+        print("ersstv5... (cached)")
+    else:
+        print("ersstv5...")
+        ds = open_tutorial("ersstv5", mask_and_scale=False)
+        if "missing_value" not in ds["sst"].attrs and "missing_value" in ds["sst"].encoding:
+            ds = ensure_attr(ds, "sst", "missing_value", ds["sst"].encoding["missing_value"])
+        if "_FillValue" not in ds["sst"].attrs and "_FillValue" in ds["sst"].encoding:
+            ds = ensure_attr(ds, "sst", "_FillValue", ds["sst"].encoding["_FillValue"])
+        # Add explicit bounds attr — the raw NetCDF omits it but time_bnds is present.
+        # Exercises the primary CF bounds detection path (attr-based); the name-pattern
+        # fallback is exercised by any store that has a *_bnds variable without the attr.
+        ds = ensure_attr(ds, "time", "bounds", "time_bnds")
+        write_zarr(ds, "ersstv5")
 
     # ── basin_mask ───────────────────────────────────────────────────────────
     # Tests: missing_value=-100 (int8) with no _FillValue — the "missing_value
     # only" branch in NULL masking precedence.
-    print("basin_mask...")
-    ds = xr.tutorial.open_dataset("basin_mask", mask_and_scale=False)
-    if "missing_value" not in ds["basin"].attrs and "missing_value" in ds["basin"].encoding:
-        ds = ensure_attr(ds, "basin", "missing_value", ds["basin"].encoding["missing_value"])
-    write_zarr(ds, "basin_mask")
+    if fixture_exists("basin_mask"):
+        print("basin_mask... (cached)")
+    else:
+        print("basin_mask...")
+        ds = open_tutorial("basin_mask", mask_and_scale=False)
+        if "missing_value" not in ds["basin"].attrs and "missing_value" in ds["basin"].encoding:
+            ds = ensure_attr(ds, "basin", "missing_value", ds["basin"].encoding["missing_value"])
+        write_zarr(ds, "basin_mask")
 
     # ── rasm ─────────────────────────────────────────────────────────────────
     # Tests: noleap calendar CF-encoded time (raw on-disk), 2D non-dim coords
