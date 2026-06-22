@@ -3,7 +3,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use duckdb::core::LogicalTypeId;
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
 
-use crate::zarr_reader::meta::{extract_file_system, infer_dim_groups, list_array_names, open_store};
+use crate::zarr_reader::meta::{
+    dim_group_for_array, discover_dim_groups, extract_file_system, list_array_names, open_store,
+    select_array_name,
+};
 
 #[derive(Debug, Clone)]
 struct GroupRow {
@@ -45,7 +48,21 @@ impl VTab for ReadZarrGroupsVTab {
         let fs = unsafe { extract_file_system(bind) };
         let store = open_store(&store_path, Some(fs))?;
         let array_names = list_array_names(&store_path, &store)?;
-        let (dim_groups, _) = infer_dim_groups(&store, &array_names)?;
+        let array_path = bind
+            .get_named_parameter("array_path")
+            .map(|value| value.to_string());
+        let array_alias = bind
+            .get_named_parameter("array")
+            .map(|value| value.to_string());
+        if array_path.is_some() && array_alias.is_some() {
+            return Err("use either array_path= or \"array\"=, not both".into());
+        }
+        let dim_groups = if let Some(requested) = array_path.or(array_alias) {
+            let array_name = select_array_name(&array_names, &requested)?;
+            vec![dim_group_for_array(&store, &array_names, &array_name)?]
+        } else {
+            discover_dim_groups(&store, &array_names)?
+        };
 
         let rows = dim_groups
             .iter()
@@ -106,5 +123,12 @@ impl VTab for ReadZarrGroupsVTab {
 
     fn parameters() -> Option<Vec<duckdb::core::LogicalTypeHandle>> {
         Some(vec![LogicalTypeId::Varchar.into()])
+    }
+
+    fn named_parameters() -> Option<Vec<(String, duckdb::core::LogicalTypeHandle)>> {
+        Some(vec![
+            ("array".to_string(), LogicalTypeId::Varchar.into()),
+            ("array_path".to_string(), LogicalTypeId::Varchar.into()),
+        ])
     }
 }

@@ -16,6 +16,9 @@ SELECT * FROM 'https://example.com/data.zarr';
 -- Explicit table function with optional dims= for multi-group stores
 SELECT * FROM read_zarr('path/to/store.zarr', dims=['time', 'lat', 'lon']);
 
+-- Select one array by its store-relative path (including nested arrays)
+SELECT * FROM read_zarr('image.ome.zarr', array_path='labels/nuclei/0');
+
 -- Inspect arrays in a store
 SELECT name, role, dtype, shape FROM read_zarr_metadata('path/to/store.zarr');
 
@@ -23,7 +26,8 @@ SELECT name, role, dtype, shape FROM read_zarr_metadata('path/to/store.zarr');
 SELECT * FROM read_zarr_groups('path/to/store.zarr');
 ```
 
-See [docs/design.md](docs/design.md) for the full design.
+See [docs/design.md](docs/design.md) for the full design and
+[docs/ome-zarr.md](docs/ome-zarr.md) for a small bioimage example.
 
 ## Status
 
@@ -31,7 +35,7 @@ Active development. Phases 1–3 are implemented:
 
 - **Phase 1** — `read_zarr`, `read_zarr_metadata`, `read_zarr_groups` table functions; Zarr v3; CF conventions (fill values, scale/offset, bounds variables, aux coords)
 - **Phase 2** — Zarr v2, Blosc/LZ4, replacement scan for local `.zarr` paths, projection pushdown
-- **Phase 3** — HTTP/HTTPS stores, `dims=` named parameter for multi-group selection
+- **Phase 3** — HTTP/HTTPS stores, `dims=` and `array_path=` selection, recursive array discovery
 
 See the [phased plan](docs/design.md#phased-plan) for what's next.
 

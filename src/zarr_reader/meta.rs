@@ -67,7 +67,8 @@ pub fn open_store(
             unsafe { duckdb_destroy_file_system(&mut fs) };
         }
         Ok(Arc::new(zarrs_http::HTTPStore::new(path)?))
-    } else if lower.starts_with("s3://") || lower.starts_with("gs://") || lower.starts_with("az://") {
+    } else if lower.starts_with("s3://") || lower.starts_with("gs://") || lower.starts_with("az://")
+    {
         let fs = file_system.ok_or(
             "remote store requires a DuckDB FileSystem handle (call from a table function bind)",
         )?;
@@ -80,9 +81,9 @@ pub fn open_store(
     }
 }
 
-/// List the names of all top-level arrays in the Zarr store root.
+/// List the store-relative paths of all arrays in the Zarr hierarchy.
 ///
-/// - Local paths: scans for child directories containing `zarr.json` (v3) or `.zarray` (v2).
+/// - Local paths: recursively scans directories containing `zarr.json` (v3) or `.zarray` (v2).
 /// - Remote paths (HTTP/HTTPS/S3/GCS/Azure): reads consolidated metadata from the root zarr.json.
 pub fn list_array_names(
     store_path: &str,
@@ -98,35 +99,57 @@ pub fn list_array_names(
 fn list_array_names_local(store_path: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let root = Path::new(store_path);
     let mut names = Vec::new();
-    for entry in std::fs::read_dir(root)? {
+    collect_array_names_local(root, root, &mut names)?;
+    names.sort();
+    Ok(names)
+}
+
+fn collect_array_names_local(
+    root: &Path,
+    directory: &Path,
+    names: &mut Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
         }
         let child_path = entry.path();
 
-        // Zarr v3: zarr.json present — check node_type to skip nested groups.
+        // Zarr v3: arrays are terminal; groups are traversed recursively.
         if child_path.join("zarr.json").exists() {
             let content = std::fs::read_to_string(child_path.join("zarr.json"))?;
             let meta: serde_json::Value = serde_json::from_str(&content)?;
             if meta.get("node_type").and_then(|v| v.as_str()) == Some("group") {
-                continue; // nested group — design assumes flat store; skip silently
+                collect_array_names_local(root, &child_path, names)?;
+                continue;
             }
-            if let Some(name) = child_path.file_name().and_then(|n| n.to_str()) {
-                names.push(name.to_string());
-            }
+            names.push(relative_array_path(root, &child_path)?);
             continue;
         }
 
         // Zarr v2: .zarray present.
         if child_path.join(".zarray").exists() {
-            if let Some(name) = child_path.file_name().and_then(|n| n.to_str()) {
-                names.push(name.to_string());
-            }
+            names.push(relative_array_path(root, &child_path)?);
+            continue;
         }
+
+        // A v2 group has .zgroup; intermediate containers may have no metadata.
+        collect_array_names_local(root, &child_path, names)?;
     }
-    names.sort();
-    Ok(names)
+    Ok(())
+}
+
+fn relative_array_path(
+    root: &Path,
+    array_path: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(array_path
+        .strip_prefix(root)?
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/"))
 }
 
 fn list_array_names_remote(store: &ZarrStore) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -136,17 +159,13 @@ fn list_array_names_remote(store: &ZarrStore) -> Result<Vec<String>, Box<dyn std
     let group = Group::open(store.clone(), "/")?;
     let consolidated = group.consolidated_metadata().ok_or(
         "remote Zarr store has no consolidated metadata in zarr.json; \
-         re-write the store with consolidated=True (xarray: zarr.consolidate_metadata(store))"
+         re-write the store with consolidated=True (xarray: zarr.consolidate_metadata(store))",
     )?;
     let mut names: Vec<String> = consolidated
         .metadata
         .iter()
         .filter_map(|(path, meta)| {
-            // Only top-level arrays (no '/' in path after stripping leading '/').
             let name = path.trim_start_matches('/');
-            if name.contains('/') {
-                return None;
-            }
             if matches!(meta, NodeMetadata::Array(_)) {
                 Some(name.to_string())
             } else {
@@ -159,12 +178,95 @@ fn list_array_names_remote(store: &ZarrStore) -> Result<Vec<String>, Box<dyn std
 }
 
 /// Open one array by name from the store.
-pub fn open_array(
-    store: &ZarrStore,
-    name: &str,
-) -> Result<ZarrArray, Box<dyn std::error::Error>> {
+pub fn open_array(store: &ZarrStore, name: &str) -> Result<ZarrArray, Box<dyn std::error::Error>> {
     let path = format!("/{name}");
     Ok(Array::open(store.clone(), &path)?)
+}
+
+/// Resolve and validate a user-provided store-relative array path.
+pub fn select_array_name(
+    array_names: &[String],
+    requested: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let normalized = requested.trim().trim_matches('/');
+    array_names
+        .iter()
+        .find(|name| name.as_str() == normalized)
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "array '{requested}' not found; available arrays: {:?}",
+                array_names
+            )
+            .into()
+        })
+}
+
+/// Build a one-array dimension group for `read_zarr(..., array_path='path')`.
+///
+/// Coordinate arrays are resolved from the selected array's sibling group first,
+/// then from the store root. OME-Zarr arrays normally have no coordinate arrays,
+/// so their named dimensions are synthesized as integer indices.
+pub fn dim_group_for_array(
+    store: &ZarrStore,
+    array_names: &[String],
+    array_name: &str,
+) -> Result<DimGroup, Box<dyn std::error::Error>> {
+    let arr = open_array(store, array_name)?;
+    let dims = dimension_names(&arr, array_name)?;
+    let shape = arr.shape().to_vec();
+    let first_chunk = vec![0u64; shape.len()];
+    let chunk_shape = arr
+        .chunk_shape(&first_chunk)?
+        .iter()
+        .map(|x| x.get())
+        .collect();
+    let coord_var_names = dims
+        .iter()
+        .filter_map(|dim| find_coord_array_path(store, array_names, array_name, dim))
+        .collect();
+
+    Ok(DimGroup {
+        dims,
+        shape,
+        chunk_shape,
+        data_var_names: vec![array_name.to_string()],
+        coord_var_names,
+    })
+}
+
+fn parent_path(name: &str) -> &str {
+    name.rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .unwrap_or("")
+}
+
+fn basename(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name)
+}
+
+fn find_coord_array_path(
+    store: &ZarrStore,
+    array_names: &[String],
+    data_var_name: &str,
+    dim: &str,
+) -> Option<String> {
+    let parent = parent_path(data_var_name);
+    let sibling = if parent.is_empty() {
+        dim.to_string()
+    } else {
+        format!("{parent}/{dim}")
+    };
+
+    let match_path = [sibling.as_str(), dim].into_iter().find_map(|candidate| {
+        if !array_names.iter().any(|name| name == candidate) {
+            return None;
+        }
+        let arr = open_array(store, candidate).ok()?;
+        let dims = dimension_names(&arr, candidate).ok()?;
+        (arr.shape().len() == 1 && dims.as_slice() == [dim]).then(|| candidate.to_string())
+    });
+    match_path
 }
 
 /// Resolve dimension names for an array.
@@ -199,10 +301,7 @@ pub fn dimension_names(
 
 /// Parse `ZarrDtype` from the zarrs DataType.
 /// `DataType::to_string()` may emit "v3_name / v2_name"; we use the v3 name (first token).
-pub fn parse_dtype(
-    array: &ZarrArray,
-    name: &str,
-) -> Result<ZarrDtype, Box<dyn std::error::Error>> {
+pub fn parse_dtype(array: &ZarrArray, name: &str) -> Result<ZarrDtype, Box<dyn std::error::Error>> {
     let full = array.data_type().to_string();
     let type_str = full.split(" / ").next().unwrap_or(&full);
     ZarrDtype::from_str(type_str)
@@ -243,8 +342,12 @@ fn parse_sentinel(
     dtype: &ZarrDtype,
     attrs: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<FillSentinel> {
-    let fill = attrs.get("_FillValue").and_then(|v| parse_fill_value(dtype, v));
-    let missing = attrs.get("missing_value").and_then(|v| parse_fill_value(dtype, v));
+    let fill = attrs
+        .get("_FillValue")
+        .and_then(|v| parse_fill_value(dtype, v));
+    let missing = attrs
+        .get("missing_value")
+        .and_then(|v| parse_fill_value(dtype, v));
     // xarray encodes _FillValue=NaN when it has already replaced fill values with NaN
     // in memory. For stores that use missing_value as the actual on-disk sentinel,
     // NaN in _FillValue is not the sentinel we need to mask; prefer missing_value.
@@ -328,10 +431,7 @@ fn parse_zarr_fill_sentinel(array: &ZarrArray, dtype: &ZarrDtype) -> Option<Fill
 
 /// Collect the set of non-dimension coord names from all `coordinates` attrs
 /// across all arrays. These must be excluded from dim-group classification.
-pub fn collect_auxiliary_coords(
-    store: &ZarrStore,
-    array_names: &[String],
-) -> HashSet<String> {
+pub fn collect_auxiliary_coords(store: &ZarrStore, array_names: &[String]) -> HashSet<String> {
     let mut aux = HashSet::new();
     for name in array_names {
         if let Ok(arr) = open_array(store, name) {
@@ -425,10 +525,10 @@ pub fn infer_dim_groups(
             continue;
         }
 
-        // Dim-coord heuristic: 1-D array whose sole dim shares its name.
+        // Dim-coord heuristic: 1-D array whose sole dim shares its basename.
         if shape.len() == 1 {
             if let Ok(dims) = dimension_names(&arr, name) {
-                if dims.len() == 1 && dims[0] == *name {
+                if dims.len() == 1 && dims[0] == basename(name) {
                     coord_names.insert(name.clone());
                     continue;
                 }
@@ -457,8 +557,7 @@ pub fn infer_dim_groups(
         // Collect coord names that belong to this dim group (dims that have matching coord arrays).
         let group_coord_names: Vec<String> = dims
             .iter()
-            .filter(|d| coord_names.contains(*d))
-            .cloned()
+            .filter_map(|dim| find_coord_array_path(store, array_names, var_name, dim))
             .collect();
 
         let entry = groups.entry(dims.clone()).or_insert_with(|| DimGroup {
@@ -471,14 +570,14 @@ pub fn infer_dim_groups(
         // Validate shape and chunk shape consistency within the dim group.
         if entry.shape != shape {
             return Err(format!(
-                "array shape mismatch in dim group {:?}: existing {:?} vs '{var_name}' {:?}",
+                "array shape mismatch in dim group {:?}: existing {:?} vs '{var_name}' {:?}; use array_path= to select one array",
                 entry.dims, entry.shape, shape
             )
             .into());
         }
         if entry.chunk_shape != chunk_shape {
             return Err(format!(
-                "chunk shape mismatch in dim group {:?}: existing {:?} vs '{var_name}' {:?}",
+                "chunk shape mismatch in dim group {:?}: existing {:?} vs '{var_name}' {:?}; use array_path= to select one array",
                 entry.dims, entry.chunk_shape, chunk_shape
             )
             .into());
@@ -490,6 +589,77 @@ pub fn infer_dim_groups(
     dim_groups.sort_by(|a, b| a.dims.cmp(&b.dims));
 
     Ok((dim_groups, coord_names))
+}
+
+/// Discover dimension groups for metadata inspection without requiring every
+/// array that shares dimension names to also share shape and chunk layout.
+///
+/// Multiscale OME-Zarr levels deliberately reuse axis names at different
+/// resolutions, so `read_zarr_groups` groups by `(dims, shape, chunk_shape)`.
+/// The stricter [`infer_dim_groups`] remains in the scan path because one scan
+/// can only align variables with identical shapes and chunk grids.
+pub fn discover_dim_groups(
+    store: &ZarrStore,
+    array_names: &[String],
+) -> Result<Vec<DimGroup>, Box<dyn std::error::Error>> {
+    let aux_coords = collect_auxiliary_coords(store, array_names);
+    let bounds_vars = collect_bounds_vars(store, array_names, &aux_coords);
+    let mut coord_names = HashSet::new();
+
+    for name in array_names {
+        if bounds_vars.contains(name) || aux_coords.contains(name) {
+            continue;
+        }
+        let arr = open_array(store, name)?;
+        if arr.shape().len() == 1 {
+            if let Ok(dims) = dimension_names(&arr, name) {
+                if dims.len() == 1 && dims[0] == basename(name) {
+                    coord_names.insert(name.clone());
+                }
+            }
+        }
+    }
+
+    type GroupKey = (Vec<String>, Vec<u64>, Vec<u64>);
+    let mut groups: HashMap<GroupKey, DimGroup> = HashMap::new();
+    for name in array_names {
+        if bounds_vars.contains(name) || aux_coords.contains(name) || coord_names.contains(name) {
+            continue;
+        }
+        let arr = open_array(store, name)?;
+        let shape = arr.shape().to_vec();
+        if shape.is_empty() {
+            continue;
+        }
+        let dims = dimension_names(&arr, name)?;
+        let chunk_shape = arr
+            .chunk_shape(&vec![0u64; shape.len()])?
+            .iter()
+            .map(|x| x.get())
+            .collect::<Vec<_>>();
+        let coord_var_names = dims
+            .iter()
+            .filter_map(|dim| find_coord_array_path(store, array_names, name, dim))
+            .collect::<Vec<_>>();
+        let key = (dims.clone(), shape.clone(), chunk_shape.clone());
+        let group = groups.entry(key).or_insert_with(|| DimGroup {
+            dims,
+            shape,
+            chunk_shape,
+            data_var_names: Vec::new(),
+            coord_var_names,
+        });
+        group.data_var_names.push(name.clone());
+    }
+
+    let mut dim_groups = groups.into_values().collect::<Vec<_>>();
+    dim_groups.sort_by(|a, b| {
+        a.dims
+            .cmp(&b.dims)
+            .then_with(|| a.shape.cmp(&b.shape))
+            .then_with(|| a.data_var_names.cmp(&b.data_var_names))
+    });
+    Ok(dim_groups)
 }
 
 /// Pre-load a coordinate array's raw bytes at bind time.
@@ -509,7 +679,9 @@ pub fn load_coord_array(
     // decoded bytes; zarrs allocates a fresh Vec<u8> satisfying the 'static bound.
     let subset = arr.subset_all();
     let array_bytes = arr.retrieve_array_subset::<zarrs::array::ArrayBytes<'static>>(&subset)?;
-    let raw = array_bytes.into_fixed().map_err(|_| "coord array has variable-length dtype")?;
+    let raw = array_bytes
+        .into_fixed()
+        .map_err(|_| "coord array has variable-length dtype")?;
     let bytes: Vec<u8> = raw.into_owned();
     debug_assert_eq!(
         bytes.len(),
@@ -532,9 +704,7 @@ pub fn build_work_units(group: &DimGroup) -> Vec<WorkUnit> {
         .dims
         .iter()
         .enumerate()
-        .map(|(i, _)| {
-            group.shape[i].div_ceil(group.chunk_shape[i])
-        })
+        .map(|(i, _)| group.shape[i].div_ceil(group.chunk_shape[i]))
         .collect();
 
     // Total number of chunks.

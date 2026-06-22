@@ -56,6 +56,10 @@ SELECT * FROM read_zarr('/path/to/my/array.zarr')
 WHERE dimension_0 > 100 AND dimension_1 < 50;
 ```
 
+For a small bioimage walkthrough, see [Querying OME-Zarr](ome-zarr.md).
+For the domains covered by the current test suite, see
+[Tested scientific domains](domains.md).
+
 ## Development Setup
 
 ```shell

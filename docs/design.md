@@ -13,7 +13,7 @@ A design for `duckdb-zarr` — a Rust DuckDB extension that lets users query Zar
 ## Non-goals (for the first cut)
 
 - Writes. Read-only.
-- Nested group hierarchies. We assume a flat Zarr group at the store root, with the xarray convention of sibling 1D coordinate arrays + nD data arrays. Multiple SQL tables can come out of that flat group (one per dim set, see below), but we don't recurse into subgroups.
+- Automatic relational joins across nested groups. Arrays are discovered recursively and can be selected by store-relative path, but each `read_zarr` scan still operates on one compatible dimension group or one explicitly selected array.
 - Replacing xarray. Users who need lazy array operations should keep using xarray; we just want a SQL handle on the same data.
 - Custom codecs beyond what `zarrs` already supports.
 - WebAssembly. The current scaffold ships a `wasm_lib.rs` target; it is not a supported build because `zarrs` and `ndarray` use threading and I/O patterns that don't trivially compile to `wasm32`. 
@@ -111,9 +111,15 @@ SELECT * FROM read_zarr(
   coords := ['t', 'y', 'x'],
   variables := ['u', 'v']
 );
+
+-- Pick one array, including a nested OME-Zarr level
+SELECT * FROM read_zarr('image.ome.zarr', array_path := 'labels/nuclei/0');
+
 ```
 
 Named arguments stay close to xarray's vocabulary (`variables`, `coords`, `chunks`, `dims`). Variables that share the requested dim set become one output column each, joined on coordinate index — exactly the xarray-sql `pivot()` shape. Variables outside that dim set are silently excluded; the user picks them up by querying a different `dims` group.
+
+`array_path` adds an unambiguous selector for multiscale OME-Zarr levels and nested labels. The same selector is accepted by `read_zarr_metadata` and `read_zarr_groups`. A quoted `"array"` alias is also registered; the quotes are required because `ARRAY` is a DuckDB keyword.
 
 ### 3. `ATTACH` for multi-group stores
 
@@ -428,7 +434,7 @@ CF-encoded time (e.g. `int64` + `units = "hours since 1970-01-01"` + `calendar =
 
 Within a dim group, two data variables might be chunked differently — e.g. `temperature[24,10,10]` and `humidity[1,20,20]`, both over `(time, lat, lon)`. The init phase enumerates a single cartesian product of chunk indices and so cannot align both grids without finer-grained iteration. Three options: (a) require uniform chunk shape per dim group, error at bind on mismatch; (b) plan against the coarsest chunk grid and re-read finer-chunked variables multiple times per work unit; (c) iterate at the row level rather than the chunk level.
 
-> **Decision (v1):** (a) — require uniform chunk shape across all selected variables in a dim group. Bind checks and fails with a message naming the offending pair, explaining the common cause (packed `int16` vs native `float32` storage from the source NetCDF), and pointing at the workaround (`read_zarr('store.zarr', variables := ['humidity'])`).
+> **Decision (v1):** (a) — require uniform chunk shape across all selected variables in a dim group. Bind checks and fails with a message naming the offending pair, explaining the common cause (packed `int16` vs native `float32` storage from the source NetCDF), and pointing at the workaround (`read_zarr('store.zarr', variables := ['humidity'])`). The new single-array equivalent is `read_zarr('store.zarr', array_path := 'humidity')`.
 >
 > **Empirical correction:** the original framing said this would "rarely be observed in practice." That was wrong. The `air_temperature_gradient` xarray tutorial dataset (NCEP reanalysis — same provenance as ERA5) has `Tair` chunked `[730, 13, 27]` while `dTdx`/`dTdy` share dims but are chunked `[730, 7, 27]`, because xarray preserves source-NetCDF chunking per variable and packed-vs-native storage routinely produces different chunks. This is common in atmospheric reanalysis stores, not exotic.
 >

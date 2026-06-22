@@ -6,8 +6,9 @@ use duckdb::core::{DataChunkHandle, LogicalTypeId};
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
 
 use crate::zarr_reader::meta::{
-    build_column_defs, build_work_units, extract_file_system, infer_dim_groups, load_coord_array,
-    open_array, open_store, ZarrArray, ZarrStore,
+    build_column_defs, build_work_units, dim_group_for_array, dimension_names, extract_file_system,
+    infer_dim_groups, load_coord_array, open_array, open_store, select_array_name, ZarrArray,
+    ZarrStore,
 };
 use crate::zarr_reader::types::{ColumnDef, CoordArray, DimGroup, WorkUnit, ZarrDtype};
 
@@ -78,6 +79,16 @@ impl VTab for ReadZarrVTab {
             .get_named_parameter("dims")
             .map(|v| parse_dims_param(&v.to_string()))
             .transpose()?;
+        let array_path = bind
+            .get_named_parameter("array_path")
+            .map(|value| value.to_string());
+        let array_alias = bind
+            .get_named_parameter("array")
+            .map(|value| value.to_string());
+        if array_path.is_some() && array_alias.is_some() {
+            return Err("use either array_path= or \"array\"=, not both".into());
+        }
+        let requested_array = array_path.or(array_alias);
 
         let fs = unsafe { extract_file_system(bind) };
         let store = open_store(&store_path, Some(fs))?;
@@ -87,6 +98,21 @@ impl VTab for ReadZarrVTab {
             return Err(format!("no Zarr arrays found in '{store_path}'").into());
         }
 
+        if let Some(requested) = requested_array {
+            let array_name = select_array_name(&array_names, &requested)?;
+            let group = dim_group_for_array(&store, &array_names, &array_name)?;
+            if let Some(dims) = requested_dims {
+                if group.dims != dims {
+                    return Err(format!(
+                        "array '{array_name}' has dimensions {:?}, not {dims:?}",
+                        group.dims
+                    )
+                    .into());
+                }
+            }
+            return finish_bind(bind, store, &group);
+        }
+
         let (dim_groups, _coord_names) = infer_dim_groups(&store, &array_names)?;
 
         if dim_groups.is_empty() {
@@ -94,18 +120,16 @@ impl VTab for ReadZarrVTab {
         }
 
         let group = match requested_dims {
-            Some(ref dims) => {
-                dim_groups.iter().find(|g| g.dims == *dims).ok_or_else(|| {
-                    format!(
-                        "'{store_path}': no dimension group matches dims={dims:?}; available: {:?}",
-                        dim_groups.iter().map(|g| &g.dims).collect::<Vec<_>>()
-                    )
-                })?
-            }
+            Some(ref dims) => dim_groups.iter().find(|g| g.dims == *dims).ok_or_else(|| {
+                format!(
+                    "'{store_path}': no dimension group matches dims={dims:?}; available: {:?}",
+                    dim_groups.iter().map(|g| &g.dims).collect::<Vec<_>>()
+                )
+            })?,
             None => {
                 if dim_groups.len() > 1 {
                     return Err(format!(
-                        "'{store_path}' contains multiple dimension groups ({}) {:?}; use read_zarr(path, dims='[\"time\",\"lat\",\"lon\"]') to select one",
+                        "'{store_path}' contains multiple dimension groups ({}) {:?}; use dims= to select a compatible group or array_path= to select one array",
                         dim_groups.len(),
                         dim_groups.iter().map(|g| &g.dims).collect::<Vec<_>>()
                     ).into());
@@ -128,7 +152,8 @@ impl VTab for ReadZarrVTab {
         // DuckDB guarantees output.flat_vector(i) in scan() corresponds to
         // get_column_indices()[i] from init(). Do NOT sort — sorting destroys
         // the positional relationship and scrambles output in JOIN context.
-        let projected_cols: HashMap<usize, usize> = init.get_column_indices()
+        let projected_cols: HashMap<usize, usize> = init
+            .get_column_indices()
             .into_iter()
             .enumerate()
             .map(|(out_idx, col_idx)| (col_idx as usize, out_idx))
@@ -218,7 +243,11 @@ impl VTab for ReadZarrVTab {
     }
 
     fn named_parameters() -> Option<Vec<(String, duckdb::core::LogicalTypeHandle)>> {
-        Some(vec![("dims".to_string(), LogicalTypeId::Varchar.into())])
+        Some(vec![
+            ("dims".to_string(), LogicalTypeId::Varchar.into()),
+            ("array".to_string(), LogicalTypeId::Varchar.into()),
+            ("array_path".to_string(), LogicalTypeId::Varchar.into()),
+        ])
     }
 }
 
@@ -236,7 +265,11 @@ fn parse_dims_param(s: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> 
         let arr: Vec<String> = serde_json::from_str(trimmed)?;
         Ok(arr)
     } else {
-        Ok(trimmed.split(',').map(|d| d.trim().to_string()).filter(|d| !d.is_empty()).collect())
+        Ok(trimmed
+            .split(',')
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty())
+            .collect())
     }
 }
 
@@ -249,7 +282,11 @@ fn finish_bind(
     let mut coord_arrays: HashMap<String, CoordArray> = HashMap::new();
     for coord_name in &group.coord_var_names {
         let ca = load_coord_array(&store, coord_name)?;
-        coord_arrays.insert(coord_name.clone(), ca);
+        let arr = open_array(&store, coord_name)?;
+        let dims = dimension_names(&arr, coord_name)?;
+        if let Some(dim) = dims.first() {
+            coord_arrays.insert(dim.clone(), ca);
+        }
     }
 
     let columns = build_column_defs(&store, group, &coord_arrays)?;
@@ -296,12 +333,15 @@ fn decode_work_unit(
         if !projected.contains_key(&col_idx) {
             continue; // skip decompression for non-projected data vars
         }
-        let arr = bind.arrays.get(&col.name)
+        let arr = bind
+            .arrays
+            .get(&col.name)
             .ok_or_else(|| format!("array '{}' not found in bind cache", col.name))?;
         // ArrayBytes<'static>: zarrs convention for requesting owned decoded bytes.
         // retrieve_chunk fills missing (implicit) chunks with fill_value automatically.
         let raw = arr.retrieve_chunk::<zarrs::array::ArrayBytes<'static>>(&wu.chunk_indices)?;
-        let bytes: Vec<u8> = raw.into_fixed()
+        let bytes: Vec<u8> = raw
+            .into_fixed()
             .map_err(|_| format!("variable-length dtype not supported for '{}'", col.name))?
             .into_owned();
         chunk_bytes.insert(col.name.clone(), bytes);
@@ -428,7 +468,10 @@ fn fill_chunk_slice(
                         dst,
                     );
                 } else {
-                    unreachable!("projected data variable '{}' missing from chunk_bytes", col_def.name);
+                    unreachable!(
+                        "projected data variable '{}' missing from chunk_bytes",
+                        col_def.name
+                    );
                 }
             }
         }
@@ -455,7 +498,10 @@ fn fill_data_element(
                 vector, bytes, dtype, sentinel, flat_row, elem_size, dst,
             );
         }
-        ColumnEncoding::PackedInt { scale_factor, add_offset } => {
+        ColumnEncoding::PackedInt {
+            scale_factor,
+            add_offset,
+        } => {
             let src = flat_row * elem_size;
             let raw = crate::zarr_reader::scan::read_int_as_i64_pub(bytes, dtype, src);
             let is_null = match sentinel {

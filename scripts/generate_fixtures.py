@@ -8,7 +8,9 @@ See docs/design.md §Bind phase and §Type mapping for the requirements.
 Usage:
     uv run scripts/generate_fixtures.py
 
-Output: test/fixtures/xarray_tutorial/<name>.zarr
+Output:
+    test/fixtures/xarray_tutorial/<name>.zarr
+    test/fixtures/bioimage/ome_zarr/<name>.ome.zarr
 
 Note on base64-encoded _FillValue: xarray encodes ALL float _FillValue attrs
 as base64 when writing zarr v3 — including non-NaN values like -9.97e36.
@@ -61,6 +63,7 @@ import zarr
 
 ROOT = pathlib.Path(__file__).parent.parent
 FIXTURES = ROOT / "test" / "fixtures" / "xarray_tutorial"
+BIOIMAGE_FIXTURES = ROOT / "test" / "fixtures" / "bioimage" / "ome_zarr"
 
 
 def write_zarr(ds: xr.Dataset, name: str, encoding: dict | None = None) -> None:
@@ -110,6 +113,106 @@ def open_tutorial(name: str, **kwargs) -> xr.Dataset:
 
 def main() -> None:
     FIXTURES.mkdir(parents=True, exist_ok=True)
+    BIOIMAGE_FIXTURES.mkdir(parents=True, exist_ok=True)
+
+    # ── synthetic_multichannel (OME-Zarr bioimage) ──────────────────────────
+    # A minimal two-channel microscopy image with OME multiscales metadata.
+    # Writing it through xarray records named dimensions in the Zarr v3 array,
+    # which read_zarr exposes directly as ergonomic c/y/x SQL columns.
+    print("synthetic_multichannel (OME-Zarr bioimage)...")
+    dest = BIOIMAGE_FIXTURES / "synthetic_multichannel.ome.zarr"
+    if not (dest / "zarr.json").exists():
+        if dest.exists():
+            _rmtree(dest)
+        pixels = np.concatenate([
+            np.arange(1, 13, dtype="uint16").reshape(1, 3, 4),
+            np.arange(101, 113, dtype="uint16").reshape(1, 3, 4),
+        ])
+        image = xr.DataArray(
+            pixels,
+            dims=["c", "y", "x"],
+            attrs={"long_name": "synthetic two-channel microscopy image"},
+        )
+        ds_bioimage = xr.Dataset(
+            {"0": image},
+            attrs={
+                "multiscales": [{
+                    "version": "0.5",
+                    "name": "synthetic_multichannel",
+                    "axes": [
+                        {"name": "c", "type": "channel"},
+                        {"name": "y", "type": "space", "unit": "micrometer"},
+                        {"name": "x", "type": "space", "unit": "micrometer"},
+                    ],
+                    "datasets": [{
+                        "path": "0",
+                        "coordinateTransformations": [{
+                            "type": "scale",
+                            "scale": [1.0, 0.65, 0.65],
+                        }],
+                    }],
+                }],
+                "omero": {
+                    "name": "synthetic_multichannel",
+                    "channels": [
+                        {"label": "DNA", "color": "0000FF"},
+                        {"label": "RNA", "color": "FFFF00"},
+                    ],
+                },
+            },
+        )
+        ds_bioimage.to_zarr(
+            dest,
+            zarr_format=3,
+            consolidated=False,
+            encoding={"0": {"chunks": [1, 2, 2]}},
+        )
+        print(f"  wrote {dest}")
+    else:
+        print(f"  (cached) {dest}")
+
+    # Add a nested OME-Zarr labels hierarchy. Keeping this as a separate xarray
+    # write exercises recursive discovery and store-relative array selection.
+    label_path = dest / "labels" / "nuclei" / "0" / "zarr.json"
+    if not label_path.exists():
+        xr.Dataset(attrs={"labels": ["nuclei"]}).to_zarr(
+            dest,
+            group="labels",
+            mode="a",
+            zarr_format=3,
+            consolidated=False,
+        )
+        labels = xr.DataArray(
+            np.array([
+                [0, 1, 1, 0],
+                [0, 1, 2, 2],
+                [0, 0, 2, 0],
+            ], dtype="uint8"),
+            dims=["y", "x"],
+            attrs={"image-label": {"source": {"image": "../../"}}},
+        )
+        xr.Dataset(
+            {"0": labels},
+            attrs={
+                "multiscales": [{
+                    "version": "0.5",
+                    "name": "nuclei",
+                    "axes": [
+                        {"name": "y", "type": "space", "unit": "micrometer"},
+                        {"name": "x", "type": "space", "unit": "micrometer"},
+                    ],
+                    "datasets": [{"path": "0"}],
+                }],
+            },
+        ).to_zarr(
+            dest,
+            group="labels/nuclei",
+            mode="a",
+            zarr_format=3,
+            consolidated=False,
+            encoding={"0": {"chunks": [2, 2]}},
+        )
+        print(f"  wrote nested labels to {dest}")
 
     # ── float_baseline (synthetic) ───────────────────────────────────────────
     # True float32 baseline with no packing, no sentinels.
