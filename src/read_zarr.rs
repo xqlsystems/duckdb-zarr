@@ -94,14 +94,12 @@ impl VTab for ReadZarrVTab {
         }
 
         let group = match requested_dims {
-            Some(ref dims) => {
-                dim_groups.iter().find(|g| g.dims == *dims).ok_or_else(|| {
-                    format!(
-                        "'{store_path}': no dimension group matches dims={dims:?}; available: {:?}",
-                        dim_groups.iter().map(|g| &g.dims).collect::<Vec<_>>()
-                    )
-                })?
-            }
+            Some(ref dims) => dim_groups.iter().find(|g| g.dims == *dims).ok_or_else(|| {
+                format!(
+                    "'{store_path}': no dimension group matches dims={dims:?}; available: {:?}",
+                    dim_groups.iter().map(|g| &g.dims).collect::<Vec<_>>()
+                )
+            })?,
             None => {
                 if dim_groups.len() > 1 {
                     return Err(format!(
@@ -128,7 +126,8 @@ impl VTab for ReadZarrVTab {
         // DuckDB guarantees output.flat_vector(i) in scan() corresponds to
         // get_column_indices()[i] from init(). Do NOT sort — sorting destroys
         // the positional relationship and scrambles output in JOIN context.
-        let projected_cols: HashMap<usize, usize> = init.get_column_indices()
+        let projected_cols: HashMap<usize, usize> = init
+            .get_column_indices()
             .into_iter()
             .enumerate()
             .map(|(out_idx, col_idx)| (col_idx as usize, out_idx))
@@ -236,7 +235,11 @@ fn parse_dims_param(s: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> 
         let arr: Vec<String> = serde_json::from_str(trimmed)?;
         Ok(arr)
     } else {
-        Ok(trimmed.split(',').map(|d| d.trim().to_string()).filter(|d| !d.is_empty()).collect())
+        Ok(trimmed
+            .split(',')
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty())
+            .collect())
     }
 }
 
@@ -296,12 +299,15 @@ fn decode_work_unit(
         if !projected.contains_key(&col_idx) {
             continue; // skip decompression for non-projected data vars
         }
-        let arr = bind.arrays.get(&col.name)
+        let arr = bind
+            .arrays
+            .get(&col.name)
             .ok_or_else(|| format!("array '{}' not found in bind cache", col.name))?;
         // ArrayBytes<'static>: zarrs convention for requesting owned decoded bytes.
         // retrieve_chunk fills missing (implicit) chunks with fill_value automatically.
         let raw = arr.retrieve_chunk::<zarrs::array::ArrayBytes<'static>>(&wu.chunk_indices)?;
-        let bytes: Vec<u8> = raw.into_fixed()
+        let bytes: Vec<u8> = raw
+            .into_fixed()
             .map_err(|_| format!("variable-length dtype not supported for '{}'", col.name))?
             .into_owned();
         chunk_bytes.insert(col.name.clone(), bytes);
@@ -428,7 +434,10 @@ fn fill_chunk_slice(
                         dst,
                     );
                 } else {
-                    unreachable!("projected data variable '{}' missing from chunk_bytes", col_def.name);
+                    unreachable!(
+                        "projected data variable '{}' missing from chunk_bytes",
+                        col_def.name
+                    );
                 }
             }
         }
@@ -455,7 +464,10 @@ fn fill_data_element(
                 vector, bytes, dtype, sentinel, flat_row, elem_size, dst,
             );
         }
-        ColumnEncoding::PackedInt { scale_factor, add_offset } => {
+        ColumnEncoding::PackedInt {
+            scale_factor,
+            add_offset,
+        } => {
             let src = flat_row * elem_size;
             let raw = crate::zarr_reader::scan::read_int_as_i64_pub(bytes, dtype, src);
             let is_null = match sentinel {

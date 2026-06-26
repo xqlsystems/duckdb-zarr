@@ -67,7 +67,8 @@ pub fn open_store(
             unsafe { duckdb_destroy_file_system(&mut fs) };
         }
         Ok(Arc::new(zarrs_http::HTTPStore::new(path)?))
-    } else if lower.starts_with("s3://") || lower.starts_with("gs://") || lower.starts_with("az://") {
+    } else if lower.starts_with("s3://") || lower.starts_with("gs://") || lower.starts_with("az://")
+    {
         let fs = file_system.ok_or(
             "remote store requires a DuckDB FileSystem handle (call from a table function bind)",
         )?;
@@ -136,7 +137,7 @@ fn list_array_names_remote(store: &ZarrStore) -> Result<Vec<String>, Box<dyn std
     let group = Group::open(store.clone(), "/")?;
     let consolidated = group.consolidated_metadata().ok_or(
         "remote Zarr store has no consolidated metadata in zarr.json; \
-         re-write the store with consolidated=True (xarray: zarr.consolidate_metadata(store))"
+         re-write the store with consolidated=True (xarray: zarr.consolidate_metadata(store))",
     )?;
     let mut names: Vec<String> = consolidated
         .metadata
@@ -159,10 +160,7 @@ fn list_array_names_remote(store: &ZarrStore) -> Result<Vec<String>, Box<dyn std
 }
 
 /// Open one array by name from the store.
-pub fn open_array(
-    store: &ZarrStore,
-    name: &str,
-) -> Result<ZarrArray, Box<dyn std::error::Error>> {
+pub fn open_array(store: &ZarrStore, name: &str) -> Result<ZarrArray, Box<dyn std::error::Error>> {
     let path = format!("/{name}");
     Ok(Array::open(store.clone(), &path)?)
 }
@@ -199,10 +197,7 @@ pub fn dimension_names(
 
 /// Parse `ZarrDtype` from the zarrs DataType.
 /// `DataType::to_string()` may emit "v3_name / v2_name"; we use the v3 name (first token).
-pub fn parse_dtype(
-    array: &ZarrArray,
-    name: &str,
-) -> Result<ZarrDtype, Box<dyn std::error::Error>> {
+pub fn parse_dtype(array: &ZarrArray, name: &str) -> Result<ZarrDtype, Box<dyn std::error::Error>> {
     let full = array.data_type().to_string();
     let type_str = full.split(" / ").next().unwrap_or(&full);
     ZarrDtype::from_str(type_str)
@@ -243,8 +238,12 @@ fn parse_sentinel(
     dtype: &ZarrDtype,
     attrs: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<FillSentinel> {
-    let fill = attrs.get("_FillValue").and_then(|v| parse_fill_value(dtype, v));
-    let missing = attrs.get("missing_value").and_then(|v| parse_fill_value(dtype, v));
+    let fill = attrs
+        .get("_FillValue")
+        .and_then(|v| parse_fill_value(dtype, v));
+    let missing = attrs
+        .get("missing_value")
+        .and_then(|v| parse_fill_value(dtype, v));
     // xarray encodes _FillValue=NaN when it has already replaced fill values with NaN
     // in memory. For stores that use missing_value as the actual on-disk sentinel,
     // NaN in _FillValue is not the sentinel we need to mask; prefer missing_value.
@@ -328,10 +327,7 @@ fn parse_zarr_fill_sentinel(array: &ZarrArray, dtype: &ZarrDtype) -> Option<Fill
 
 /// Collect the set of non-dimension coord names from all `coordinates` attrs
 /// across all arrays. These must be excluded from dim-group classification.
-pub fn collect_auxiliary_coords(
-    store: &ZarrStore,
-    array_names: &[String],
-) -> HashSet<String> {
+pub fn collect_auxiliary_coords(store: &ZarrStore, array_names: &[String]) -> HashSet<String> {
     let mut aux = HashSet::new();
     for name in array_names {
         if let Ok(arr) = open_array(store, name) {
@@ -509,7 +505,9 @@ pub fn load_coord_array(
     // decoded bytes; zarrs allocates a fresh Vec<u8> satisfying the 'static bound.
     let subset = arr.subset_all();
     let array_bytes = arr.retrieve_array_subset::<zarrs::array::ArrayBytes<'static>>(&subset)?;
-    let raw = array_bytes.into_fixed().map_err(|_| "coord array has variable-length dtype")?;
+    let raw = array_bytes
+        .into_fixed()
+        .map_err(|_| "coord array has variable-length dtype")?;
     let bytes: Vec<u8> = raw.into_owned();
     debug_assert_eq!(
         bytes.len(),
@@ -532,9 +530,7 @@ pub fn build_work_units(group: &DimGroup) -> Vec<WorkUnit> {
         .dims
         .iter()
         .enumerate()
-        .map(|(i, _)| {
-            group.shape[i].div_ceil(group.chunk_shape[i])
-        })
+        .map(|(i, _)| group.shape[i].div_ceil(group.chunk_shape[i]))
         .collect();
 
     // Total number of chunks.

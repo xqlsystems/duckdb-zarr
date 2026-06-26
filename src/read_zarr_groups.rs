@@ -3,7 +3,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use duckdb::core::LogicalTypeId;
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
 
-use crate::zarr_reader::meta::{extract_file_system, infer_dim_groups, list_array_names, open_store};
+use crate::zarr_reader::meta::{
+    extract_file_system, infer_dim_groups, list_array_names, open_store,
+};
 
 #[derive(Debug, Clone)]
 struct GroupRow {

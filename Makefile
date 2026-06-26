@@ -1,4 +1,4 @@
-.PHONY: clean clean_all generate_fixtures
+.PHONY: clean clean_all clippy fmt fmt-check generate_fixtures lint
 
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
@@ -38,6 +38,17 @@ release: build_extension_library_release build_extension_with_metadata_release
 test: test_debug
 test_debug: generate_fixtures test_extension_debug
 test_release: generate_fixtures test_extension_release
+
+fmt:
+	cargo fmt --all
+
+fmt-check:
+	cargo fmt --all -- --check
+
+clippy:
+	cargo clippy --lib --all-features -- -D warnings
+
+lint: fmt-check clippy
 
 generate_fixtures:
 	@if command -v uv >/dev/null 2>&1; then \
