@@ -16,4 +16,8 @@ remote sensing, but those domains do not yet have representative fixtures in
 the test suite. Support claims should follow the addition of domain-specific
 test data and queries.
 
+GeoZarr-style pyramids are a likely next area to evaluate because they share
+some structural patterns with OME-Zarr multiscales, but they are not currently
+covered by fixtures.
+
 See [Querying OME-Zarr](ome-zarr.md) for the current bioimage example.

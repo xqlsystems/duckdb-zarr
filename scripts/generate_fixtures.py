@@ -171,8 +171,10 @@ def main() -> None:
     else:
         print(f"  (cached) {dest}")
 
-    # Add a nested OME-Zarr labels hierarchy. Keeping this as a separate xarray
-    # write exercises recursive discovery and store-relative array selection.
+    # Add a nested OME-Zarr labels hierarchy. This is a dense integer label
+    # image, not a ragged array: each pixel stores 0 for background or an object
+    # id. Keeping this as a separate xarray write exercises recursive discovery
+    # and store-relative array selection.
     label_path = dest / "labels" / "nuclei" / "0" / "zarr.json"
     if not label_path.exists():
         xr.Dataset(attrs={"labels": ["nuclei"]}).to_zarr(

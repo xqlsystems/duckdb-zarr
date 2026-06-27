@@ -8,6 +8,10 @@ SELECT name, dims, shape, dtype
 FROM read_zarr_metadata('image.ome.zarr');
 ```
 
+The `array_path` argument is optional. Use it when a store has multiple
+resolution levels, nested labels, or otherwise ambiguous array groups. The path
+is the same store-relative path reported by `read_zarr_metadata`.
+
 Then select a resolution level and aggregate a region by channel:
 
 ```sql

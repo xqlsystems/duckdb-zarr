@@ -126,6 +126,9 @@ impl VTab for ReadZarrGroupsVTab {
     }
 
     fn named_parameters() -> Option<Vec<(String, duckdb::core::LogicalTypeHandle)>> {
+        // DuckDB named parameters are optional. These selectors narrow the
+        // discovered groups when present; omitting both returns all compatible
+        // groups discovered in the store.
         Some(vec![
             ("array".to_string(), LogicalTypeId::Varchar.into()),
             ("array_path".to_string(), LogicalTypeId::Varchar.into()),
