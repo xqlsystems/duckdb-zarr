@@ -25,13 +25,26 @@ make
 
 # Run tests
 make test
+
+# Format Rust code
+make fmt
+
+# Check formatting and run Clippy
+make lint
+
+# Install the Git hooks
+uv run prek install
+
+# Run the hooks against the whole repository
+uv run prek run --all-files
 ```
 
 Tests live in `test/sql/` as DuckDB `.test` files. New functionality should include corresponding tests.
 
 ## Code style
 
-- Rust: `cargo fmt` and `cargo clippy` must pass before submission.
+- Rust: `make lint` must pass before submission.
+- Git hooks: `prek` applies rustfmt and runs Clippy before each commit.
 - Commit messages: short imperative subject line, blank line, then details if needed.
 
 ## Submitting a pull request

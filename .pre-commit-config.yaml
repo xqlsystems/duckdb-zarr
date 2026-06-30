@@ -1,0 +1,15 @@
+repos:
+  - repo: local
+    hooks:
+      - id: rustfmt
+        name: rustfmt
+        entry: make fmt
+        language: system
+        files: \.rs$
+        pass_filenames: false
+      - id: clippy
+        name: Clippy
+        entry: make clippy
+        language: system
+        files: (^Cargo\.(toml|lock)$|\.rs$)
+        pass_filenames: false
