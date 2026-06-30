@@ -16,9 +16,7 @@ unsafe fn duckdb_zarr_init_c_api_internal(
             return Ok(false);
         }
 
-        let get_database = (*access)
-            .get_database
-            .ok_or("get_database is null")?;
+        let get_database = (*access).get_database.ok_or("get_database is null")?;
         let db_ptr = get_database(info);
         if db_ptr.is_null() {
             return Ok(false);

@@ -91,11 +91,11 @@ macro_rules! impl_null_check_int {
     };
 }
 
-impl_null_check_int!(i8,  Int,  i64);
-impl_null_check_int!(i16, Int,  i64);
-impl_null_check_int!(i32, Int,  i64);
-impl_null_check_int!(i64, Int,  i64);
-impl_null_check_int!(u8,  UInt, u64);
+impl_null_check_int!(i8, Int, i64);
+impl_null_check_int!(i16, Int, i64);
+impl_null_check_int!(i32, Int, i64);
+impl_null_check_int!(i64, Int, i64);
+impl_null_check_int!(u8, UInt, u64);
 impl_null_check_int!(u16, UInt, u64);
 impl_null_check_int!(u32, UInt, u64);
 impl_null_check_int!(u64, UInt, u64);
@@ -108,7 +108,11 @@ impl NullCheck for f32 {
             // widths match, then use exact equality — not an epsilon band, which would
             // incorrectly mask non-sentinel values near zero.
             Some(FillSentinel::Float(v)) => {
-                if v.is_nan() { self.is_nan() } else { (self as f64) == *v }
+                if v.is_nan() {
+                    self.is_nan()
+                } else {
+                    (self as f64) == *v
+                }
             }
             _ => false,
         }
@@ -119,7 +123,11 @@ impl NullCheck for f64 {
     fn check_fill(self, s: &Option<FillSentinel>) -> bool {
         match s {
             Some(FillSentinel::Float(v)) => {
-                if v.is_nan() { self.is_nan() } else { self == *v }
+                if v.is_nan() {
+                    self.is_nan()
+                } else {
+                    self == *v
+                }
             }
             _ => false,
         }

@@ -12,12 +12,12 @@ use crate::zarr_reader::meta::{
 #[derive(Debug, Clone)]
 struct MetaRow {
     name: String,
-    dims: String,       // JSON array string e.g. '["lat","lon"]'
+    dims: String, // JSON array string e.g. '["lat","lon"]'
     dtype: String,
-    shape: String,      // JSON array string e.g. '[4,6]'
+    shape: String, // JSON array string e.g. '[4,6]'
     chunk_shape: String,
-    attrs: String,      // full attrs as JSON string
-    role: String,       // "coord" | "data" | "aux_coord" | "bounds" | "scalar" | "unknown"
+    attrs: String, // full attrs as JSON string
+    role: String,  // "coord" | "data" | "aux_coord" | "bounds" | "scalar" | "unknown"
 }
 
 pub struct ReadZarrMetaBind {
@@ -82,10 +82,7 @@ impl VTab for ReadZarrMetaVTab {
                 "scalar"
             } else if aux_coords.contains(name) {
                 "aux_coord"
-            } else if shape.len() == 1
-                && dims.len() == 1
-                && dims[0] == *name
-            {
+            } else if shape.len() == 1 && dims.len() == 1 && dims[0] == *name {
                 "coord"
             } else {
                 "data"

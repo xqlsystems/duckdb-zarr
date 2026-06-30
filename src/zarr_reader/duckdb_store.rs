@@ -1,8 +1,8 @@
 use std::ffi::CString;
 
 use zarrs::storage::{
-    byte_range::ByteRangeIterator, Bytes, MaybeBytesIterator, ReadableStorageTraits,
-    StorageError, StoreKey,
+    byte_range::ByteRangeIterator, Bytes, MaybeBytesIterator, ReadableStorageTraits, StorageError,
+    StoreKey,
 };
 
 use duckdb::ffi::{
@@ -47,10 +47,7 @@ impl DuckDbStore {
     }
 
     /// Opens a file for reading. Returns `None` if the key does not exist.
-    unsafe fn open_read(
-        &self,
-        key: &StoreKey,
-    ) -> Result<Option<duckdb_file_handle>, StorageError> {
+    unsafe fn open_read(&self, key: &StoreKey) -> Result<Option<duckdb_file_handle>, StorageError> {
         let path_cstr = self.key_path(key)?;
         let opts = duckdb_create_file_open_options();
         duckdb_file_open_options_set_flag(opts, duckdb_file_flag_DUCKDB_FILE_FLAG_READ, true);
@@ -93,9 +90,8 @@ impl ReadableStorageTraits for DuckDbStore {
                 continue;
             }
             let mut buf = vec![0u8; length as usize];
-            let bytes_read = unsafe {
-                duckdb_file_handle_read(handle, buf.as_mut_ptr().cast(), length as i64)
-            };
+            let bytes_read =
+                unsafe { duckdb_file_handle_read(handle, buf.as_mut_ptr().cast(), length as i64) };
             if bytes_read < 0 || bytes_read as u64 != length {
                 results.push(Err(StorageError::Other(format!(
                     "read of {length} bytes at offset {offset} returned {bytes_read}"
