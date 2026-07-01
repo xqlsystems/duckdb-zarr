@@ -56,6 +56,37 @@ SELECT * FROM read_zarr('/path/to/my/array.zarr')
 WHERE dimension_0 > 100 AND dimension_1 < 50;
 ```
 
+For a small bioimage walkthrough, see [Querying OME-Zarr](ome-zarr.md).
+For the domains covered by the current test suite, see
+[Tested scientific domains](domains.md).
+
+### OME-Zarr Features
+
+OME-Zarr stores often contain nested arrays for resolution levels and labels.
+Use metadata discovery first to see the available store-relative paths:
+
+```sql
+SELECT name, dims, shape, dtype
+FROM read_zarr_metadata('/path/to/image.ome.zarr');
+```
+
+Then pass `array_path=` when you want a specific image or label array:
+
+```sql
+SELECT c, AVG("0") AS mean_intensity
+FROM read_zarr('/path/to/image.ome.zarr', array_path='0')
+GROUP BY c;
+
+SELECT "labels/nuclei/0" AS label, COUNT(*) AS pixels
+FROM read_zarr('/path/to/image.ome.zarr', array_path='labels/nuclei/0')
+WHERE "labels/nuclei/0" > 0
+GROUP BY label;
+```
+
+`array_path` is optional for simple stores where the reader can infer a single
+compatible array group. It becomes useful for multiscale images, nested labels,
+or stores with multiple incompatible array shapes.
+
 ## Development Setup
 
 ```shell

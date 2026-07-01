@@ -1,0 +1,97 @@
+# name: test/sql/bioimage_ome_zarr.test
+# description: xarray-style SQL queries over an OME-Zarr bioimage
+# group: [duckdb_zarr]
+
+require duckdb_zarr
+
+load duckdb_zarr
+
+# The fixture is written by xarray with named c/y/x dimensions and OME-Zarr
+# multiscales metadata. The array is named "0", following the conventional
+# path for the highest-resolution level of a multiscale bioimage.
+
+query I
+SELECT COUNT(*)
+FROM read_zarr(
+    'test/fixtures/bioimage/ome_zarr/synthetic_multichannel.ome.zarr',
+    array_path = '0'
+);
+----
+24
+
+# Named xarray dimensions make channel and spatial queries self-describing.
+query II rowsort
+SELECT c, SUM("0")
+FROM read_zarr(
+    'test/fixtures/bioimage/ome_zarr/synthetic_multichannel.ome.zarr',
+    array_path = '0'
+)
+GROUP BY c;
+----
+0	78
+1	1278
+
+# Query a spatial region from the DNA channel using image-axis names.
+query II
+SELECT COUNT(*), SUM("0")
+FROM read_zarr(
+    'test/fixtures/bioimage/ome_zarr/synthetic_multichannel.ome.zarr',
+    array_path = '0'
+)
+WHERE c = 0 AND y < 2 AND x < 2;
+----
+4	14
+
+# The OME-Zarr array is discoverable as one c/y/x dimension group.
+query II rowsort
+SELECT dims, data_vars
+FROM read_zarr_groups('test/fixtures/bioimage/ome_zarr/synthetic_multichannel.ome.zarr');
+----
+["c","y","x"]	["0"]
+["y","x"]	["labels/nuclei/0"]
+
+# Recursive metadata discovery reports arrays inside the labels hierarchy.
+query TT rowsort
+SELECT name, role
+FROM read_zarr_metadata('test/fixtures/bioimage/ome_zarr/synthetic_multichannel.ome.zarr');
+----
+0	data
+labels/nuclei/0	data
+
+# array_path= selects a nested image-label array while retaining named image axes.
+query III
+SELECT COUNT(*), COUNT(*) FILTER (WHERE "labels/nuclei/0" > 0), SUM("labels/nuclei/0")
+FROM read_zarr(
+    'test/fixtures/bioimage/ome_zarr/synthetic_multichannel.ome.zarr',
+    array_path = 'labels/nuclei/0'
+);
+----
+12	6	9
+
+# Metadata and group inspection accept the same store-relative selector.
+query T
+SELECT shape
+FROM read_zarr_metadata(
+    'test/fixtures/bioimage/ome_zarr/synthetic_multichannel.ome.zarr',
+    "array" = '/labels/nuclei/0/'
+);
+----
+[3,4]
+
+query TT
+SELECT dims, data_vars
+FROM read_zarr_groups(
+    'test/fixtures/bioimage/ome_zarr/synthetic_multichannel.ome.zarr',
+    array_path = 'labels/nuclei/0'
+);
+----
+["y","x"]	["labels/nuclei/0"]
+
+statement error
+SELECT *
+FROM read_zarr(
+    'test/fixtures/bioimage/ome_zarr/synthetic_multichannel.ome.zarr',
+    array_path = 'labels/missing/0'
+);
+----
+array 'labels/missing/0' not found

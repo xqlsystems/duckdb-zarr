@@ -6,8 +6,9 @@ use duckdb::core::{DataChunkHandle, LogicalTypeId};
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
 
 use crate::zarr_reader::meta::{
-    build_column_defs, build_work_units, extract_file_system, infer_dim_groups, load_coord_array,
-    open_array, open_store, ZarrArray, ZarrStore,
+    build_column_defs, build_work_units, dim_group_for_array, dimension_names, extract_file_system,
+    infer_dim_groups, load_coord_array, open_array, open_store, select_array_name, ZarrArray,
+    ZarrStore,
 };
 use crate::zarr_reader::types::{ColumnDef, CoordArray, DimGroup, WorkUnit, ZarrDtype};
 
@@ -78,6 +79,16 @@ impl VTab for ReadZarrVTab {
             .get_named_parameter("dims")
             .map(|v| parse_dims_param(&v.to_string()))
             .transpose()?;
+        let array_path = bind
+            .get_named_parameter("array_path")
+            .map(|value| value.to_string());
+        let array_alias = bind
+            .get_named_parameter("array")
+            .map(|value| value.to_string());
+        if array_path.is_some() && array_alias.is_some() {
+            return Err("use either array_path= or \"array\"=, not both".into());
+        }
+        let requested_array = array_path.or(array_alias);
 
         let fs = unsafe { extract_file_system(bind) };
         let store = open_store(&store_path, Some(fs))?;
@@ -85,6 +96,21 @@ impl VTab for ReadZarrVTab {
 
         if array_names.is_empty() {
             return Err(format!("no Zarr arrays found in '{store_path}'").into());
+        }
+
+        if let Some(requested) = requested_array {
+            let array_name = select_array_name(&array_names, &requested)?;
+            let group = dim_group_for_array(&store, &array_names, &array_name)?;
+            if let Some(dims) = requested_dims {
+                if group.dims != dims {
+                    return Err(format!(
+                        "array '{array_name}' has dimensions {:?}, not {dims:?}",
+                        group.dims
+                    )
+                    .into());
+                }
+            }
+            return finish_bind(bind, store, &group);
         }
 
         let (dim_groups, _coord_names) = infer_dim_groups(&store, &array_names)?;
@@ -103,7 +129,7 @@ impl VTab for ReadZarrVTab {
             None => {
                 if dim_groups.len() > 1 {
                     return Err(format!(
-                        "'{store_path}' contains multiple dimension groups ({}) {:?}; use read_zarr(path, dims='[\"time\",\"lat\",\"lon\"]') to select one",
+                        "'{store_path}' contains multiple dimension groups ({}) {:?}; use dims= to select a compatible group or array_path= to select one array",
                         dim_groups.len(),
                         dim_groups.iter().map(|g| &g.dims).collect::<Vec<_>>()
                     ).into());
@@ -217,7 +243,11 @@ impl VTab for ReadZarrVTab {
     }
 
     fn named_parameters() -> Option<Vec<(String, duckdb::core::LogicalTypeHandle)>> {
-        Some(vec![("dims".to_string(), LogicalTypeId::Varchar.into())])
+        Some(vec![
+            ("dims".to_string(), LogicalTypeId::Varchar.into()),
+            ("array".to_string(), LogicalTypeId::Varchar.into()),
+            ("array_path".to_string(), LogicalTypeId::Varchar.into()),
+        ])
     }
 }
 
@@ -252,7 +282,11 @@ fn finish_bind(
     let mut coord_arrays: HashMap<String, CoordArray> = HashMap::new();
     for coord_name in &group.coord_var_names {
         let ca = load_coord_array(&store, coord_name)?;
-        coord_arrays.insert(coord_name.clone(), ca);
+        let arr = open_array(&store, coord_name)?;
+        let dims = dimension_names(&arr, coord_name)?;
+        if let Some(dim) = dims.first() {
+            coord_arrays.insert(dim.clone(), ca);
+        }
     }
 
     let columns = build_column_defs(&store, group, &coord_arrays)?;
