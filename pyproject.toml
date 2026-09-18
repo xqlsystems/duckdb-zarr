@@ -11,6 +11,7 @@ dependencies = [
     "h5netcdf",
     "h5py",
     "pooch",
+    "anndata",
 ]
 
 [dependency-groups]

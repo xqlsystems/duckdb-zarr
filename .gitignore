@@ -12,6 +12,7 @@ __pycache__
 .mcp.json
 test/fixtures/xarray_tutorial
 test/fixtures/bioimage
+test/fixtures/anndata
 
 # CCE (code-context-engine)
 # CCE local cache (per-machine, not for version control)

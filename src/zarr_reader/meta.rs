@@ -361,9 +361,9 @@ pub fn dim_group_for_array(
     // `dimension_names` nor `_ARRAY_DIMENSIONS` on the array itself.
     let dims = match dimension_names(&arr, array_name) {
         Ok(dims) => dims,
-        Err(err) => ome_axis_names(store, array_name)
+        Err(_) => ome_axis_names(store, array_name)
             .filter(|axes| axes.len() == shape.len())
-            .ok_or(err)?,
+            .unwrap_or_else(|| synthesize_dim_names(shape.len())),
     };
     let first_chunk = vec![0u64; shape.len()];
     let chunk_shape = arr
@@ -493,6 +493,21 @@ pub fn dimension_names(
             .collect());
     }
     Err(format!("array '{name}' has no dimension_names or _ARRAY_DIMENSIONS").into())
+}
+
+/// Synthesize `dim_0..dim_{ndim-1}` for an array with no dimension metadata at all.
+fn synthesize_dim_names(ndim: usize) -> Vec<String> {
+    (0..ndim).map(|i| format!("dim_{i}")).collect()
+}
+
+/// Like [`dimension_names`], but never fails: synthesizes `dim_0..dim_{ndim-1}`
+/// (by array rank) instead of erroring when neither the v3 `dimension_names`
+/// field nor the `_ARRAY_DIMENSIONS` attr is present. AnnData/zarr-python never
+/// write either — this is the convention their stores rely on implicitly
+/// (issue #40) — so treating missing dim metadata as fatal makes such stores
+/// unreadable even via `array_path=`. See docs/design.md > Bind phase.
+pub fn dimension_names_or_synthesize(array: &ZarrArray, name: &str) -> Vec<String> {
+    dimension_names(array, name).unwrap_or_else(|_| synthesize_dim_names(array.shape().len()))
 }
 
 /// Parse `ZarrDtype` from the zarrs DataType.
@@ -742,7 +757,7 @@ pub fn infer_dim_groups(
 
     for var_name in &data_vars {
         let arr = open_array(store, var_name)?;
-        let dims = dimension_names(&arr, var_name)?;
+        let dims = dimension_names_or_synthesize(&arr, var_name);
         let shape = arr.shape().to_vec();
 
         let ndim = shape.len();
@@ -830,7 +845,7 @@ pub fn discover_dim_groups(
         if shape.is_empty() {
             continue;
         }
-        let dims = dimension_names(&arr, name)?;
+        let dims = dimension_names_or_synthesize(&arr, name);
         let chunk_shape = arr
             .chunk_shape(&vec![0u64; shape.len()])?
             .iter()
@@ -1036,5 +1051,93 @@ mod tests {
             "root zarr.json cache entry lost its consolidated_metadata block: {parsed}"
         );
         assert!(cache.contains_key(&StoreKey::new("foo/zarr.json").unwrap()));
+    }
+
+    #[test]
+    fn dimension_names_or_synthesize_falls_back_to_dim_n() {
+        // AnnData/zarr-python arrays carry neither zarr v3 `dimension_names`
+        // nor a Zarr v2 `_ARRAY_DIMENSIONS` attr (issue #40). Without a
+        // fallback, `dimension_names()` would reject every array in such a
+        // store, even via `array_path=`.
+        let store_inner = Arc::new(MemoryStore::new());
+        let array = zarrs::array::ArrayBuilder::new(
+            vec![20, 8],
+            vec![20, 8],
+            zarrs::array::data_type::float32(),
+            zarrs::array::ZARR_NAN_F32,
+        )
+        .build(store_inner.clone(), "/X")
+        .unwrap();
+        array.store_metadata().unwrap();
+        let store: ZarrStore = store_inner;
+
+        let arr = open_array(&store, "X").unwrap();
+        assert!(dimension_names(&arr, "X").is_err());
+        assert_eq!(
+            dimension_names_or_synthesize(&arr, "X"),
+            vec!["dim_0".to_string(), "dim_1".to_string()]
+        );
+    }
+
+    /// End-to-end sanity check against the real, `anndata`-writer-produced
+    /// fixture (issue #40): synthesized dim names on a real array, string
+    /// dtype decoding through zarrs' `sharding_indexed` codec (what recent
+    /// `anndata`/zarr-python versions wrap `vlen-utf8` columns in), and the
+    /// deterministic CSR `X` component values documented in
+    /// `scripts/generate_fixtures.py`. Complements the SQL-level
+    /// `test/sql/anndata.test`, which exercises the same fixture through the
+    /// full `read_zarr`/`read_zarr_metadata` table functions.
+    #[test]
+    fn reads_real_anndata_fixture() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test/fixtures/anndata/pbmc_like.zarr"
+        );
+        let store: ZarrStore = Arc::new(FilesystemStore::new(fixture).unwrap());
+
+        // X/data has no dimension_names/_ARRAY_DIMENSIONS at all (AnnData
+        // never writes them) — must synthesize, not error.
+        let x_data = open_array(&store, "X/data").unwrap();
+        assert!(dimension_names(&x_data, "X/data").is_err());
+        assert_eq!(
+            dimension_names_or_synthesize(&x_data, "X/data"),
+            vec!["dim_0".to_string()]
+        );
+
+        // Deterministic CSR values from generate_fixtures.py: nonzero at
+        // (i, j) where (i + j) % 5 == 0, value = i*10 + j + 1.
+        let data = x_data
+            .retrieve_array_subset::<Vec<f32>>(&x_data.subset_all())
+            .unwrap();
+        assert_eq!(data.len(), 32);
+        assert_eq!(data[0], 1.0); // (i=0, j=0)
+        assert_eq!(data[data.len() - 1], 197.0); // (i=19, j=6)
+
+        let indptr = open_array(&store, "X/indptr").unwrap();
+        let indptr_vals = indptr
+            .retrieve_array_subset::<zarrs::array::ArrayBytes<'static>>(&indptr.subset_all())
+            .unwrap()
+            .into_fixed()
+            .unwrap()
+            .into_owned();
+        let indptr_i32: Vec<i32> = indptr_vals
+            .chunks_exact(4)
+            .map(|b| i32::from_ne_bytes(b.try_into().unwrap()))
+            .collect();
+        assert_eq!(indptr_i32.first(), Some(&0));
+        assert_eq!(indptr_i32.last(), Some(&32));
+
+        // var/gene_symbol is a `nullable-string-array` group (values + mask),
+        // not a plain array — read through to `.../values` like the SQL test does.
+        let gene_symbol = open_array(&store, "var/gene_symbol/values").unwrap();
+        assert_eq!(
+            parse_dtype(&gene_symbol, "var/gene_symbol/values").unwrap(),
+            ZarrDtype::String
+        );
+        let symbols = gene_symbol
+            .retrieve_array_subset::<Vec<String>>(&gene_symbol.subset_all())
+            .unwrap();
+        assert_eq!(symbols[0], "Actb");
+        assert_eq!(symbols[7], "Foxp3");
     }
 }

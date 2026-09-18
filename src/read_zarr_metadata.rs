@@ -4,7 +4,7 @@ use duckdb::core::LogicalTypeId;
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
 
 use crate::zarr_reader::meta::{
-    collect_auxiliary_coords, collect_bounds_vars, dimension_names as get_dim_names,
+    collect_auxiliary_coords, collect_bounds_vars, dimension_names_or_synthesize as get_dim_names,
     extract_file_system, list_array_names, open_array, open_store, select_array_name,
 };
 
@@ -17,7 +17,7 @@ struct MetaRow {
     shape: String, // JSON array string e.g. '[4,6]'
     chunk_shape: String,
     attrs: String, // full attrs as JSON string
-    role: String,  // "coord" | "data" | "aux_coord" | "bounds" | "scalar" | "unknown"
+    role: String, // "coord" | "data" | "aux_coord" | "bounds" | "scalar" | "unsupported" | "unknown"
 }
 
 pub struct ReadZarrMetaBind {
@@ -71,7 +71,24 @@ impl VTab for ReadZarrMetaVTab {
 
         let mut rows = Vec::new();
         for name in &array_names {
-            let arr = open_array(&store, name)?;
+            // zarrs itself may refuse to open an array whose dtype it doesn't
+            // recognize (e.g. certain `uns` entries in AnnData stores) — degrade
+            // to a single "unsupported" row instead of failing the whole call.
+            let arr = match open_array(&store, name) {
+                Ok(arr) => arr,
+                Err(err) => {
+                    rows.push(MetaRow {
+                        name: name.clone(),
+                        dims: "[]".to_string(),
+                        dtype: err.to_string(),
+                        shape: "[]".to_string(),
+                        chunk_shape: "[]".to_string(),
+                        attrs: "{}".to_string(),
+                        role: "unsupported".to_string(),
+                    });
+                    continue;
+                }
+            };
             let shape = arr.shape().to_vec();
             // chunk_grid_shape() returns number-of-chunks per dim, NOT element shape.
             // Use chunk_shape([0,0,...]) to get the actual per-chunk element dimensions.
@@ -84,7 +101,7 @@ impl VTab for ReadZarrMetaVTab {
                 Vec::new()
             };
 
-            let dims = get_dim_names(&arr, name).unwrap_or_default();
+            let dims = get_dim_names(&arr, name);
             let dtype_str = arr.data_type().to_string();
             let attrs = arr.attributes().clone();
 

@@ -57,13 +57,17 @@ def _rmtree(path: pathlib.Path) -> None:
     except PermissionError:
         subprocess.run(['sudo', 'rm', '-rf', str(path)], check=False)
 
+import anndata as ad
 import numpy as np
+import pandas as pd
+import scipy.sparse
 import xarray as xr
 import zarr
 
 ROOT = pathlib.Path(__file__).parent.parent
 FIXTURES = ROOT / "test" / "fixtures" / "xarray_tutorial"
 BIOIMAGE_FIXTURES = ROOT / "test" / "fixtures" / "bioimage" / "ome_zarr"
+ANNDATA_FIXTURES = ROOT / "test" / "fixtures" / "anndata"
 
 
 def write_zarr(ds: xr.Dataset, name: str, encoding: dict | None = None) -> None:
@@ -114,6 +118,7 @@ def open_tutorial(name: str, **kwargs) -> xr.Dataset:
 def main() -> None:
     FIXTURES.mkdir(parents=True, exist_ok=True)
     BIOIMAGE_FIXTURES.mkdir(parents=True, exist_ok=True)
+    ANNDATA_FIXTURES.mkdir(parents=True, exist_ok=True)
 
     # ── synthetic_multichannel (OME-Zarr bioimage) ──────────────────────────
     # A minimal two-channel microscopy image with OME multiscales metadata.
@@ -626,6 +631,68 @@ def main() -> None:
             _rmtree(dest)
         http_ds.to_zarr(dest, zarr_format=3, consolidated=False)
         zarr.consolidate_metadata(str(dest))
+        print(f"  wrote {dest}")
+
+    # ── anndata/pbmc_like (real anndata writer) ──────────────────────────────
+    # Tests: AnnData-style Zarr compatibility (issue #40) — arrays with no
+    # `dimension_names`/`_ARRAY_DIMENSIONS` (AnnData/zarr-python never write
+    # either), `obs`/`var` string + categorical columns, and a sparse CSR `X`
+    # read component-by-component via array_path= and reconstructed with
+    # plain SQL, per the pattern demonstrated in the issue thread. Written
+    # with the real `anndata` package (not hand-built) so the on-disk layout
+    # matches actual AnnData writers exactly. X's nonzero pattern and values
+    # are a deterministic formula (not random) so SQL tests can assert exact
+    # expected values without re-deriving them from the file.
+    print("anndata/pbmc_like (synthetic, real anndata writer)...")
+    dest = ANNDATA_FIXTURES / "pbmc_like.zarr"
+    if (dest / "zarr.json").exists() or (dest / ".zattrs").exists():
+        print(f"  (cached) {dest}")
+    else:
+        if dest.exists():
+            _rmtree(dest)
+
+        n_obs, n_var = 20, 8
+
+        # Deterministic sparse X: nonzero at (i, j) where (i + j) % 5 == 0,
+        # value = i*10 + j + 1 (never zero, so no explicit-zero ambiguity).
+        # ~29% density (32/160 cells) — realistic for scRNA-seq counts.
+        dense = np.zeros((n_obs, n_var), dtype=np.float32)
+        for i in range(n_obs):
+            for j in range(n_var):
+                if (i + j) % 5 == 0:
+                    dense[i, j] = i * 10 + j + 1
+        X = scipy.sparse.csr_matrix(dense)
+
+        obs = pd.DataFrame(
+            {
+                "cell_type": pd.Categorical(
+                    [["T cell", "B cell", "NK cell"][i % 3] for i in range(n_obs)]
+                ),
+                # All-unique on purpose: anndata auto-converts object columns to
+                # categorical when doing so saves space (fewer categories than
+                # rows). Uniqueness keeps this a plain string column so the
+                # fixture exercises both encodings (see cell_type below).
+                "donor": [f"donor_{i:02d}" for i in range(n_obs)],
+                "n_genes": np.asarray(
+                    (dense > 0).sum(axis=1), dtype=np.int64
+                ),
+            },
+            index=[f"cell_{i}" for i in range(n_obs)],
+        )
+        var = pd.DataFrame(
+            {
+                "gene_symbol": ["Actb", "Gapdh", "Myc", "Tp53",
+                                "Cd8a", "Cd4", "Il2", "Foxp3"],
+                "mean_expr": np.asarray(dense.mean(axis=0), dtype=np.float64),
+            },
+            index=[f"gene_{j}" for j in range(n_var)],
+        )
+        obsm = {
+            "X_umap": np.arange(n_obs * 2, dtype=np.float32).reshape(n_obs, 2)
+        }
+
+        adata = ad.AnnData(X=X, obs=obs, var=var, obsm=obsm)
+        adata.write_zarr(dest)
         print(f"  wrote {dest}")
 
     print("\nAll fixtures written.")

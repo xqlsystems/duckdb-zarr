@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 - **`string` dtype support** (Zarr v3 `string` / Zarr v2 `|O` + `vlen-utf8` filter), mapped to `VARCHAR`. This is the encoding anndata (and zarr-python generally) use for `obs`/`var` text columns such as `gene_symbol`, which previously failed to read with `unsupported dtype 'string'` (#40). Both a plain data-variable column and a string dim-coord are supported, over `read_zarr` and HTTP/S3/GCS/Azure stores alike. See `docs/design.md` §Type mapping > Variable-length strings for the implementation approach.
+- **AnnData-style Zarr compatibility** (#40): arrays with no `dimension_names` and no `_ARRAY_DIMENSIONS` — which AnnData/zarr-python never write — now get synthesized `dim_0..dim_{ndim-1}` names instead of failing bind, so `read_zarr(store, array_path := '...')` can read AnnData's `obs`/`var` columns, `X`/`layers` sparse CSR components, and `obsm` embeddings directly. `read_zarr_metadata` no longer aborts its entire result if one array in the store has a dtype `zarrs` itself can't open (surfaced as a single `role = 'unsupported'` row instead). See `docs/design.md` decision 7 for scope and rationale — this intentionally does not add AnnData-aware parsing (no automatic CSR/categorical/dataframe reconstruction); `test/sql/anndata.test` demonstrates the hand-written-SQL pattern against a realistic fixture.
 
 ## [0.1.3] - 2026-08-04
 
