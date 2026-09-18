@@ -84,6 +84,26 @@ GROUP BY label;
 compatible array group. It becomes useful for multiscale images, nested labels,
 or stores with multiple incompatible array shapes.
 
+### Reading part of a store with `ranges=`
+
+DuckDB's C API does not hand `WHERE` filters to a table function, so a plain
+`WHERE lat BETWEEN 40 AND 50` decodes every chunk and filters afterwards. On a
+large remote store that means fetching everything. `ranges=` takes the bounds
+as an argument instead:
+
+```sql
+SELECT time, lat, lon, air
+FROM read_zarr('test/fixtures/xarray_tutorial/air_temperature.zarr',
+               ranges=['lat:40:50', 'lon:230:250']);
+```
+
+Each entry is `dim:lo:hi` in the raw values of that dimension's coordinate
+array, inclusive on both ends; `dim:lo:` and `dim::hi` leave one side open.
+Chunks whose coordinate min/max fall outside the bounds are never read, and
+rows inside kept chunks are clipped to the bounds, so the result is exactly what
+the equivalent `WHERE` returns. A pruned dimension needs a 1-D coordinate
+array; decreasing and non-uniform coordinates are handled.
+
 ## Development Setup
 
 ```shell

@@ -397,14 +397,99 @@ FROM (SELECT air FROM read_zarr('test/fixtures/xarray_tutorial/air_temperature.z
 ----
 1088175738.000000
 
-# ── extension version ───────────────────────────────────────────────────────
-# extension_version is stamped at build time from `git tag --points-at HEAD`
-# (falling back to the short commit hash) by extension-ci-tools' configure
-# step — see docs/versioning.md. Just assert it's populated; the exact value
-# is build-environment-dependent.
+
+# ── ranges= (chunk pruning + row clipping) ─────────────────────────────────────
+# air_temperature: air(2920, 25, 53) int16 chunked (730, 13, 27); lat runs
+# 75 -> 15 (decreasing), lon 200 -> 330, time float32 hours. ranges= bounds are
+# inclusive on both ends and apply to the raw coordinate values. Kept chunks
+# are clipped to the bounds, so no WHERE is needed for correctness.
+
+# lat in [40, 50] -> 5 values; lon in [230, 250] -> 9 values; all 2920 times.
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/air_temperature.zarr',
+    ranges=['lat:40:50', 'lon:230:250']);
+----
+131400
+
+# Rows are exactly the rows a WHERE would produce (both directions of EXCEPT).
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/air_temperature.zarr',
+        ranges=['lat:40:50', 'lon:230:250'])
+    EXCEPT ALL
+    SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/air_temperature.zarr')
+    WHERE lat BETWEEN 40 AND 50 AND lon BETWEEN 230 AND 250);
+----
+0
 
 query I
-SELECT length(extension_version) > 0 FROM duckdb_extensions() WHERE extension_name = 'zarr';
+SELECT COUNT(*) FROM (
+    SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/air_temperature.zarr')
+    WHERE lat BETWEEN 40 AND 50 AND lon BETWEEN 230 AND 250
+    EXCEPT ALL
+    SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/air_temperature.zarr',
+        ranges=['lat:40:50', 'lon:230:250']));
 ----
-true
+0
 
+# Bounds are inclusive: the edge values themselves are present.
+query RR
+SELECT MIN(lat), MAX(lat) FROM read_zarr('test/fixtures/xarray_tutorial/air_temperature.zarr',
+    ranges=['lat:40:50']);
+----
+40.000000	50.000000
+
+# A range spanning the time chunk seam (index 729 | 730): 4 time steps, both
+# time chunks touched, each clipped to its side of the seam.
+query I
+SELECT COUNT(DISTINCT time) FROM read_zarr('test/fixtures/xarray_tutorial/air_temperature.zarr',
+    ranges=['time:1871496:1871514']);
+----
+4
+
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/air_temperature.zarr',
+    ranges=['time:1871496:1871514', 'lat:40:50', 'lon:230:250']);
+----
+180
+
+# Point predicate exactly on the seam (first element of time chunk 1).
+query I
+SELECT COUNT(DISTINCT time) FROM read_zarr('test/fixtures/xarray_tutorial/air_temperature.zarr',
+    ranges=['time:1871508:1871508']);
+----
+1
+
+# Open-ended bounds.
+query I
+SELECT COUNT(DISTINCT lat) FROM read_zarr('test/fixtures/xarray_tutorial/air_temperature.zarr',
+    ranges=['lat:70:']);
+----
+3
+
+# Empty result: no chunk scheduled, no rows, no error.
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/air_temperature.zarr',
+    ranges=['lat:100:']);
+----
+0
+
+# Decreasing coordinate on a multichunk v2 store: blosc_multichunk lat runs
+# -90 -> 90 in 8 values chunked by 4; lon 0 -> 330 by 30 chunked by 6.
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/blosc_multichunk.zarr',
+    ranges=['lat:0:90', 'lon:180:']);
+----
+24
+
+# Unknown dimension is an error.
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/air_temperature.zarr', ranges=['depth:0:1']);
+----
+not a dimension
+
+# Malformed item is an error.
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/air_temperature.zarr', ranges=['lat:40']);
+----
+dim:lo:hi

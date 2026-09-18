@@ -922,6 +922,227 @@ pub fn build_work_units(group: &DimGroup) -> Vec<WorkUnit> {
         .collect()
 }
 
+/// Inclusive `[lo, hi]` bound on one dimension's raw coordinate values,
+/// as given by `read_zarr(..., ranges=['dim:lo:hi'])`. Both bounds are
+/// inclusive (`lo <= coord <= hi`), matching SQL `BETWEEN`. An exclusive
+/// bound has to be expressed in `WHERE`; the range still prunes the chunks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DimRange {
+    pub dim: String,
+    pub lo: f64,
+    pub hi: f64,
+}
+
+/// Parse one `dim:lo:hi` item. Either bound may be empty (`time:1000:` is
+/// "time >= 1000"). Values are compared against the raw on-disk coordinate
+/// values, exactly as `read_zarr` emits them in the coordinate columns.
+pub fn parse_dim_range(item: &str) -> Result<DimRange, Box<dyn std::error::Error>> {
+    let parts: Vec<&str> = item.rsplitn(3, ':').collect();
+    if parts.len() != 3 {
+        return Err(
+            format!("range '{item}' must look like 'dim:lo:hi' (bounds may be empty)").into(),
+        );
+    }
+    let (hi, lo, dim) = (parts[0].trim(), parts[1].trim(), parts[2].trim());
+    let bound = |s: &str, default: f64| -> Result<f64, Box<dyn std::error::Error>> {
+        if s.is_empty() {
+            Ok(default)
+        } else {
+            s.parse::<f64>()
+                .map_err(|_| format!("range '{item}': '{s}' is not a number").into())
+        }
+    };
+    Ok(DimRange {
+        dim: dim.to_string(),
+        lo: bound(lo, f64::NEG_INFINITY)?,
+        hi: bound(hi, f64::INFINITY)?,
+    })
+}
+
+/// Raw coordinate value at `idx` as f64 (`None` for bool or out of range).
+pub(crate) fn coord_value_f64(ca: &CoordArray, idx: usize) -> Option<f64> {
+    let w = ca.dtype.byte_size();
+    let b = ca.bytes.get(idx * w..(idx + 1) * w)?;
+    Some(match ca.dtype {
+        ZarrDtype::Bool => return None,
+        ZarrDtype::Int8 => b[0] as i8 as f64,
+        ZarrDtype::Int16 => i16::from_ne_bytes(b.try_into().ok()?) as f64,
+        ZarrDtype::Int32 => i32::from_ne_bytes(b.try_into().ok()?) as f64,
+        ZarrDtype::Int64 => i64::from_ne_bytes(b.try_into().ok()?) as f64,
+        ZarrDtype::UInt8 => b[0] as f64,
+        ZarrDtype::UInt16 => u16::from_ne_bytes(b.try_into().ok()?) as f64,
+        ZarrDtype::UInt32 => u32::from_ne_bytes(b.try_into().ok()?) as f64,
+        ZarrDtype::UInt64 => u64::from_ne_bytes(b.try_into().ok()?) as f64,
+        ZarrDtype::Float32 => f32::from_ne_bytes(b.try_into().ok()?) as f64,
+        ZarrDtype::Float64 => f64::from_ne_bytes(b.try_into().ok()?),
+    })
+}
+
+/// Chunk pruning: keep only the chunks whose coordinate `[min, max]` along each
+/// ranged dimension intersects the requested `[lo, hi]`. Min/max are computed
+/// over the actual coordinate slice (not first/last), so descending coordinates
+/// (ERA5 latitude 90 -> -90) prune correctly. A dimension without a coordinate
+/// array is pruned on its integer index. Rows inside a kept chunk that fall
+/// outside the range are dropped by the scan via `build_dim_keep_masks`.
+pub fn build_work_units_pruned(
+    group: &DimGroup,
+    coord_arrays: &HashMap<String, CoordArray>,
+    ranges: &[DimRange],
+) -> Result<Vec<WorkUnit>, Box<dyn std::error::Error>> {
+    let ndim = group.dims.len();
+    let mut kept: Vec<Vec<u64>> = (0..ndim)
+        .map(|k| (0..group.shape[k].div_ceil(group.chunk_shape[k])).collect())
+        .collect();
+
+    for r in ranges {
+        let k = group.dims.iter().position(|d| d == &r.dim).ok_or_else(|| {
+            format!(
+                "ranges: '{}' is not a dimension of this table; dims are {:?}",
+                r.dim, group.dims
+            )
+        })?;
+        let n = group.shape[k] as usize;
+        let cs = group.chunk_shape[k] as usize;
+        let ca = coord_arrays.get(&r.dim);
+        if let Some(ca) = ca {
+            if matches!(ca.dtype, ZarrDtype::Bool) {
+                return Err(format!("ranges: dimension '{}' has a bool coordinate", r.dim).into());
+            }
+        }
+        kept[k].retain(|&c| {
+            let start = c as usize * cs;
+            let end = (start + cs).min(n);
+            let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+            for i in start..end {
+                let v = match ca {
+                    Some(ca) => match coord_value_f64(ca, i) {
+                        Some(v) if !v.is_nan() => v,
+                        _ => continue,
+                    },
+                    None => i as f64,
+                };
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+            lo <= r.hi && hi >= r.lo
+        });
+    }
+
+    let mut units = Vec::new();
+    let mut idx = vec![0usize; ndim];
+    if kept.iter().any(|v| v.is_empty()) {
+        return Ok(units);
+    }
+    loop {
+        units.push(WorkUnit {
+            chunk_indices: (0..ndim).map(|k| kept[k][idx[k]]).collect(),
+        });
+        // Odometer increment, last dim fastest (C order).
+        let mut k = ndim;
+        loop {
+            if k == 0 {
+                return Ok(units);
+            }
+            k -= 1;
+            idx[k] += 1;
+            if idx[k] < kept[k].len() {
+                break;
+            }
+            idx[k] = 0;
+        }
+    }
+}
+
+/// Per-dimension row masks for `ranges=`: `masks[k][i]` is whether global
+/// index `i` along dimension `k` satisfies every range on that dimension.
+/// `None` for a dimension with no range (every index kept). A coordinate that
+/// is NaN or unreadable never satisfies a range.
+pub fn build_dim_keep_masks(
+    group: &DimGroup,
+    coord_arrays: &HashMap<String, CoordArray>,
+    ranges: &[DimRange],
+) -> Result<Vec<Option<Vec<bool>>>, Box<dyn std::error::Error>> {
+    let mut masks: Vec<Option<Vec<bool>>> = vec![None; group.dims.len()];
+    for r in ranges {
+        let k = group.dims.iter().position(|d| d == &r.dim).ok_or_else(|| {
+            format!(
+                "ranges: '{}' is not a dimension of this table; dims are {:?}",
+                r.dim, group.dims
+            )
+        })?;
+        let n = group.shape[k] as usize;
+        let ca = coord_arrays.get(&r.dim);
+        let mask = masks[k].get_or_insert_with(|| vec![true; n]);
+        for (i, keep) in mask.iter_mut().enumerate() {
+            let v = match ca {
+                Some(ca) => coord_value_f64(ca, i).unwrap_or(f64::NAN),
+                None => i as f64,
+            };
+            *keep = *keep && v >= r.lo && v <= r.hi;
+        }
+    }
+    Ok(masks)
+}
+
+/// Flat logical row indices (C order) inside one chunk that survive the
+/// per-dimension masks. `None` when every row survives, so the common
+/// unpruned path costs nothing. `logical_shape` is the chunk shape clipped
+/// to the array bounds.
+pub fn kept_rows_in_chunk(
+    wu: &WorkUnit,
+    chunk_shape: &[u64],
+    logical_shape: &[usize],
+    masks: &[Option<Vec<bool>>],
+) -> Option<Vec<usize>> {
+    if masks.iter().all(|m| m.is_none()) {
+        return None;
+    }
+    let ndim = logical_shape.len();
+    // Per-dim list of kept local indices.
+    let per_dim: Vec<Vec<usize>> = (0..ndim)
+        .map(|k| {
+            let origin = (wu.chunk_indices[k] * chunk_shape[k]) as usize;
+            (0..logical_shape[k])
+                .filter(|&j| masks[k].as_ref().is_none_or(|m| m[origin + j]))
+                .collect()
+        })
+        .collect();
+    let total: usize = logical_shape.iter().product();
+    if per_dim
+        .iter()
+        .enumerate()
+        .all(|(k, v)| v.len() == logical_shape[k])
+    {
+        return None;
+    }
+    let mut strides = vec![1usize; ndim];
+    for k in (0..ndim.saturating_sub(1)).rev() {
+        strides[k] = strides[k + 1] * logical_shape[k + 1];
+    }
+    let mut rows = Vec::new();
+    if per_dim.iter().any(|v| v.is_empty()) {
+        return Some(rows);
+    }
+    let mut idx = vec![0usize; ndim];
+    loop {
+        let flat: usize = (0..ndim).map(|k| per_dim[k][idx[k]] * strides[k]).sum();
+        debug_assert!(flat < total);
+        rows.push(flat);
+        let mut k = ndim;
+        loop {
+            if k == 0 {
+                return Some(rows);
+            }
+            k -= 1;
+            idx[k] += 1;
+            if idx[k] < per_dim[k].len() {
+                break;
+            }
+            idx[k] = 0;
+        }
+    }
+}
+
 /// Build `ColumnDef`s for one dim group: dims first, then data vars.
 pub fn build_column_defs(
     store: &ZarrStore,
@@ -1020,5 +1241,253 @@ mod tests {
             "root zarr.json cache entry lost its consolidated_metadata block: {parsed}"
         );
         assert!(cache.contains_key(&StoreKey::new("foo/zarr.json").unwrap()));
+    }
+
+    fn f64_coord(vals: &[f64]) -> CoordArray {
+        CoordArray {
+            dtype: ZarrDtype::Float64,
+            encoding: ColumnEncoding::Plain,
+            sentinel: None,
+            bytes: vals.iter().flat_map(|v| v.to_ne_bytes()).collect(),
+        }
+    }
+
+    #[test]
+    fn parse_dim_range_forms() {
+        assert_eq!(
+            parse_dim_range("lat:40:50").unwrap(),
+            DimRange {
+                dim: "lat".into(),
+                lo: 40.0,
+                hi: 50.0
+            }
+        );
+        let r = parse_dim_range("time:1000:").unwrap();
+        assert_eq!((r.lo, r.hi), (1000.0, f64::INFINITY));
+        let r = parse_dim_range("time::-5").unwrap();
+        assert_eq!((r.lo, r.hi), (f64::NEG_INFINITY, -5.0));
+        assert!(parse_dim_range("lat:40").is_err());
+        assert!(parse_dim_range("lat:a:b").is_err());
+    }
+
+    #[test]
+    fn prune_descending_coord_and_unindexed_dim() {
+        // time: 10 steps, chunks of 4 (3 chunks); lat: 90 -> -90 by 30, chunks of 4 (2 chunks).
+        let group = DimGroup {
+            dims: vec!["time".into(), "lat".into()],
+            shape: vec![10, 7],
+            chunk_shape: vec![4, 4],
+            data_var_names: vec!["t".into()],
+            coord_var_names: vec!["lat".into()],
+        };
+        let mut coords = HashMap::new();
+        coords.insert(
+            "lat".to_string(),
+            f64_coord(&[90.0, 60.0, 30.0, 0.0, -30.0, -60.0, -90.0]),
+        );
+        let all = build_work_units_pruned(&group, &coords, &[]).unwrap();
+        assert_eq!(all.len(), 6);
+        assert_eq!(all, build_work_units(&group));
+
+        // lat in [-40, -20]: only the second lat chunk (-30..-90) intersects.
+        let r = vec![parse_dim_range("lat:-40:-20").unwrap()];
+        let u = build_work_units_pruned(&group, &coords, &r).unwrap();
+        assert_eq!(u.len(), 3);
+        assert!(u.iter().all(|w| w.chunk_indices[1] == 1));
+
+        // time is unindexed: pruned on integer index. time in [4, 5] -> chunk 1 only.
+        let r = vec![
+            parse_dim_range("time:4:5").unwrap(),
+            parse_dim_range("lat:0:100").unwrap(),
+        ];
+        let u = build_work_units_pruned(&group, &coords, &r).unwrap();
+        assert_eq!(u.len(), 1);
+        assert_eq!(u[0].chunk_indices, vec![1, 0]);
+
+        // Empty intersection -> no work units.
+        let r = vec![parse_dim_range("lat:200:300").unwrap()];
+        assert!(build_work_units_pruned(&group, &coords, &r)
+            .unwrap()
+            .is_empty());
+
+        // Unknown dim -> error.
+        let r = vec![parse_dim_range("lon:0:1").unwrap()];
+        assert!(build_work_units_pruned(&group, &coords, &r).is_err());
+    }
+
+    // ---- Test cases required by docs/design.md "Predicate & projection pushdown" ----
+
+    fn era5_like_group() -> (DimGroup, HashMap<String, CoordArray>) {
+        // time: 12 steps (0..12), chunks of 4 -> 3 chunks.
+        // lat: 90 -> -90 by 30 (7 values), chunks of 3 -> 3 chunks: [90,60,30] [0,-30,-60] [-90].
+        // level: pressure levels, non-uniform, chunks of 2 -> 3 chunks:
+        //   [1000, 850] [700, 500] [250, 50].
+        let group = DimGroup {
+            dims: vec!["time".into(), "lat".into(), "level".into()],
+            shape: vec![12, 7, 6],
+            chunk_shape: vec![4, 3, 2],
+            data_var_names: vec!["t".into()],
+            coord_var_names: vec!["time".into(), "lat".into(), "level".into()],
+        };
+        let mut coords = HashMap::new();
+        coords.insert(
+            "time".to_string(),
+            f64_coord(&(0..12).map(|i| i as f64).collect::<Vec<_>>()),
+        );
+        coords.insert(
+            "lat".to_string(),
+            f64_coord(&[90.0, 60.0, 30.0, 0.0, -30.0, -60.0, -90.0]),
+        );
+        coords.insert(
+            "level".to_string(),
+            f64_coord(&[1000.0, 850.0, 700.0, 500.0, 250.0, 50.0]),
+        );
+        (group, coords)
+    }
+
+    fn pruned(
+        group: &DimGroup,
+        coords: &HashMap<String, CoordArray>,
+        rs: &[&str],
+    ) -> Vec<WorkUnit> {
+        let rs: Vec<DimRange> = rs.iter().map(|r| parse_dim_range(r).unwrap()).collect();
+        build_work_units_pruned(group, coords, &rs).unwrap()
+    }
+
+    fn chunk_set(units: &[WorkUnit], k: usize) -> Vec<u64> {
+        let mut v: Vec<u64> = units.iter().map(|w| w.chunk_indices[k]).collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    #[test]
+    fn design_decreasing_coordinate() {
+        // ERA5 latitude runs 90 -> -90; a range on the low end must select the
+        // chunk at the END of the index space, and the index translation must
+        // not assume monotonic-increasing.
+        let (g, c) = era5_like_group();
+        assert_eq!(chunk_set(&pruned(&g, &c, &["lat:-90:-70"]), 1), vec![2]);
+        assert_eq!(chunk_set(&pruned(&g, &c, &["lat:-70:-10"]), 1), vec![1]);
+        assert_eq!(chunk_set(&pruned(&g, &c, &["lat:50:90"]), 1), vec![0]);
+        // Straddles two chunks: 30 (chunk 0) and 0 (chunk 1).
+        assert_eq!(chunk_set(&pruned(&g, &c, &["lat:0:30"]), 1), vec![0, 1]);
+    }
+
+    #[test]
+    fn design_non_uniform_spacing() {
+        // Pressure levels are not evenly spaced; chunk index cannot be
+        // coord / chunk_size. [1000,850] [700,500] [250,50].
+        let (g, c) = era5_like_group();
+        assert_eq!(chunk_set(&pruned(&g, &c, &["level:600:800"]), 2), vec![1]);
+        assert_eq!(chunk_set(&pruned(&g, &c, &["level:100:300"]), 2), vec![2]);
+        assert_eq!(chunk_set(&pruned(&g, &c, &["level:900:1000"]), 2), vec![0]);
+        // Gap between 500 and 250: nothing lives there.
+        assert!(pruned(&g, &c, &["level:300:450"]).is_empty());
+    }
+
+    #[test]
+    fn design_exact_chunk_boundary_predicate() {
+        // A point predicate on a value sitting exactly on a chunk seam must
+        // select the owning chunk once, not zero or two chunks.
+        let (g, c) = era5_like_group();
+        // time=4 is the first element of chunk 1; time=3 the last of chunk 0.
+        assert_eq!(chunk_set(&pruned(&g, &c, &["time:4:4"]), 0), vec![1]);
+        assert_eq!(chunk_set(&pruned(&g, &c, &["time:3:3"]), 0), vec![0]);
+        // lat=0 is the first element of lat chunk 1.
+        assert_eq!(chunk_set(&pruned(&g, &c, &["lat:0:0"]), 1), vec![1]);
+        // Rows: exactly one time step survives inside the kept chunk.
+        let rs = [parse_dim_range("time:4:4").unwrap()];
+        let masks = build_dim_keep_masks(&g, &c, &rs).unwrap();
+        let wu = WorkUnit {
+            chunk_indices: vec![1, 0, 0],
+        };
+        let rows = kept_rows_in_chunk(&wu, &g.chunk_shape, &[4, 3, 2], &masks).unwrap();
+        assert_eq!(rows.len(), 6);
+        assert!(rows.iter().all(|r| r / 6 == 0));
+    }
+
+    #[test]
+    fn design_empty_result_predicate() {
+        // lat > 100: zero work units, no panic, nothing scheduled.
+        let (g, c) = era5_like_group();
+        assert!(pruned(&g, &c, &["lat:100:"]).is_empty());
+        assert!(pruned(&g, &c, &["time::-1"]).is_empty());
+        // And the row masks agree: nothing kept along that dim.
+        let rs = [parse_dim_range("lat:100:").unwrap()];
+        let masks = build_dim_keep_masks(&g, &c, &rs).unwrap();
+        assert!(masks[1].as_ref().unwrap().iter().all(|k| !k));
+    }
+
+    #[test]
+    fn design_inclusive_bounds_and_row_clipping() {
+        // ranges= is inclusive on both ends (BETWEEN). Rows inside a kept chunk
+        // outside the bounds are clipped; rows on the bound are kept.
+        let (g, c) = era5_like_group();
+        let rs = [
+            parse_dim_range("time:1:2").unwrap(),
+            parse_dim_range("lat:0:60").unwrap(),
+        ];
+        let units = build_work_units_pruned(&g, &c, &rs).unwrap();
+        // time chunk 0 only; lat chunks 0 (60, 30) and 1 (0); all 3 level chunks.
+        assert_eq!(chunk_set(&units, 0), vec![0]);
+        assert_eq!(chunk_set(&units, 1), vec![0, 1]);
+        assert_eq!(units.len(), 6);
+
+        let masks = build_dim_keep_masks(&g, &c, &rs).unwrap();
+        assert_eq!(
+            masks[0].as_ref().unwrap(),
+            &[false, true, true, false, false, false, false, false, false, false, false, false]
+        );
+        assert_eq!(
+            masks[1].as_ref().unwrap(),
+            &[false, true, true, true, false, false, false]
+        );
+        assert!(masks[2].is_none());
+
+        // Chunk (0,0,0): logical shape [4,3,2]. Kept: time {1,2} x lat {1,2} x level {0,1}.
+        let wu = WorkUnit {
+            chunk_indices: vec![0, 0, 0],
+        };
+        let rows = kept_rows_in_chunk(&wu, &g.chunk_shape, &[4, 3, 2], &masks).unwrap();
+        let expect: Vec<usize> = [1usize, 2]
+            .iter()
+            .flat_map(|&t| {
+                [1usize, 2]
+                    .iter()
+                    .flat_map(move |&l| [0usize, 1].iter().map(move |&p| t * 6 + l * 2 + p))
+            })
+            .collect();
+        assert_eq!(rows, expect);
+
+        // Chunk (0,1,0): lat chunk 1 = [0,-30,-60]; only lat local 0 kept.
+        let wu = WorkUnit {
+            chunk_indices: vec![0, 1, 0],
+        };
+        let rows = kept_rows_in_chunk(&wu, &g.chunk_shape, &[4, 3, 2], &masks).unwrap();
+        assert_eq!(rows, vec![6, 7, 12, 13]);
+
+        // No ranges at all -> None (fast path).
+        let masks = build_dim_keep_masks(&g, &c, &[]).unwrap();
+        assert!(kept_rows_in_chunk(&wu, &g.chunk_shape, &[4, 3, 2], &masks).is_none());
+        // A range that keeps every row of the chunk -> None too.
+        let rs = [parse_dim_range("time:0:11").unwrap()];
+        let masks = build_dim_keep_masks(&g, &c, &rs).unwrap();
+        assert!(kept_rows_in_chunk(&wu, &g.chunk_shape, &[4, 3, 2], &masks).is_none());
+    }
+
+    #[test]
+    fn design_partial_boundary_chunk_rows() {
+        // Last lat chunk holds one value (-90) of a chunk_shape 3: logical shape
+        // is [4,1,2]; row indices must use the logical shape, not the chunk shape.
+        let (g, c) = era5_like_group();
+        let rs = [parse_dim_range("level:0:100").unwrap()];
+        let masks = build_dim_keep_masks(&g, &c, &rs).unwrap();
+        let wu = WorkUnit {
+            chunk_indices: vec![0, 2, 2],
+        };
+        // level chunk 2 = [250, 50]; only local 1 kept.
+        let rows = kept_rows_in_chunk(&wu, &g.chunk_shape, &[4, 1, 2], &masks).unwrap();
+        assert_eq!(rows, vec![1, 3, 5, 7]);
     }
 }

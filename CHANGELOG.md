@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- **`ranges=['dim:lo:hi', ...]` on `read_zarr`**: coordinate-bound chunk pruning and row clipping. Work units whose per-chunk coordinate min/max miss the bounds are dropped at bind, so their chunks are never fetched or decoded; rows inside kept chunks are clipped, so results equal the equivalent `WHERE`. Bounds are inclusive raw coordinate values. This is the pruning `docs/design.md` specifies for coordinate-range filter pushdown, driven by a parameter because the DuckDB C API does not expose filters to table functions; the required boundary tests (decreasing coords, non-uniform spacing, chunk-seam point, empty result, inclusive bounds) are unit tests in `meta.rs`, and SQL tests check equivalence with `WHERE` by `EXCEPT ALL`.
+
 ## [0.1.3] - 2026-08-04
 
 ### Changed

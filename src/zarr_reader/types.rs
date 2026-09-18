@@ -137,7 +137,7 @@ pub struct CoordArray {
 }
 
 /// One unit of parallel work: a chunk index tuple for all data variables.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkUnit {
     pub chunk_indices: Vec<u64>,
 }
