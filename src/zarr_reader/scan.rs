@@ -46,6 +46,10 @@ pub fn read_int_as_i64_pub(bytes: &[u8], dtype: &ZarrDtype, start: usize) -> i64
         ZarrDtype::UInt8 => bytes[start] as i64,
         ZarrDtype::UInt16 => u16::from_ne_bytes(bytes[start..start + 2].try_into().unwrap()) as i64,
         ZarrDtype::UInt32 => u32::from_ne_bytes(bytes[start..start + 4].try_into().unwrap()) as i64,
+        // Bit-preserving reinterpret, not a numeric conversion: values above i64::MAX
+        // land negative here. Callers that do arithmetic on the result (fill_element)
+        // must special-case dtype == UInt64 and recover the true magnitude via
+        // `raw as u64` before using it — this cast alone would silently flip the sign.
         ZarrDtype::UInt64 => u64::from_ne_bytes(bytes[start..start + 8].try_into().unwrap()) as i64,
         _ => 0,
     }

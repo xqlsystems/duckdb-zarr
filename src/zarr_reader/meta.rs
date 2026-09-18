@@ -510,6 +510,13 @@ pub fn parse_dtype(array: &ZarrArray, name: &str) -> Result<ZarrDtype, Box<dyn s
 /// calendar, and the column is not already claimed by packed-int decoding.
 /// `decode_times = false` (the `decode_times=` named parameter) suppresses the
 /// latter and leaves the raw offsets visible, mirroring `xarray.open_zarr`.
+///
+/// Packed-int deliberately takes priority: CF §8.1 permits packing *any* numeric
+/// variable, including a time axis, but no store seen in practice packs time —
+/// it is already a compact int64/float64 — so a column with both `scale_factor`
+/// and CF-time `units` is decoded as the scaled physical quantity, not double
+/// -decoded into a scaled-then-CF-timestamped value. Combining the two would need
+/// its own `ColumnEncoding` variant for a case that has not shown up.
 pub fn parse_encoding_and_sentinel(
     dtype: &ZarrDtype,
     attrs: &serde_json::Map<String, serde_json::Value>,

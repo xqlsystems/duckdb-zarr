@@ -9,6 +9,7 @@
 //! and friends have arithmetic that does not map onto a wall clock at all, so
 //! those columns stay raw.
 
+use chrono::NaiveDate;
 use serde_json::{Map, Value};
 
 /// Microseconds in one day — DuckDB `TIMESTAMP` counts microseconds from the
@@ -189,12 +190,13 @@ fn parse_date(s: &str) -> Option<(i64, u32, u32)> {
         Some(f) => f.parse().ok()?,
         None => 1,
     };
-    if fields.next().is_some() || !(1..=12).contains(&month) {
+    if fields.next().is_some() {
         return None;
     }
-    if !(1..=days_in_month(year, month)).contains(&day) {
-        return None;
-    }
+    // NaiveDate::from_ymd_opt validates month range, leap years, and day-of-month
+    // together; a year outside chrono's i32 range is rejected the same as one that
+    // would later overflow the i64-microseconds epoch check in parse_reference.
+    NaiveDate::from_ymd_opt(i32::try_from(year).ok()?, month, day)?;
     Some((year, month, day))
 }
 
@@ -292,33 +294,16 @@ fn parse_zone(s: &str) -> Option<i64> {
     Some(sign * (hours * 3_600_000_000 + minutes * 60_000_000))
 }
 
-fn is_leap_year(y: i64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
-}
-
-fn days_in_month(y: i64, m: u32) -> u32 {
-    match m {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if is_leap_year(y) => 29,
-        2 => 28,
-        _ => 0,
-    }
-}
-
 /// Days from 1970-01-01 to `y-m-d` in the proleptic Gregorian calendar.
 ///
-/// Howard Hinnant's `days_from_civil` (public domain, "chrono-Compatible Low-Level
-/// Date Algorithms"): shift the year to start in March so the leap day lands last,
-/// then count whole 400-year eras exactly.
+/// `y`/`m`/`d` must already be a calendar-valid date (checked by `parse_date`'s
+/// `NaiveDate::from_ymd_opt` call, or a hardcoded literal below) — this panics
+/// otherwise, since a garbage day count would be worse than a loud failure.
 fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-    let m = m as i64;
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let year_of_era = y - era * 400; // [0, 399]
-    let day_of_year = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d as i64 - 1; // [0, 365]
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
+    let date = NaiveDate::from_ymd_opt(i32::try_from(y).expect("year fits i32"), m, d)
+        .expect("caller validated y/m/d");
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+    (date - epoch).num_days()
 }
 
 #[cfg(test)]

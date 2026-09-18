@@ -546,9 +546,17 @@ fn fill_element(
             if matches_int_sentinel(raw, sentinel) {
                 vector.set_null(dst);
             } else {
+                // read_int_as_i64_pub bit-reinterprets UInt64, so a value above
+                // i64::MAX comes back negative here; recover the true magnitude
+                // before scaling instead of scaling a sign-flipped one.
+                let numeric = if *dtype == ZarrDtype::UInt64 {
+                    raw as u64 as f64
+                } else {
+                    raw as f64
+                };
                 unsafe {
                     let slot = vector.as_mut_ptr::<f64>();
-                    *slot.add(dst) = raw as f64 * scale_factor + add_offset;
+                    *slot.add(dst) = numeric * scale_factor + add_offset;
                 }
             }
         }
@@ -559,7 +567,12 @@ fn fill_element(
             // becomes NULL rather than a bogus date.
             let decoded = if dtype.is_integer() {
                 let raw = read_int_as_i64_pub(bytes, dtype, src);
-                (!matches_int_sentinel(raw, sentinel))
+                // A UInt64 raw above i64::MAX comes back negative from the same
+                // bit-reinterpret — no legitimate CF-time offset is that large
+                // anyway (see out_of_range_values_decode_to_none), so treat it as
+                // out-of-range rather than decoding a bogus negative-offset date.
+                let overflowed = *dtype == ZarrDtype::UInt64 && raw < 0;
+                (!overflowed && !matches_int_sentinel(raw, sentinel))
                     .then(|| cf.decode_int(raw))
                     .flatten()
             } else {
