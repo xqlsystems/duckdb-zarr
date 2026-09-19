@@ -362,6 +362,56 @@ def main() -> None:
             dest, zarr_format=2, consolidated=False)
         print(f"  wrote {dest}")
 
+    # ── cf_time (synthetic) ──────────────────────────────────────────────────
+    # Tests: CF time decoding to DuckDB TIMESTAMP.
+    #   (time, lat)        — int64 "hours since 1900-01-01 00:00:00", the
+    #                        ARCO-ERA5 shape; must decode.
+    #   (noleap_time, lat) — float64 "days since 0001-01-01" on the noleap
+    #                        calendar, whose 365-day years have no wall-clock
+    #                        equivalent; must stay a raw DOUBLE (issue #45).
+    # Both coords are written as plain numbers with the CF attrs set by hand:
+    # xarray only re-encodes coords that are already datetime64, so these ride
+    # through to disk verbatim — and building the noleap axis this way avoids
+    # needing cftime at all.
+    print("cf_time (synthetic)...")
+    rng = np.random.default_rng(11)
+    stamps = np.array(
+        ["2020-01-01T00:00", "2020-01-01T01:00",
+         "2020-01-01T02:00", "2020-01-01T03:00"],
+        dtype="datetime64[h]",
+    )
+    cf_hours = (stamps - np.datetime64("1900-01-01T00:00", "h")).astype("int64")
+    cf_lat = np.array([-45.0, 0.0, 45.0])
+    ds_cf = xr.Dataset(
+        {
+            "t2m": xr.DataArray(
+                rng.standard_normal((4, 3)).astype("float32") + 273.15,
+                dims=["time", "lat"],
+                attrs={"units": "K"},
+            ),
+            "snow": xr.DataArray(
+                rng.standard_normal((4, 3)).astype("float32"),
+                dims=["noleap_time", "lat"],
+                attrs={"units": "m"},
+            ),
+        },
+        coords={
+            "time": xr.DataArray(
+                cf_hours, dims=["time"],
+                attrs={"units": "hours since 1900-01-01 00:00:00",
+                       "calendar": "proleptic_gregorian",
+                       "standard_name": "time"},
+            ),
+            "noleap_time": xr.DataArray(
+                np.array([730000.0, 730001.0, 730002.0, 730003.0]),
+                dims=["noleap_time"],
+                attrs={"units": "days since 0001-01-01", "calendar": "noleap"},
+            ),
+            "lat": xr.DataArray(cf_lat, dims=["lat"], attrs={"units": "degrees_north"}),
+        },
+    )
+    write_zarr(ds_cf, "cf_time")
+
     # ── scalar_coord (synthetic) ─────────────────────────────────────────────
     # Tests: scalar (0-dim) coordinate variables (e.g. ROMS hc, Vtransform).
     # These should be excluded from the row schema and surfaced in metadata.

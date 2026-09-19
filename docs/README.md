@@ -47,11 +47,16 @@ SELECT * FROM read_zarr_metadata('test/fixtures/xarray_tutorial/float_baseline.z
 -- Read a store as a table
 SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/float_baseline.zarr');
 
--- Filter with plain SQL on the coordinate columns
-SELECT time, lat, lon, temperature
-FROM read_zarr('test/fixtures/xarray_tutorial/float_baseline.zarr')
-WHERE lat > 0 AND lon < 180;
+-- Filter with plain SQL on the coordinate columns, dates included
+SELECT time, lat, lon, air
+FROM read_zarr('test/fixtures/xarray_tutorial/air_temperature.zarr')
+WHERE lat > 0 AND time >= TIMESTAMP '2014-06-01';
 ```
+
+Time coordinates stored the CF way — a number plus a `units` attr like
+`"hours since 1800-01-01"` — are decoded to `TIMESTAMP`, which is why the query
+above can compare `time` against a date literal. Pass `decode_times := false` if
+you want the raw on-disk offsets instead.
 
 For a small bioimage walkthrough, see [Querying OME-Zarr](ome-zarr.md).
 For the domains covered by the current test suite, see

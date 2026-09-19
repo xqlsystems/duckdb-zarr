@@ -298,13 +298,32 @@ The base dtype mapping is mechanical:
 | `f4/f8`                            | `FLOAT`/`DOUBLE`                         | NaN preserved                               |
 | `bool`                             | `BOOLEAN`                                |                                             |
 | `M8[ns]` / `M8[us]`                | `TIMESTAMP_NS` / `TIMESTAMP`             | native NumPy datetimes; mapped directly     |
-| CF-encoded time (`f4/f8/i4/i8`)    | `FLOAT`/`DOUBLE`/`INTEGER`/`BIGINT`      | raw on-disk dtype; CF decoding deferred     |
+| CF-encoded time (`f4/f8/i4/i8`)    | `TIMESTAMP`                              | decoded on real-world calendars; raw dtype otherwise |
 | `S<n>` (fixed bytes)               | `BLOB`                                   | not yet implemented; error at bind          |
 | `U<n>` (UTF-32)                    | `VARCHAR`                                | not yet implemented; error at bind          |
 | `string` (v3) / `|O`+vlen-utf8 (v2) | `VARCHAR`                                | variable-length; see below                  |
 | structured / other object          | unsupported                              | error at bind                               |
 
-CF-encoded time appears in real stores as `int32`, `int64`, `float32`, or `float64` depending on the source NetCDF — RASM uses `f8` + `noleap`, `air_temperature` uses `f4` + `gregorian`, ERA5-style stores use `i8`. We surface the raw on-disk dtype; decoding is deferred (see Phased plan / Later and decision 3). The `units` and `calendar` attrs ride along into `read_zarr_metadata.attrs` so users know what they're decoding against.
+CF-encoded time appears in real stores as `int32`, `int64`, `float32`, or `float64` depending on the source NetCDF — RASM uses `f8` + `noleap`, `air_temperature` uses `f4` + `gregorian`, ERA5-style stores use `i8`. We decode it to `TIMESTAMP` at scan time; see §CF time decoding and decision 3. The `units` and `calendar` attrs ride along into `read_zarr_metadata.attrs` either way, so a column left raw still says what it is.
+
+### CF time decoding (CF §4.4)
+
+A coordinate whose `units` attr reads `"<step> since <reference>"` is a time axis stored as plain numbers: ARCO-ERA5's `time` is `int64` + `"hours since 1900-01-01 00:00:00"`. Surfacing the integer is physically faithful and semantically useless — `WHERE time >= '2024-01-01'`, `date_trunc('month', time)` and a join against a calendar table all need a real timestamp, and a user who has to write `TIMESTAMP '1900-01-01' + INTERVAL (time) HOUR` by hand has to first go read the array's attrs to know that's the right expression. So bind resolves the encoding and the column comes out as `TIMESTAMP` (microseconds since the Unix epoch, DuckDB's physical layout).
+
+Decoding is gated on the `calendar` attr, which is where the AGPL problem from decision 3 dissolves:
+
+- **`proleptic_gregorian`, and `standard`/`gregorian` with a reference date on or after the 1582-10-15 reform** (absent `calendar` means `standard`, per CF §4.4.1) — decoded. These are ordinary civil-date arithmetic: `chrono::NaiveDate` for calendar validation and day arithmetic, plus a rational step size for the UDUNITS unit, in `src/zarr_reader/cftime.rs`. `chrono` is already in the dependency tree transitively via `duckdb → arrow → arrow-arith`, so taking it directly costs nothing new.
+- **Everything else** — `noleap`/`365_day`, `all_leap`/`366_day`, `360_day`, `julian`, and pre-reform `standard` references — left as the raw on-disk dtype. These calendars have years that do not exist on a wall clock; there is no correct `TIMESTAMP` to emit, and emitting a plausible-looking wrong one is worse than emitting the number.
+
+The reform gate is enforced *per value*, not just on the reference: a `standard` axis can perfectly well have a post-reform reference and negative offsets that reach back past 1582-10-15, and those instants are Julian in the file's own terms. They decode to `NULL` rather than to a date ~10 days off; `decode_times := false` recovers the raw offsets for anyone who actually has such data.
+
+Mechanics worth pinning down:
+
+- **Step sizes** are the UDUNITS time names (`weeks`…`nanoseconds`, with the usual abbreviations) held as an exact rational number of microseconds, so `"nanoseconds since ..."` does not round-trip through a float. `years` and `months` are deliberately *not* decoded — they have no fixed length, and xarray refuses them too. Bare `m` is not accepted either: in UDUNITS it means metres.
+- **Reference parsing** accepts the shapes real stores use: `1900-01-01`, `1800-01-01 00:00:00`, `1970-01-01T00:00:00Z`, `0001-1-1 0:0:0`, and a trailing UTC offset, which is *subtracted* to reach UTC. The offset's sign is optional, because UDUNITS' own canonical output omits it — `"hours since 1800-01-01 00:00:0.0 0:00"` is how NOAA/NCEP-derived stores spell a zero offset, and rejecting it would silently leave the whole axis raw.
+- **Precision.** Float offsets are split into whole and fractional parts before scaling, because `days since 1800-01-01` reaches ~7.0e15 µs — past the point where an f64 multiply still resolves single microseconds. Integer offsets never touch floating point at all.
+- **Masking and range.** The `_FillValue`/`missing_value` sentinel is compared against the *raw* value first, as in packed-int decoding. NaN, and any offset that decodes outside DuckDB's timestamp range, become SQL `NULL` — `i64::MIN`/`i64::MAX` are DuckDB's ±infinity sentinels and must never be collided with.
+- **Escape hatch.** `read_zarr(store, decode_times := false)` turns the whole thing off and restores the raw offsets, mirroring `xarray.open_zarr(decode_times=False)`.
 
 ### Variable-length strings (`string` / vlen-utf8)
 
@@ -317,7 +336,9 @@ Because the rest of the reader is built around `ColumnEncoding`/byte-offset math
 - zarrs pads a boundary chunk's *element count* to the full nominal `chunk_shape` for every dtype uniformly (fill-value elements past the array's logical bound), so the existing `zarrs_flat` physical-offset math indexes correctly into a `Vec<String>` with no changes — verified against a non-chunk-aligned 2-D string fixture during implementation.
 - No NULL masking applies: CF's `_FillValue`/`missing_value` sentinel convention is numeric-only, so every decoded string (including zarrs' own empty-string fill-value substitution) is written through as-is.
 
-`ColumnEncoding::PackedInt` never applies to strings (its trigger condition requires an integer on-disk dtype), so packed-decoding and string decoding never intersect.
+`ColumnEncoding::PackedInt` never applies to strings (its trigger condition requires an integer on-disk dtype), and CF-time detection explicitly skips them (a string array carrying a `units` attr is not a time axis), so neither decoding ever intersects string decoding.
+
+### Packed integer decoding (CF §8.1)
 
 A data variable whose **on-disk dtype is an integer type** (i8/u8/i16/u16/i32/u32/i64/u64) *and* that carries `scale_factor` and/or `add_offset` attrs is *packed*: the on-disk integer is a quantization of a real-valued measurement. **The integer dtype is required.** A float array that incidentally carries `scale_factor` as legacy metadata (measurement precision, grid resolution) must NOT be decoded — applying `scale * value + offset` to already-decoded floats would corrupt them by a factor of ~100×. The trigger condition is `integer_dtype AND (has scale_factor OR has add_offset)`, not the presence of attrs alone.
 
@@ -396,7 +417,7 @@ Filters on data variables cannot be pushed (Zarr is dense, no chunk-level statis
 2. **v0.2** — Zarr v2 + Blosc/LZ4 codecs (free with `zarrs`), replacement scan (via `libduckdb-sys` FFI), projection pushdown, type mapping for native datetime/string dtypes.
 3. **v0.3** — Multi-group stores via `ATTACH ... (TYPE ZARR)`; coordinate-range filter pushdown; parallel scan; statistics; **coarsest-grid chunk planning** (relaxes decision 6's uniform-chunk requirement now that the scan engine is being reworked anyway). Goal: beat naive `xarray + pandas` (with dask, on the same thread budget) on a real ERA5 query. Benchmark must capture chunks-decoded vs total chunks, not just wall-clock.
 4. **v0.4** — Remote stores via DuckDB filesystem FFI, secrets integration, community-extension submission.
-5. **Later** — CF time UDFs (deferred until a permissively-licensed implementation path exists; nice-to-have, not blocking), chunk-level statistics (when present), aggregate pushdown, write support, 2D non-dimension coordinates, async `zarrs` if remote latency demands it.
+5. **Later** — CF time on the artificial calendars (`noleap`, `360_day`, `julian` — deferred until a permissively-licensed implementation path exists; the real-world calendars decode today, see §CF time decoding), chunk-level statistics (when present), aggregate pushdown, write support, 2D non-dimension coordinates, async `zarrs` if remote latency demands it.
 
 ## Open questions and decisions
 
@@ -422,9 +443,13 @@ When a store contains many data variables, do we expose them as one wide table, 
 
 CF-encoded time (e.g. `int64` + `units = "hours since 1970-01-01"` + `calendar = "noleap"`) needs explicit conversion. We can decode at scan time (transparent but opinionated), expose a UDF (explicit but a tiny extra hop), or defer the whole thing.
 
-> **Decision:** Defer. CF-encoded time columns are exposed raw as `BIGINT`; users handle the conversion app-side (xarray, pandas, or a follow-up SQL macro) until a permissively-licensed implementation path is identified.
+> **Decision (superseded):** Defer. CF-encoded time columns are exposed raw as `BIGINT`; users handle the conversion app-side.
 >
-> **Rationale:** Be honest about what's central. The product win — SQL on a Zarr store, with chunk pruning and parallel scan — does not depend on CF time. The originally-proposed `cftime-rs` is AGPL-3.0 (incompatible with community-extension binary distribution) and unmaintained since October 2023, so the easy path is closed. Implementing CF math in-tree is doable but is several hundred lines of calendar code that would gate every other v0.2 deliverable on its testing burden. Keeping CF support on the deferred list lets the v0.2 milestone land cleanly and lets us pick this up properly when the right dependency exists, without rushing the call.
+> **Rationale:** The originally-proposed `cftime-rs` is AGPL-3.0 (incompatible with community-extension binary distribution) and unmaintained since October 2023, so the easy path was closed, and implementing *all* of CF's calendars in-tree would have gated every other v0.2 deliverable on its testing burden.
+>
+> **Decision (current):** Decode at scan time, on the real-world calendars only. `proleptic_gregorian` and post-reform `standard`/`gregorian` columns come out as `TIMESTAMP`; `noleap`, `360_day`, `julian` and friends stay raw. `decode_times := false` opts out. See §CF time decoding.
+>
+> **Rationale:** The deferral conflated two problems. The hard one is the *artificial* calendars, which genuinely need cftime semantics — and those are still deferred. The easy one is the calendars that match a wall clock, which is where essentially all widely-queried data lives (ERA5, GPCP, the NCEP reanalyses), and which needs no *new* dependency: `chrono` — already pulled in transitively by `duckdb`'s own Arrow dependency — supplies the civil-date arithmetic directly. Splitting the two turns the AGPL blocker from a wall into a scope boundary. And the win is not marginal: without it every time predicate in every query has to be hand-written against the array's `units` attr, which is exactly the friction this extension exists to remove.
 
 ### 4. Replacement scan ambiguity
 

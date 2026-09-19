@@ -27,6 +27,13 @@ SELECT lat, lon, AVG(temperature)
 FROM 'test/fixtures/xarray_tutorial/float_baseline.zarr'
 GROUP BY lat, lon;
 
+-- CF time coordinates arrive as TIMESTAMP, so date predicates and date
+-- functions need no ceremony (decode_times=false gives the raw offsets).
+SELECT date_trunc('month', time) AS month, AVG(air) AS mean_air
+FROM 'test/fixtures/xarray_tutorial/air_temperature.zarr'
+WHERE time >= TIMESTAMP '2014-01-01'
+GROUP BY month ORDER BY month;
+
 -- Select one array by its store-relative path (e.g. an OME-Zarr resolution level or nested label)
 SELECT * FROM read_zarr('test/fixtures/bioimage/ome_zarr/synthetic_multichannel.ome.zarr', array_path='0');
 
@@ -50,7 +57,7 @@ DuckDB's secrets manager (`CREATE SECRET ... TYPE S3`).
 
 Active development. Phases 1–3 are implemented:
 
-- **Phase 1** — `read_zarr`, `read_zarr_metadata`, `read_zarr_groups` table functions; Zarr v3; CF conventions (fill values, scale/offset, bounds variables, aux coords)
+- **Phase 1** — `read_zarr`, `read_zarr_metadata`, `read_zarr_groups` table functions; Zarr v3; CF conventions (fill values, scale/offset, time → `TIMESTAMP`, bounds variables, aux coords)
 - **Phase 2** — Zarr v2, Blosc/LZ4, replacement scan for local `.zarr` paths, projection pushdown
 - **Phase 3** — HTTP/HTTPS stores, `dims=` and `array_path=` selection, recursive array discovery
 

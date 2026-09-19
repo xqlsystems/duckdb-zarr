@@ -397,6 +397,75 @@ FROM (SELECT air FROM read_zarr('test/fixtures/xarray_tutorial/air_temperature.z
 ----
 1088175738.000000
 
+# ── CF time decoding ──────────────────────────────────────────────────────────
+# A coord carrying `units = "<step> since <reference>"` on a real-world calendar
+# is surfaced as TIMESTAMP instead of the raw offset it is stored as.
+
+# cf_time (time, lat): int64 "hours since 1900-01-01 00:00:00" — the ARCO-ERA5 shape.
+query I
+SELECT typeof(time) FROM read_zarr('test/fixtures/xarray_tutorial/cf_time.zarr', dims=['time','lat']) LIMIT 1;
+----
+TIMESTAMP
+
+query I
+SELECT DISTINCT time FROM read_zarr('test/fixtures/xarray_tutorial/cf_time.zarr', dims=['time','lat']) ORDER BY 1;
+----
+2020-01-01 00:00:00
+2020-01-01 01:00:00
+2020-01-01 02:00:00
+2020-01-01 03:00:00
+
+# Timestamp literals compare directly against the decoded column.
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/cf_time.zarr', dims=['time','lat'])
+WHERE time >= TIMESTAMP '2020-01-01 02:00:00';
+----
+6
+
+# decode_times=false restores the raw on-disk offsets (xarray.open_zarr's escape hatch).
+query I
+SELECT typeof(time) FROM read_zarr('test/fixtures/xarray_tutorial/cf_time.zarr', dims=['time','lat'], decode_times=false) LIMIT 1;
+----
+BIGINT
+
+query I
+SELECT MIN(time) FROM read_zarr('test/fixtures/xarray_tutorial/cf_time.zarr', dims=['time','lat'], decode_times=false);
+----
+1051896
+
+# noleap has 365-day years, so its offsets have no wall-clock equivalent —
+# the column stays raw rather than becoming a wrong date (issue #45).
+query I
+SELECT typeof(noleap_time) FROM read_zarr('test/fixtures/xarray_tutorial/cf_time.zarr', dims=['noleap_time','lat']) LIMIT 1;
+----
+DOUBLE
+
+# float32 "hours since 1800-01-01" on the standard calendar (air_temperature).
+# Matches xarray: 2013-01-01T00:00 .. 2014-12-31T18:00, 6-hourly.
+query II
+SELECT MIN(time), MAX(time) FROM read_zarr('test/fixtures/xarray_tutorial/air_temperature.zarr');
+----
+2013-01-01 00:00:00	2014-12-31 18:00:00
+
+# float64 "days since 1800-01-01", proleptic_gregorian (ersstv5): monthly 1970..2021.
+query II
+SELECT MIN(time), MAX(time) FROM read_zarr('test/fixtures/xarray_tutorial/ersstv5.zarr');
+----
+1970-01-01 00:00:00	2021-12-01 00:00:00
+
+# Decoded timestamps drive DuckDB's date functions — the point of the exercise.
+query II
+SELECT date_part('year', MIN(time)), date_part('month', MAX(time))
+FROM read_zarr('test/fixtures/xarray_tutorial/ersstv5.zarr');
+----
+1970	12
+
+# A coord with no CF units at all is untouched.
+query I
+SELECT typeof(time) FROM read_zarr('test/fixtures/xarray_tutorial/float_baseline.zarr') LIMIT 1;
+----
+BIGINT
+
 # ── extension version ───────────────────────────────────────────────────────
 # extension_version is stamped at build time from `git tag --points-at HEAD`
 # (falling back to the short commit hash) by extension-ci-tools' configure

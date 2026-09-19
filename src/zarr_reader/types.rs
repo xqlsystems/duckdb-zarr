@@ -1,5 +1,7 @@
 use duckdb::core::{LogicalTypeHandle, LogicalTypeId};
 
+use super::cftime::CfTimeEncoding;
+
 /// On-disk Zarr dtype as reported by zarrs `DataType::to_string()`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ZarrDtype {
@@ -72,6 +74,8 @@ impl ZarrDtype {
     pub fn to_duckdb_type(&self, encoding: &ColumnEncoding) -> LogicalTypeHandle {
         match encoding {
             ColumnEncoding::PackedInt { .. } => LogicalTypeId::Double.into(),
+            // Microseconds since the Unix epoch — DuckDB TIMESTAMP's physical layout.
+            ColumnEncoding::CfTime(_) => LogicalTypeId::Timestamp.into(),
             ColumnEncoding::Plain => match self {
                 Self::Bool => LogicalTypeId::Boolean.into(),
                 Self::Int8 => LogicalTypeId::Tinyint.into(),
@@ -94,7 +98,12 @@ impl ZarrDtype {
 #[derive(Debug, Clone)]
 pub enum ColumnEncoding {
     Plain,
-    PackedInt { scale_factor: f64, add_offset: f64 },
+    PackedInt {
+        scale_factor: f64,
+        add_offset: f64,
+    },
+    /// CF-encoded time (`units = "<step> since <reference>"`) → `TIMESTAMP`.
+    CfTime(CfTimeEncoding),
 }
 
 /// Parsed NULL-masking sentinel from CF attrs (`_FillValue` or `missing_value`).

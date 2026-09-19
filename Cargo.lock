@@ -3203,6 +3203,7 @@ name = "zarr"
 version = "0.1.3"
 dependencies = [
  "base64",
+ "chrono",
  "duckdb",
  "ndarray",
  "openssl",

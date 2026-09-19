@@ -4,6 +4,8 @@ configure
 .idea
 duckdb_unittest_tempdir
 /test/bin
+# Stray DuckDB database file from ad hoc `duckdb zarr` shell invocations
+/zarr
 venv
 .venv
 __pycache__

@@ -11,7 +11,7 @@ use crate::zarr_reader::meta::{
     ZarrStore,
 };
 use crate::zarr_reader::types::{
-    ColumnDef, ColumnValues, CoordArray, DimGroup, WorkUnit, ZarrDtype,
+    ColumnDef, ColumnEncoding, ColumnValues, CoordArray, DimGroup, WorkUnit, ZarrDtype,
 };
 
 // ---------------------------------------------------------------------------
@@ -93,6 +93,13 @@ impl VTab for ReadZarrVTab {
         }
         let requested_array = array_path.or(array_alias);
 
+        // Mirrors xarray.open_zarr's decode_times=: on by default, opt out to see
+        // the raw CF offsets instead of TIMESTAMPs.
+        let decode_times = bind
+            .get_named_parameter("decode_times")
+            .map(|value| value.is_null() || value.to_bool())
+            .unwrap_or(true);
+
         let fs = unsafe { extract_file_system(bind) };
         let store = open_store(&store_path, Some(fs))?;
         if let Some(requested) = requested_array {
@@ -118,7 +125,7 @@ impl VTab for ReadZarrVTab {
                     .into());
                 }
             }
-            return finish_bind(bind, store, &group);
+            return finish_bind(bind, store, &group, decode_times);
         }
 
         let array_names = crate::zarr_reader::meta::list_array_names(&store_path, &store)?;
@@ -151,7 +158,7 @@ impl VTab for ReadZarrVTab {
             }
         };
 
-        finish_bind(bind, store, group)
+        finish_bind(bind, store, group, decode_times)
     }
 
     fn supports_pushdown() -> bool {
@@ -263,6 +270,7 @@ impl VTab for ReadZarrVTab {
             ),
             ("array".to_string(), LogicalTypeId::Varchar.into()),
             ("array_path".to_string(), LogicalTypeId::Varchar.into()),
+            ("decode_times".to_string(), LogicalTypeId::Boolean.into()),
         ])
     }
 }
@@ -293,11 +301,12 @@ fn finish_bind(
     bind: &BindInfo,
     store: ZarrStore,
     group: &DimGroup,
+    decode_times: bool,
 ) -> Result<ReadZarrBind, Box<dyn std::error::Error>> {
     // Load coord arrays.
     let mut coord_arrays: HashMap<String, CoordArray> = HashMap::new();
     for coord_name in &group.coord_var_names {
-        let ca = load_coord_array(&store, coord_name)?;
+        let ca = load_coord_array(&store, coord_name, decode_times)?;
         let arr = open_array(&store, coord_name)?;
         let dims = dimension_names(&arr, coord_name)?;
         if let Some(dim) = dims.first() {
@@ -305,7 +314,7 @@ fn finish_bind(
         }
     }
 
-    let columns = build_column_defs(&store, group, &coord_arrays)?;
+    let columns = build_column_defs(&store, group, &coord_arrays, decode_times)?;
 
     // Register output columns with DuckDB. When a single array is selected by
     // array_path, its name is a numeric level (`0`) or a nested store-relative
@@ -471,10 +480,11 @@ fn fill_chunk_slice(
                     match &ca.data {
                         ColumnValues::Fixed(bytes) => {
                             let elem_size = ca.dtype.byte_size();
-                            crate::zarr_reader::scan::fill_scalar_element_pub(
+                            fill_element(
                                 &mut vector,
                                 bytes,
                                 &ca.dtype,
+                                &ca.encoding,
                                 &ca.sentinel,
                                 coord_idx,
                                 elem_size,
@@ -502,7 +512,7 @@ fn fill_chunk_slice(
                 match chunk_bytes.get(&col_def.name) {
                     Some(ColumnValues::Fixed(bytes)) => {
                         let elem_size = col_def.on_disk_dtype.byte_size();
-                        fill_data_element(
+                        fill_element(
                             &mut vector,
                             bytes,
                             &col_def.on_disk_dtype,
@@ -533,42 +543,79 @@ fn fill_chunk_slice(
     n_rows
 }
 
+/// Write one element — coord or data variable — into the DuckDB output vector,
+/// applying whatever CF decoding the column's bind-time encoding calls for.
 #[allow(clippy::too_many_arguments)]
-fn fill_data_element(
+fn fill_element(
     vector: &mut duckdb::core::FlatVector<'_>,
     bytes: &[u8],
     dtype: &ZarrDtype,
-    encoding: &crate::zarr_reader::types::ColumnEncoding,
+    encoding: &ColumnEncoding,
     sentinel: &Option<crate::zarr_reader::types::FillSentinel>,
     flat_row: usize,
     elem_size: usize,
     dst: usize,
 ) {
-    use crate::zarr_reader::types::ColumnEncoding;
+    use crate::zarr_reader::scan::{
+        fill_scalar_element_pub, matches_float_sentinel, matches_int_sentinel, read_as_f64_pub,
+        read_int_as_i64_pub,
+    };
     match encoding {
         ColumnEncoding::Plain => {
-            crate::zarr_reader::scan::fill_scalar_element_pub(
-                vector, bytes, dtype, sentinel, flat_row, elem_size, dst,
-            );
+            fill_scalar_element_pub(vector, bytes, dtype, sentinel, flat_row, elem_size, dst);
         }
         ColumnEncoding::PackedInt {
             scale_factor,
             add_offset,
         } => {
             let src = flat_row * elem_size;
-            let raw = crate::zarr_reader::scan::read_int_as_i64_pub(bytes, dtype, src);
-            let is_null = match sentinel {
-                Some(crate::zarr_reader::types::FillSentinel::Int(v)) => raw == *v,
-                Some(crate::zarr_reader::types::FillSentinel::UInt(v)) => (raw as u64) == *v,
-                _ => false,
-            };
-            if is_null {
+            let raw = read_int_as_i64_pub(bytes, dtype, src);
+            // CF §8.1: mask on the raw integer, before scaling shifts the sentinel.
+            if matches_int_sentinel(raw, sentinel) {
                 vector.set_null(dst);
             } else {
+                // read_int_as_i64_pub bit-reinterprets UInt64, so a value above
+                // i64::MAX comes back negative here; recover the true magnitude
+                // before scaling instead of scaling a sign-flipped one.
+                let numeric = if *dtype == ZarrDtype::UInt64 {
+                    raw as u64 as f64
+                } else {
+                    raw as f64
+                };
                 unsafe {
                     let slot = vector.as_mut_ptr::<f64>();
-                    *slot.add(dst) = raw as f64 * scale_factor + add_offset;
+                    *slot.add(dst) = numeric * scale_factor + add_offset;
                 }
+            }
+        }
+        ColumnEncoding::CfTime(cf) => {
+            let src = flat_row * elem_size;
+            // Integers go through the exact i128 path; only float offsets need f64.
+            // Either way an unrepresentable instant (NaN, or past DuckDB's range)
+            // becomes NULL rather than a bogus date.
+            let decoded = if dtype.is_integer() {
+                let raw = read_int_as_i64_pub(bytes, dtype, src);
+                // A UInt64 raw above i64::MAX comes back negative from the same
+                // bit-reinterpret — no legitimate CF-time offset is that large
+                // anyway (see out_of_range_values_decode_to_none), so treat it as
+                // out-of-range rather than decoding a bogus negative-offset date.
+                let overflowed = *dtype == ZarrDtype::UInt64 && raw < 0;
+                (!overflowed && !matches_int_sentinel(raw, sentinel))
+                    .then(|| cf.decode_int(raw))
+                    .flatten()
+            } else {
+                let raw = read_as_f64_pub(bytes, dtype, src);
+                (!matches_float_sentinel(raw, sentinel))
+                    .then(|| cf.decode_float(raw))
+                    .flatten()
+            };
+            match decoded {
+                // DuckDB TIMESTAMP is physically an i64 of microseconds since epoch.
+                Some(micros) => unsafe {
+                    let slot = vector.as_mut_ptr::<i64>();
+                    *slot.add(dst) = micros;
+                },
+                None => vector.set_null(dst),
             }
         }
     }

@@ -548,9 +548,21 @@ pub fn parse_dtype(array: &ZarrArray, name: &str) -> Result<ZarrDtype, Box<dyn s
 /// Parse `ColumnEncoding` and `FillSentinel` from CF attrs.
 ///
 /// Packed-int rule: integer on-disk dtype AND (scale_factor OR add_offset in attrs).
+/// CF-time rule: `units` parses as `"<step> since <reference>"` on a decodable
+/// calendar, and the column is not already claimed by packed-int decoding.
+/// `decode_times = false` (the `decode_times=` named parameter) suppresses the
+/// latter and leaves the raw offsets visible, mirroring `xarray.open_zarr`.
+///
+/// Packed-int deliberately takes priority: CF §8.1 permits packing *any* numeric
+/// variable, including a time axis, but no store seen in practice packs time —
+/// it is already a compact int64/float64 — so a column with both `scale_factor`
+/// and CF-time `units` is decoded as the scaled physical quantity, not double
+/// -decoded into a scaled-then-CF-timestamped value. Combining the two would need
+/// its own `ColumnEncoding` variant for a case that has not shown up.
 pub fn parse_encoding_and_sentinel(
     dtype: &ZarrDtype,
     attrs: &serde_json::Map<String, serde_json::Value>,
+    decode_times: bool,
 ) -> (ColumnEncoding, Option<FillSentinel>) {
     let scale = attrs
         .get("scale_factor")
@@ -568,7 +580,15 @@ pub fn parse_encoding_and_sentinel(
             add_offset: offset,
         }
     } else {
-        ColumnEncoding::Plain
+        // Bool and String are excluded: neither can hold a numeric time offset, and a
+        // string column must stay on the string decode path.
+        match (decode_times && !matches!(dtype, ZarrDtype::Bool | ZarrDtype::String))
+            .then(|| super::cftime::parse(attrs))
+            .flatten()
+        {
+            Some(cf) => ColumnEncoding::CfTime(cf),
+            None => ColumnEncoding::Plain,
+        }
     };
 
     let sentinel = parse_sentinel(dtype, attrs);
@@ -906,11 +926,12 @@ pub fn discover_dim_groups(
 pub fn load_coord_array(
     store: &ZarrStore,
     coord_name: &str,
+    decode_times: bool,
 ) -> Result<CoordArray, Box<dyn std::error::Error>> {
     let arr = open_array(store, coord_name)?;
     let dtype = parse_dtype(&arr, coord_name)?;
     let attrs = arr.attributes().clone();
-    let (encoding, sentinel) = parse_encoding_and_sentinel(&dtype, &attrs);
+    let (encoding, sentinel) = parse_encoding_and_sentinel(&dtype, &attrs, decode_times);
     let sentinel = sentinel.or_else(|| parse_zarr_fill_sentinel(&arr, &dtype));
     let shape = arr.shape().to_vec();
     let n = shape[0] as usize;
@@ -984,6 +1005,7 @@ pub fn build_column_defs(
     store: &ZarrStore,
     group: &DimGroup,
     coord_arrays: &HashMap<String, CoordArray>,
+    decode_times: bool,
 ) -> Result<Vec<ColumnDef>, Box<dyn std::error::Error>> {
     let mut cols = Vec::new();
 
@@ -1017,7 +1039,7 @@ pub fn build_column_defs(
         let arr = open_array(store, var_name)?;
         let dtype = parse_dtype(&arr, var_name)?;
         let attrs = arr.attributes().clone();
-        let (encoding, sentinel) = parse_encoding_and_sentinel(&dtype, &attrs);
+        let (encoding, sentinel) = parse_encoding_and_sentinel(&dtype, &attrs, decode_times);
         let sentinel = sentinel.or_else(|| parse_zarr_fill_sentinel(&arr, &dtype));
         cols.push(ColumnDef {
             name: var_name.clone(),
