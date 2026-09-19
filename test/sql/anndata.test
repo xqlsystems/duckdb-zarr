@@ -39,10 +39,18 @@ WHERE name IN ('X/data', 'X/indices', 'X/indptr', 'var/gene_symbol/values',
 ----
 9
 
-query II
-SELECT dtype, dims FROM read_zarr_metadata('test/fixtures/anndata/pbmc_like.zarr') WHERE name = 'X/data';
+# `dims` is what the array's own metadata declares (nothing, for AnnData).
+# `array_path_dims` is what read_zarr(store, array_path := name) will bind — the column
+# names to write in SQL.
+query III
+SELECT dtype, dims, array_path_dims FROM read_zarr_metadata('test/fixtures/anndata/pbmc_like.zarr') WHERE name = 'X/data';
 ----
-float32 / <f4	[]
+float32 / <f4	[]	["dim_0"]
+
+query I
+SELECT array_path_dims FROM read_zarr_metadata('test/fixtures/anndata/pbmc_like.zarr') WHERE name = 'obsm/X_umap';
+----
+["dim_0","dim_1"]
 
 query I
 SELECT dtype FROM read_zarr_metadata('test/fixtures/anndata/pbmc_like.zarr') WHERE name = 'var/gene_symbol/values';
@@ -156,8 +164,13 @@ SELECT
 # Row r owns the flat positions [indptr[r], indptr[r+1]). Do NOT use an
 # `ASOF JOIN ... ON pos >= indptr.value` here: with an empty row indptr repeats an
 # offset, ASOF picks among the ties arbitrarily, and nonzeros land on the wrong
-# row. The fixture has empty rows 7, 8 and 19 for exactly this reason. A range
-# join on the half-open interval is exact (empty rows match nothing).
+# row. The fixture has empty rows 7, 8 and 19 for exactly this reason. Two exact
+# alternatives are tested below and asserted identical:
+#   * a range join on the half-open interval (empty rows match nothing) — the
+#     obviously-correct reference;
+#   * an ASOF join against indptr DEDUPLICATED to the last row per offset (with ties
+#     removed, "last offset at or before this position" is exactly right) — about
+#     2.5x faster and half the memory at 2-9M nonzeros; see docs/design.md decision 7.
 
 # Every reconstructed nonzero must satisfy the fixture's generating rule, i.e. land
 # on the right row and carry the right value: 0 violations, over all 27 entries.
@@ -176,6 +189,30 @@ SELECT COUNT(*),
                                    AND x_value = obs_idx * 10 + var_idx + 1
                                    AND obs_idx NOT IN (7, 8, 19)))
 FROM csr;
+----
+27	0
+
+# The deduplicated-ASOF alternative assigns every nonzero to the same row as the range
+# join (all 27 entries; includes the positions right after the empty rows).
+query II
+WITH bounds AS (
+  SELECT dim_0 AS obs_idx, value AS start_pos, LEAD(value) OVER (ORDER BY dim_0) AS end_pos
+  FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/indptr')
+), last_row AS (
+  SELECT value AS start_pos, MAX(dim_0) AS obs_idx
+  FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/indptr')
+  GROUP BY value
+), by_range AS (
+  SELECT d.dim_0 AS pos, b.obs_idx
+  FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/data') d
+  JOIN bounds b ON d.dim_0 >= b.start_pos AND d.dim_0 < b.end_pos
+), by_asof AS (
+  SELECT d.dim_0 AS pos, l.obs_idx
+  FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/data') d
+  ASOF JOIN last_row l ON d.dim_0 >= l.start_pos
+)
+SELECT COUNT(*), COUNT(*) FILTER (WHERE r.obs_idx != a.obs_idx)
+FROM by_range r JOIN by_asof a USING (pos);
 ----
 27	0
 
@@ -199,17 +236,17 @@ WHERE g.value != COALESCE(r.n, 0);
 0
 
 # ── read_zarr_metadata degrades per array, not per store ──────────────────────
-# unsupported_dtype.zarr has one readable array and one whose dtype zarrs doesn't
+# unsupported_dtype.zarr (not AnnData) has one readable array and one whose dtype zarrs doesn't
 # know. The bad one is listed as role='unsupported' (error text in `attrs`); the
 # good one is unaffected. (Only "zarrs doesn't support this" is degraded — I/O and
 # missing-metadata errors still fail the call; see the unit tests in meta.rs.)
 query TTT
-SELECT name, dtype, role FROM read_zarr_metadata('test/fixtures/anndata/unsupported_dtype.zarr') ORDER BY name;
+SELECT name, dtype, role FROM read_zarr_metadata('test/fixtures/xarray_tutorial/unsupported_dtype.zarr') ORDER BY name;
 ----
 bad	unsupported	unsupported
 good	float32 / <f4	data
 
 query I
-SELECT attrs LIKE '%not_a_real_dtype%' FROM read_zarr_metadata('test/fixtures/anndata/unsupported_dtype.zarr') WHERE name = 'bad';
+SELECT attrs LIKE '%not_a_real_dtype%' FROM read_zarr_metadata('test/fixtures/xarray_tutorial/unsupported_dtype.zarr') WHERE name = 'bad';
 ----
 true

@@ -1,0 +1,39 @@
+# name: test/sql/ragged_chunks.test
+# description: boundary chunks smaller than the nominal chunk shape (strings and numbers)
+# group: [zarr]
+#
+# Every other fixture is a single chunk. zarrs pads a boundary chunk's element buffer
+# out to the full nominal chunk shape (fill values past the array's logical edge), and
+# the scan must index around that padding — for variable-length strings as much as for
+# fixed-width numbers (docs/design.md §Variable-length strings). Fixture:
+# scripts/generate_fixtures.py `ragged_chunks`.
+#
+#   s, v  (r=5, c=3) chunks (2, 2)  ragged in both dims; s is a string array
+#   t     (i=10)     chunks (4,)    chunks of 4, 4, 2; string
+#   x27   (n=27)     chunks (10,)   chunks of 10, 10, 7; float32 (the shape of a CSR X/data)
+
+require zarr
+
+# 2-D, ragged in both dims: 15 rows, and EVERY cell — string and number — must equal
+# what the generator wrote (s = 's<r><c>', v = r*10 + c). Zero mismatches.
+query II
+SELECT COUNT(*),
+       COUNT(*) FILTER (WHERE s != 's' || r::VARCHAR || c::VARCHAR OR v != r * 10 + c)
+FROM read_zarr('test/fixtures/xarray_tutorial/ragged_chunks.zarr', dims := ['r', 'c']);
+----
+15	0
+
+# 1-D ragged string array (last chunk holds 2 of 4 elements). A plain array name is its
+# own column name; only '/'-paths and numeric names are exposed as `value`.
+query II
+SELECT COUNT(*), COUNT(*) FILTER (WHERE t != 't' || i::VARCHAR)
+FROM read_zarr('test/fixtures/xarray_tutorial/ragged_chunks.zarr', array_path := 't');
+----
+10	0
+
+# 1-D ragged float32 (last chunk holds 7 of 10): every element, plus the total.
+query IIR
+SELECT COUNT(*), COUNT(*) FILTER (WHERE x27 != n * 2), SUM(x27)
+FROM read_zarr('test/fixtures/xarray_tutorial/ragged_chunks.zarr', array_path := 'x27');
+----
+27	0	702.000000
