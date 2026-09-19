@@ -4,8 +4,9 @@ use duckdb::core::LogicalTypeId;
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
 
 use crate::zarr_reader::meta::{
-    collect_auxiliary_coords, collect_bounds_vars, dimension_names_or_synthesize as get_dim_names,
-    extract_file_system, list_array_names, open_array, open_store, select_array_name,
+    collect_auxiliary_coords, collect_bounds_vars, dimension_names as get_dim_names,
+    extract_file_system, is_unsupported_array_error, list_array_names, open_array, open_store,
+    select_array_name,
 };
 
 /// One metadata row per array.
@@ -71,23 +72,25 @@ impl VTab for ReadZarrMetaVTab {
 
         let mut rows = Vec::new();
         for name in &array_names {
-            // zarrs itself may refuse to open an array whose dtype it doesn't
-            // recognize (e.g. certain `uns` entries in AnnData stores) — degrade
-            // to a single "unsupported" row instead of failing the whole call.
+            // zarrs may refuse to open an array whose dtype or codecs it doesn't
+            // support (e.g. some AnnData `uns` entries). List it as `unsupported`
+            // instead of failing the whole call — but only for that class of error:
+            // I/O, auth and missing-metadata failures must still surface.
             let arr = match open_array(&store, name) {
                 Ok(arr) => arr,
-                Err(err) => {
+                Err(err) if is_unsupported_array_error(err.as_ref()) => {
                     rows.push(MetaRow {
                         name: name.clone(),
                         dims: "[]".to_string(),
-                        dtype: err.to_string(),
+                        dtype: "unsupported".to_string(),
                         shape: "[]".to_string(),
                         chunk_shape: "[]".to_string(),
-                        attrs: "{}".to_string(),
+                        attrs: serde_json::json!({ "error": err.to_string() }).to_string(),
                         role: "unsupported".to_string(),
                     });
                     continue;
                 }
+                Err(err) => return Err(err),
             };
             let shape = arr.shape().to_vec();
             // chunk_grid_shape() returns number-of-chunks per dim, NOT element shape.
@@ -101,7 +104,7 @@ impl VTab for ReadZarrMetaVTab {
                 Vec::new()
             };
 
-            let dims = get_dim_names(&arr, name);
+            let dims = get_dim_names(&arr, name).unwrap_or_default();
             let dtype_str = arr.data_type().to_string();
             let attrs = arr.attributes().clone();
 

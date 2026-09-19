@@ -57,10 +57,7 @@ def _rmtree(path: pathlib.Path) -> None:
     except PermissionError:
         subprocess.run(['sudo', 'rm', '-rf', str(path)], check=False)
 
-import anndata as ad
 import numpy as np
-import pandas as pd
-import scipy.sparse
 import xarray as xr
 import zarr
 
@@ -637,62 +634,108 @@ def main() -> None:
     # Tests: AnnData-style Zarr compatibility (issue #40) — arrays with no
     # `dimension_names`/`_ARRAY_DIMENSIONS` (AnnData/zarr-python never write
     # either), `obs`/`var` string + categorical columns, and a sparse CSR `X`
-    # read component-by-component via array_path= and reconstructed with
-    # plain SQL, per the pattern demonstrated in the issue thread. Written
-    # with the real `anndata` package (not hand-built) so the on-disk layout
-    # matches actual AnnData writers exactly. X's nonzero pattern and values
-    # are a deterministic formula (not random) so SQL tests can assert exact
-    # expected values without re-deriving them from the file.
+    # read component-by-component via array_path= and reconstructed with plain
+    # SQL. Written with the real `anndata` package so the on-disk layout matches
+    # actual writers. Everything is deterministic so SQL tests can assert exact
+    # values, and deliberately includes the awkward cases real data has:
+    #   * EMPTY ROWS (7, 8, 19): indptr has repeated offsets, which breaks naive
+    #     "row = last indptr <= position" recipes (ties).
+    #   * a NULL string (var/gene_symbol[6]): stored as a `nullable-string-array`
+    #     group (values + mask); `values` alone reads it as ''.
+    #   * a NULL category (obs/cell_type[4]): stored as code -1.
+    # anndata is imported here, not at module top, so a missing/broken anndata
+    # only affects this fixture rather than every fixture.
     print("anndata/pbmc_like (synthetic, real anndata writer)...")
     dest = ANNDATA_FIXTURES / "pbmc_like.zarr"
     if (dest / "zarr.json").exists() or (dest / ".zattrs").exists():
         print(f"  (cached) {dest}")
     else:
+        import anndata as ad
+        import pandas as pd
+        import scipy.sparse
+
         if dest.exists():
             _rmtree(dest)
 
-        n_obs, n_var = 20, 8
+        # anndata converts any string column with fewer unique values than rows to a
+        # categorical (code -1 for nulls), both in the constructor and again in
+        # write_zarr. To get the other real-world null encoding — a
+        # nullable-string-array (values + mask) — we allow nullable strings and
+        # neutralise that conversion for this one object. cell_type stays
+        # categorical, so both encodings are represented.
+        ad.settings.allow_write_nullable_strings = True
 
-        # Deterministic sparse X: nonzero at (i, j) where (i + j) % 5 == 0,
+        n_obs, n_var = 20, 8
+        empty_rows = {7, 8, 19}
+
+        # Nonzero at (i, j) where (i + j) % 5 == 0 and row i is not empty;
         # value = i*10 + j + 1 (never zero, so no explicit-zero ambiguity).
-        # ~29% density (32/160 cells) — realistic for scRNA-seq counts.
         dense = np.zeros((n_obs, n_var), dtype=np.float32)
         for i in range(n_obs):
             for j in range(n_var):
-                if (i + j) % 5 == 0:
+                if (i + j) % 5 == 0 and i not in empty_rows:
                     dense[i, j] = i * 10 + j + 1
         X = scipy.sparse.csr_matrix(dense)
 
+        cell_types = [["T cell", "B cell", "NK cell"][i % 3] for i in range(n_obs)]
+        cell_types[4] = None
         obs = pd.DataFrame(
             {
-                "cell_type": pd.Categorical(
-                    [["T cell", "B cell", "NK cell"][i % 3] for i in range(n_obs)]
-                ),
+                "cell_type": pd.Categorical(cell_types),
                 # All-unique on purpose: anndata auto-converts object columns to
-                # categorical when doing so saves space (fewer categories than
-                # rows). Uniqueness keeps this a plain string column so the
-                # fixture exercises both encodings (see cell_type below).
+                # categorical when that saves space (fewer categories than rows).
                 "donor": [f"donor_{i:02d}" for i in range(n_obs)],
-                "n_genes": np.asarray(
-                    (dense > 0).sum(axis=1), dtype=np.int64
-                ),
+                "n_genes": np.asarray((dense > 0).sum(axis=1), dtype=np.int64),
             },
             index=[f"cell_{i}" for i in range(n_obs)],
         )
+        symbols = ["Actb", "Gapdh", "Myc", "Tp53", "Cd8a", "Cd4", None, "Foxp3"]
         var = pd.DataFrame(
             {
-                "gene_symbol": ["Actb", "Gapdh", "Myc", "Tp53",
-                                "Cd8a", "Cd4", "Il2", "Foxp3"],
                 "mean_expr": np.asarray(dense.mean(axis=0), dtype=np.float64),
             },
             index=[f"gene_{j}" for j in range(n_var)],
         )
-        obsm = {
-            "X_umap": np.arange(n_obs * 2, dtype=np.float32).reshape(n_obs, 2)
-        }
+        obsm = {"X_umap": np.arange(n_obs * 2, dtype=np.float32).reshape(n_obs, 2)}
 
         adata = ad.AnnData(X=X, obs=obs, var=var, obsm=obsm)
+        adata.var["gene_symbol"] = pd.array(symbols, dtype="string")
+        adata.strings_to_categoricals = lambda *args, **kwargs: None
         adata.write_zarr(dest)
+        print(f"  wrote {dest}")
+
+    # ── anndata/unsupported_dtype (hand-written metadata) ────────────────────
+    # Tests: read_zarr_metadata lists an array zarrs cannot open (unknown dtype)
+    # as role='unsupported' instead of failing the whole call, while the good
+    # array beside it is still listed normally.
+    print("anndata/unsupported_dtype (synthetic)...")
+    dest = ANNDATA_FIXTURES / "unsupported_dtype.zarr"
+    if (dest / "zarr.json").exists():
+        print(f"  (cached) {dest}")
+    else:
+        import json
+        if dest.exists():
+            _rmtree(dest)
+
+        def _array_json(data_type, fill_value):
+            return {
+                "zarr_format": 3, "node_type": "array", "shape": [4],
+                "data_type": data_type,
+                "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [4]}},
+                "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+                "fill_value": fill_value,
+                "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}],
+                "attributes": {},
+            }
+
+        for rel, doc in {
+            "": {"zarr_format": 3, "node_type": "group", "attributes": {}},
+            "good": _array_json("float32", 0.0),
+            "bad": _array_json("not_a_real_dtype", 0),
+        }.items():
+            d = dest / rel
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "zarr.json").write_text(json.dumps(doc))
         print(f"  wrote {dest}")
 
     print("\nAll fixtures written.")

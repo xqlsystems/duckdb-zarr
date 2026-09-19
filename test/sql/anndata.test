@@ -3,154 +3,213 @@
 # group: [zarr]
 #
 # Covers https://github.com/xqlsystems/duckdb-zarr/issues/40. AnnData/zarr-python
-# never write `dimension_names`/`_ARRAY_DIMENSIONS`, so every array in an AnnData
-# store used to be rejected at bind — fixed by synthesizing dim_0..dim_n (see
-# docs/design.md decision 7). Combined with the `string` dtype support added in
-# #44, `array_path=` plus hand-written SQL can now read AnnData's obs/var
-# dataframes, categorical columns, and sparse CSR `X` directly, matching the
-# pattern demonstrated in the issue thread (kentstephen, against a real pbmc3k
-# store). This intentionally does NOT add AnnData-aware convenience readers —
-# see docs/design.md decision 7 for why.
+# never write `dimension_names`/`_ARRAY_DIMENSIONS`, so arrays in an AnnData store
+# used to be unreadable. A single array selected with `array_path=` now gets
+# synthesized dim_0..dim_n names (docs/design.md decision 7). Combined with the
+# `string` dtype support from #44, `array_path=` plus hand-written SQL reads
+# AnnData's obs/var dataframes, categoricals and sparse `X`. This deliberately does
+# NOT add AnnData-aware readers, so the recipes below are the user's job — and this
+# file pins down the parts of them that are easy to get silently wrong: nulls and
+# empty rows.
 #
 # The fixture (test/fixtures/anndata/pbmc_like.zarr, scripts/generate_fixtures.py)
-# is written by the real `anndata` package: 20 obs x 8 var, obs has a categorical
-# `cell_type`, a plain string `donor`, and a numeric `n_genes`; var has a string
-# `gene_symbol` (the issue's own motivating example) and a numeric `mean_expr`;
-# X is a sparse CSR float32 matrix with a deterministic (non-random) nonzero
-# pattern; obsm has a dense 2-D `X_umap` embedding.
+# is written by the real `anndata` package. 20 obs x 8 var:
+#   obs/cell_type  categorical; cell 4 is NULL (code -1)
+#   obs/donor      string, all unique
+#   obs/n_genes    int64, nonzeros per row
+#   var/gene_symbol  nullable-string-array (values + mask); gene 6 is NULL
+#   X              csr_matrix float32; nonzero at (i, j) where (i + j) % 5 == 0,
+#                  value i*10 + j + 1, EXCEPT rows 7, 8 and 19 which are empty
+#                  (27 nonzeros; indptr has repeated offsets)
+#   obsm/X_umap    dense 2-D float32
+#
+# Note on `dtype` strings below: zarrs prints a dtype as "<zarr v3 name> / <zarr v2
+# name>" for every array regardless of on-disk format. This store is Zarr v3 (and
+# uses the sharding_indexed codec); "string / |O" is just how zarrs prints `string`.
 
 require zarr
 
-# ── read_zarr_metadata: whole store, no crash ────────────────────────────────
-# Every array opens (fix #1 — dim synthesis), including the ones with no dim
-# metadata at all. This also exercises fix #2 (read_zarr_metadata no longer
-# aborts the whole call on one bad array) on the happy path; this fixture
-# doesn't contain an actually-unopenable array, so the `role = 'unsupported'`
-# degrade branch itself isn't hit here — it's a defensive fix for the dtype
-# kentstephen's real store hit, not reproducible without that exact store.
-
+# ── store-level metadata ──────────────────────────────────────────────────────
+# The whole-store listing works, and includes the arrays we go on to read.
 query I
-SELECT COUNT(*) > 10 FROM read_zarr_metadata('test/fixtures/anndata/pbmc_like.zarr');
+SELECT COUNT(*) FROM read_zarr_metadata('test/fixtures/anndata/pbmc_like.zarr')
+WHERE name IN ('X/data', 'X/indices', 'X/indptr', 'var/gene_symbol/values',
+               'var/gene_symbol/mask', 'obs/cell_type/codes',
+               'obs/cell_type/categories', 'obs/n_genes', 'obsm/X_umap');
 ----
-true
+9
 
-# X/data has no dimension_names/_ARRAY_DIMENSIONS at all — dims synthesizes to dim_0.
 query II
-SELECT dims, dtype FROM read_zarr_metadata('test/fixtures/anndata/pbmc_like.zarr') WHERE name = 'X/data';
+SELECT dtype, dims FROM read_zarr_metadata('test/fixtures/anndata/pbmc_like.zarr') WHERE name = 'X/data';
 ----
-["dim_0"]	float32 / <f4
+float32 / <f4	[]
 
-# obsm/X_umap is 2-D with no dim metadata — dims synthesizes to dim_0, dim_1.
-query I
-SELECT dims FROM read_zarr_metadata('test/fixtures/anndata/pbmc_like.zarr') WHERE name = 'obsm/X_umap';
-----
-["dim_0","dim_1"]
-
-# var/gene_symbol is a `nullable-string-array` group (values + mask), not a
-# plain array — the actual string data lives one level down.
 query I
 SELECT dtype FROM read_zarr_metadata('test/fixtures/anndata/pbmc_like.zarr') WHERE name = 'var/gene_symbol/values';
 ----
 string / |O
 
-# ── obs / var columns via array_path= ────────────────────────────────────────
-
-query I
-SELECT value FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'var/gene_symbol/values') ORDER BY dim_0;
+# Whole-store enumeration stays strict: the arrays have no dimension metadata, so
+# bare read_zarr(store) must not guess — it fails with a message pointing at
+# array_path=. (Synthesizing dims here would make unrelated same-length arrays,
+# e.g. obs/donor/values and obs/cell_type/codes, look like one aligned table.)
+statement error
+SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr') LIMIT 1;
 ----
-Actb
-Gapdh
-Myc
-Tp53
-Cd8a
-Cd4
-Il2
-Foxp3
+no dimension_names or _ARRAY_DIMENSIONS
 
-# obs/donor: a plain (non-categorical) string column, all-unique by
-# construction — read the same way as var/gene_symbol above.
-query I
-SELECT COUNT(DISTINCT value) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'obs/donor/values');
+# ── array_path= synthesizes dim_0..dim_n for one selected array ───────────────
+query II
+SELECT MAX(dim_0), MAX(dim_1) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'obsm/X_umap');
 ----
-20
-
-# obs/cell_type: categorical — codes and categories are two separate arrays,
-# read and joined with plain SQL (no automatic categorical decoding).
-query I
-SELECT c.value AS cell_type
-FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'obs/cell_type/codes') codes
-JOIN read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'obs/cell_type/categories') c
-  ON codes.value = c.dim_0
-WHERE codes.dim_0 = 0;
-----
-T cell
-
-query I
-SELECT COUNT(*) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'obs/cell_type/codes');
-----
-20
-
-# ── sparse X components via array_path= ──────────────────────────────────────
-
-query I
-SELECT COUNT(*) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/data');
-----
-32
-
-query I
-SELECT COUNT(*) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/indptr');
-----
-21
-
-# ── CSR → long-form reconstruction, pure SQL (ASOF join over indptr) ─────────
-# Mirrors the pattern kentstephen demonstrated against a real pbmc3k store:
-# no densification, no AnnData-specific code in the extension. `indptr`'s
-# synthesized dim_0 IS the row (obs) index by construction — the ASOF join
-# picks, for each nonzero's flat position, the largest indptr offset at or
-# before it, whose dim_0 is that nonzero's row.
-
-query I
-SELECT COUNT(*)
-FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/data') data
-JOIN read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/indices') indices
-  ON data.dim_0 = indices.dim_0
-ASOF JOIN read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/indptr') indptr
-  ON data.dim_0 >= indptr.value;
-----
-32
-
-# Known values from the fixture's deterministic nonzero pattern
-# ((i + j) % 5 == 0, value = i*10 + j + 1 — see generate_fixtures.py).
-query IIR
-SELECT indptr.dim_0 AS obs_idx, indices.value AS var_idx, data.value AS x_value
-FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/data') data
-JOIN read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/indices') indices
-  ON data.dim_0 = indices.dim_0
-ASOF JOIN read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/indptr') indptr
-  ON data.dim_0 >= indptr.value
-WHERE data.dim_0 IN (0, 3, 30, 31)
-ORDER BY data.dim_0;
-----
-0	0	1.000000
-2	3	24.000000
-19	1	192.000000
-19	6	197.000000
-
-# ── obsm embedding as a plain dense 2-D array ─────────────────────────────────
+19	1
 
 query I
 SELECT COUNT(*) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'obsm/X_umap');
 ----
 40
 
-# ── store root: multiple unrelated per-array component shapes ────────────────
-# A bare read_zarr(store) with no array_path= sweeps every array into whole-
-# store dim-group inference; AnnData's per-array component layout has no
-# shared dim group to find, so bind must error cleanly (not panic). This is
-# the accepted, documented degradation from decision 7 — array_path= is (and
-# remains) the intended entry point for stores shaped like this one.
-
-statement error
-SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr') LIMIT 1;
+# ── NULLs, encoding 1: nullable-string-array (values + mask) ──────────────────
+# var/gene_symbol is a GROUP; the strings live in `values`. Reading `values` alone
+# silently turns the null gene (index 6) into '' — there is no signal in the data
+# column. The null lives in the separate `mask` array.
+query I
+SELECT value FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'var/gene_symbol/values') WHERE dim_0 = 6;
 ----
-shape mismatch
+(empty)
+
+query I
+SELECT value FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'var/gene_symbol/mask') WHERE dim_0 = 6;
+----
+true
+
+# The correct recipe: apply the mask.
+query II
+SELECT v.dim_0, CASE WHEN m.value THEN NULL ELSE v.value END AS gene_symbol
+FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'var/gene_symbol/values') v
+JOIN read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'var/gene_symbol/mask') m
+  ON v.dim_0 = m.dim_0
+WHERE v.dim_0 IN (0, 5, 6, 7)
+ORDER BY v.dim_0;
+----
+0	Actb
+5	Cd4
+6	NULL
+7	Foxp3
+
+# obs/donor uses the same encoding, all unmasked.
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'obs/donor/values') v
+JOIN read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'obs/donor/mask') m
+  ON v.dim_0 = m.dim_0 WHERE NOT m.value;
+----
+20
+
+# ── NULLs, encoding 2: categorical (codes + categories, code -1 = NULL) ───────
+query I
+SELECT value FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'obs/cell_type/codes') WHERE dim_0 = 4;
+----
+-1
+
+# An INNER JOIN of codes to categories silently drops the null cell (19 of 20)...
+query I
+SELECT COUNT(*)
+FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'obs/cell_type/codes') codes
+JOIN read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'obs/cell_type/categories') cat
+  ON codes.value = cat.dim_0;
+----
+19
+
+# ...a LEFT JOIN keeps it as NULL. Check ALL 20 cells against the fixture's pattern
+# (cell i is T/B/NK cell for i % 3 = 0/1/2, except cell 4 which is NULL).
+query I
+SELECT COUNT(*) FROM (
+  SELECT codes.dim_0 AS i, cat.value AS decoded
+  FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'obs/cell_type/codes') codes
+  LEFT JOIN read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'obs/cell_type/categories') cat
+    ON codes.value = cat.dim_0
+)
+WHERE decoded IS DISTINCT FROM (
+  CASE WHEN i = 4 THEN NULL
+       WHEN i % 3 = 0 THEN 'T cell'
+       WHEN i % 3 = 1 THEN 'B cell'
+       ELSE 'NK cell' END
+);
+----
+0
+
+# ── sparse X (csr_matrix): components via array_path= ─────────────────────────
+query III
+SELECT
+  (SELECT COUNT(*) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/data')),
+  (SELECT COUNT(*) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/indices')),
+  (SELECT COUNT(*) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/indptr'));
+----
+27	27	21
+
+# ── CSR -> long-form (obs, var, value), pure SQL ──────────────────────────────
+# Valid for `csr_matrix` only: indptr has n_obs + 1 entries and indexes ROWS. For a
+# `csc_matrix` indptr indexes COLUMNS and `indices` holds row ids, so the roles of
+# obs/var swap. The extension does not look at the group's `encoding-type`
+# attribute — knowing which one you have is the caller's job.
+#
+# Row r owns the flat positions [indptr[r], indptr[r+1]). Do NOT use an
+# `ASOF JOIN ... ON pos >= indptr.value` here: with an empty row indptr repeats an
+# offset, ASOF picks among the ties arbitrarily, and nonzeros land on the wrong
+# row. The fixture has empty rows 7, 8 and 19 for exactly this reason. A range
+# join on the half-open interval is exact (empty rows match nothing).
+
+# Every reconstructed nonzero must satisfy the fixture's generating rule, i.e. land
+# on the right row and carry the right value: 0 violations, over all 27 entries.
+query II
+WITH bounds AS (
+  SELECT dim_0 AS obs_idx, value AS start_pos, LEAD(value) OVER (ORDER BY dim_0) AS end_pos
+  FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/indptr')
+), csr AS (
+  SELECT b.obs_idx, i.value AS var_idx, d.value AS x_value
+  FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/data') d
+  JOIN read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/indices') i ON d.dim_0 = i.dim_0
+  JOIN bounds b ON d.dim_0 >= b.start_pos AND d.dim_0 < b.end_pos
+)
+SELECT COUNT(*),
+       COUNT(*) FILTER (WHERE NOT ((obs_idx + var_idx) % 5 = 0
+                                   AND x_value = obs_idx * 10 + var_idx + 1
+                                   AND obs_idx NOT IN (7, 8, 19)))
+FROM csr;
+----
+27	0
+
+# Independent cross-check against the stored obs/n_genes array (nonzeros per cell),
+# including the three empty rows, which must come out as 0 and not be dropped.
+query I
+WITH bounds AS (
+  SELECT dim_0 AS obs_idx, value AS start_pos, LEAD(value) OVER (ORDER BY dim_0) AS end_pos
+  FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/indptr')
+), per_row AS (
+  SELECT b.obs_idx, COUNT(*) AS n
+  FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/data') d
+  JOIN bounds b ON d.dim_0 >= b.start_pos AND d.dim_0 < b.end_pos
+  GROUP BY b.obs_idx
+)
+SELECT COUNT(*)
+FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'obs/n_genes') g
+LEFT JOIN per_row r ON g.dim_0 = r.obs_idx
+WHERE g.value != COALESCE(r.n, 0);
+----
+0
+
+# ── read_zarr_metadata degrades per array, not per store ──────────────────────
+# unsupported_dtype.zarr has one readable array and one whose dtype zarrs doesn't
+# know. The bad one is listed as role='unsupported' (error text in `attrs`); the
+# good one is unaffected. (Only "zarrs doesn't support this" is degraded — I/O and
+# missing-metadata errors still fail the call; see the unit tests in meta.rs.)
+query TTT
+SELECT name, dtype, role FROM read_zarr_metadata('test/fixtures/anndata/unsupported_dtype.zarr') ORDER BY name;
+----
+bad	unsupported	unsupported
+good	float32 / <f4	data
+
+query I
+SELECT attrs LIKE '%not_a_real_dtype%' FROM read_zarr_metadata('test/fixtures/anndata/unsupported_dtype.zarr') WHERE name = 'bad';
+----
+true
