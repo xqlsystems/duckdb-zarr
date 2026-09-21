@@ -11,6 +11,8 @@ Usage:
 Output:
     test/fixtures/xarray_tutorial/<name>.zarr
     test/fixtures/bioimage/ome_zarr/<name>.ome.zarr
+    test/fixtures/anndata/<name>.zarr (delegated to generate_anndata_fixtures.py,
+        its own pinned/isolated dependency set — see that file's docstring)
 
 Note on base64-encoded _FillValue: xarray encodes ALL float _FillValue attrs
 as base64 when writing zarr v3 — including non-NaN values like -9.97e36.
@@ -333,6 +335,50 @@ def main() -> None:
                       coords={"lat": lat, "lon": lon})
     write_zarr(xr.Dataset({"values": da}), "unindexed_dim")
 
+    # ── string_var_v3 (synthetic, anndata-style) ────────────────────────────────
+    # Tests: `string` dtype (Zarr v3, vlen-utf8-codec-backed) as a plain data
+    # variable — the shape anndata writes `obs`/`var` columns like
+    # `gene_symbol` in. One row is the empty string to exercise the dtype's
+    # default fill_value. See https://github.com/xqlsystems/duckdb-zarr/issues/40.
+    print("string_var_v3 (synthetic)...")
+    n_var = 5
+    var_idx = np.arange(n_var, dtype="int64")
+    gene_symbol = np.array(["Actb", "Gapdh", "", "Myc", "Tp53"], dtype=object)
+    gene_symbol_da = xr.DataArray(gene_symbol, dims=["var"], coords={"var": var_idx})
+    write_zarr(xr.Dataset({"gene_symbol": gene_symbol_da}), "string_var_v3")
+
+    # ── string_var_v3_2d (synthetic) ─────────────────────────────────────────
+    # Tests: string dtype (Zarr v3) where chunk_shape doesn't evenly divide the
+    # array shape — (3, 5) dims with (2, 3) chunks, so the last row-chunk and
+    # last col-chunk are both boundary chunks padded past the array's logical
+    # bound. Exercises the zarrs_flat physical-offset math against a
+    # Vec<String> decode buffer (see docs/design.md, "Variable-length strings").
+    print("string_var_v3_2d (synthetic)...")
+    n_row, n_col = 3, 5
+    row_idx = np.arange(n_row, dtype="int64")
+    col_idx = np.arange(n_col, dtype="int64")
+    grid = np.array(
+        [[f"r{r}c{c}" for c in range(n_col)] for r in range(n_row)], dtype=object)
+    grid_da = xr.DataArray(grid, dims=["row", "col"],
+                            coords={"row": row_idx, "col": col_idx})
+    write_zarr(xr.Dataset({"grid": grid_da}), "string_var_v3_2d",
+               encoding={"grid": {"chunks": [2, 3]}})
+
+    # ── string_var_v2 (synthetic) ────────────────────────────────────────────
+    # Same data as string_var_v3 but written as Zarr v2: dtype `|O` with a
+    # `vlen-utf8` filter — the exact on-disk encoding anndata (zarr-python)
+    # uses for string columns in a pre-v3 `.zarr` store.
+    print("string_var_v2 (synthetic)...")
+    dest = FIXTURES / "string_var_v2.zarr"
+    if (dest / "gene_symbol" / ".zarray").exists():
+        print(f"  (cached) {dest}")
+    else:
+        if dest.exists():
+            _rmtree(dest)
+        xr.Dataset({"gene_symbol": gene_symbol_da}).to_zarr(
+            dest, zarr_format=2, consolidated=False)
+        print(f"  wrote {dest}")
+    
     # ── cf_time (synthetic) ──────────────────────────────────────────────────
     # Tests: CF time decoding to DuckDB TIMESTAMP.
     #   (time, lat)        — int64 "hours since 1900-01-01 00:00:00", the
@@ -650,6 +696,19 @@ def main() -> None:
         http_ds.to_zarr(dest, zarr_format=3, consolidated=False)
         zarr.consolidate_metadata(str(dest))
         print(f"  wrote {dest}")
+
+    # ── anndata (real, non-synthetic) ────────────────────────────────────────
+    # Delegated to scripts/generate_anndata_fixtures.py via PEP 723 inline
+    # metadata so heavy deps (anndata/awkward/dask) stay isolated from this venv.
+    # Skipped if `uv` isn't installed to avoid zarr/numpy version clashes.
+    if shutil.which("uv"):
+        print("anndata (real, via scripts/generate_anndata_fixtures.py)...", flush=True)
+        subprocess.run(
+            ["uv", "run", str(ROOT / "scripts" / "generate_anndata_fixtures.py")],
+            check=True,
+        )
+    else:
+        print("Skipping anndata fixtures: uv not found (they need an isolated dependency set).")
 
     print("\nAll fixtures written.")
 

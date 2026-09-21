@@ -301,6 +301,7 @@ The base dtype mapping is mechanical:
 | CF-encoded time (`f4/f8/i4/i8`)    | `TIMESTAMP`                              | decoded on real-world calendars; raw dtype otherwise |
 | `S<n>` (fixed bytes)               | `BLOB`                                   |                                             |
 | `U<n>` (UTF-32)                    | `VARCHAR`                                | decoded                                     |
+| `string` (v3) / `\|O`+vlen-utf8 (v2) | `VARCHAR`                              | variable-length; see below                  |
 | structured / object                | unsupported v1                           | error at bind                               |
 
 CF-encoded time appears in real stores as `int32`, `int64`, `float32`, or `float64` depending on the source NetCDF — RASM uses `f8` + `noleap`, `air_temperature` uses `f4` + `gregorian`, ERA5-style stores use `i8`. We decode it to `TIMESTAMP` at scan time; see §CF time decoding and decision 3. The `units` and `calendar` attrs ride along into `read_zarr_metadata.attrs` either way, so a column left raw still says what it is.
@@ -324,7 +325,20 @@ Mechanics worth pinning down:
 - **Masking and range.** The `_FillValue`/`missing_value` sentinel is compared against the *raw* value first, as in packed-int decoding. NaN, and any offset that decodes outside DuckDB's timestamp range, become SQL `NULL` — `i64::MIN`/`i64::MAX` are DuckDB's ±infinity sentinels and must never be collided with.
 - **Escape hatch.** `read_zarr(store, decode_times := false)` turns the whole thing off and restores the raw offsets, mirroring `xarray.open_zarr(decode_times=False)`.
 
+### Variable-length strings (`string` / vlen-utf8)
+
+Unlike other supported dtypes, `ZarrDtype::String` has no fixed `byte_size()` — each element is its own UTF-8 byte run, not a fixed-width slot in a flat buffer. This is the on-disk encoding [anndata](https://github.com/scverse/anndata) (and [zarr-python](https://github.com/zarr-developers/zarr-python) generally) use for `obs`/`var` text columns such as `gene_symbol` ([see here for more background from the context of `duckdb-zarr`](https://github.com/xqlsystems/duckdb-zarr/issues/40)), as either the Zarr v3 `string` dtype or the Zarr v2 `dtype: "|O"` + `filters: [{"id": "vlen-utf8"}]` pair — `zarrs` normalizes both to the same `string` data type at open time, so the reader doesn't need to special-case v2.
+
+Because the rest of the reader is built around `ColumnEncoding`/byte-offset math (`retrieve_chunk::<ArrayBytes<'static>>().into_fixed()`, indexed by `dtype.byte_size()`), string columns take a parallel path everywhere a byte buffer would otherwise be read or decoded:
+
+- Decoding uses `retrieve_chunk::<Vec<String>>` / `retrieve_array_subset::<Vec<String>>` (zarrs' `ElementOwned` API) instead of `ArrayBytes::into_fixed()`, yielding one `String` per element directly.
+- `ColumnValues` (an enum of `Fixed(Vec<u8>)` or `Strings(Vec<String>)`) replaces the bare `Vec<u8>` used for a coordinate array's pre-loaded values and a data variable's per-chunk decode buffer, so both paths carry either representation.
+- zarrs pads a boundary chunk's *element count* to the full nominal `chunk_shape` for every dtype uniformly (fill-value elements past the array's logical bound), so the existing `zarrs_flat` physical-offset math indexes correctly into a `Vec<String>` with no changes — covered by the `string_var_v3_2d` fixture ((3, 5) dims, (2, 3) chunks) in [string_dtype.test](../test/sql/string_dtype.test).
+- No NULL masking applies: `FillSentinel` only represents numeric sentinels (`Float`/`Int`/`UInt`, see [meta.rs](../src/zarr_reader/meta.rs)), so a `_FillValue`/`missing_value` attr on a string variable doesn't parse into a sentinel and every decoded string (including zarrs' own empty-string fill-value substitution) is written through as-is.
+
 ### Packed integer decoding (CF §8.1)
+
+`ColumnEncoding::PackedInt` never applies to strings (its trigger condition requires an integer on-disk dtype), so packed-decoding and string decoding never intersect.
 
 A data variable whose **on-disk dtype is an integer type** (i8/u8/i16/u16/i32/u32/i64/u64) *and* that carries `scale_factor` and/or `add_offset` attrs is *packed*: the on-disk integer is a quantization of a real-valued measurement. **The integer dtype is required.** A float array that incidentally carries `scale_factor` as legacy metadata (measurement precision, grid resolution) must NOT be decoded — applying `scale * value + offset` to already-decoded floats would corrupt them by a factor of ~100×. The trigger condition is `integer_dtype AND (has scale_factor OR has add_offset)`, not the presence of attrs alone.
 
