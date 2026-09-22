@@ -1,0 +1,267 @@
+# name: test/sql/read_zarr_kerchunk.test
+# description: virtual Zarr: kerchunk JSON reference manifests (NetCDF4, GeoTIFF) via format='kerchunk'
+# group: [zarr]
+
+require zarr
+
+# ── kerchunk_netcdf4 ─────────────────────────────────────────────────────────
+# A NetCDF4 file (HDF5 shuffle + deflate + fletcher32 on `temperature`, deflate
+# only on `pressure`, contiguous `mask`) indexed by VirtualiZarr into
+# kerchunk_netcdf4.json. kerchunk_netcdf4_v2.zarr holds the same dataset written
+# as a real Zarr v2 store. Shape (8, 6, 12) → 576 rows; 13 temperature cells are
+# NaN in the source and masked through _FillValue in both stores.
+
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_netcdf4.json', format='kerchunk', dims=['time','lat','lon']);
+----
+576
+
+query II
+SELECT COUNT(temperature), COUNT(pressure) FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_netcdf4.json', format='kerchunk', dims=['time','lat','lon']);
+----
+563	576
+
+# The manifest and the real Zarr store are row-for-row identical, both ways.
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_netcdf4.json', format='kerchunk', dims=['time','lat','lon'])
+    EXCEPT
+    SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_netcdf4_v2.zarr', dims=['time','lat','lon'])
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_netcdf4_v2.zarr', dims=['time','lat','lon'])
+    EXCEPT
+    SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_netcdf4.json', format='kerchunk', dims=['time','lat','lon'])
+);
+----
+0
+
+# Coordinates are inline base64 values in the manifest; filtering on them works.
+query IIIR
+SELECT time, lat, lon, pressure FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_netcdf4.json', format='kerchunk', dims=['time','lat','lon'])
+WHERE lat = 18 AND time = 5 ORDER BY lon LIMIT 2;
+----
+5	18.0	0.0	1001.702515
+5	18.0	30.0	1016.168945
+
+# The whole row [5, 3, :] is fill in the source: masked to NULL.
+query II
+SELECT time, COUNT(temperature) FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_netcdf4.json', format='kerchunk', dims=['time','lat','lon'])
+GROUP BY time HAVING COUNT(temperature) < 72 ORDER BY time;
+----
+0	71
+5	60
+
+# array_path= on a contiguous (unchunked, unfiltered) HDF5 dataset: one whole-range reference.
+query II
+SELECT COUNT(*), SUM(mask) FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_netcdf4.json', format='kerchunk', array_path='mask');
+----
+72	36
+
+# read_zarr_metadata and read_zarr_groups take the same format= argument.
+query I
+SELECT name FROM read_zarr_metadata('test/fixtures/xarray_tutorial/kerchunk_netcdf4.json', format='kerchunk') ORDER BY name;
+----
+lat
+lon
+mask
+pressure
+temperature
+time
+
+query I
+SELECT dtype FROM read_zarr_metadata('test/fixtures/xarray_tutorial/kerchunk_netcdf4.json', format='kerchunk', array_path='temperature');
+----
+float32 / <f4
+
+query I
+SELECT data_vars FROM read_zarr_groups('test/fixtures/xarray_tutorial/kerchunk_netcdf4.json', format='kerchunk') ORDER BY data_vars;
+----
+["mask"]
+["pressure","temperature"]
+
+# ── kerchunk_zarr_v2 ─────────────────────────────────────────────────────────
+# A hand-built manifest whose chunk references are whole-file `[path]` entries
+# pointing at the chunk files of a real Zarr v2 store. Chunk temperature/1.0.0
+# (time 4..7) is deliberately absent from the manifest: an unlisted key decodes
+# to the fill value, which is how kerchunk represents never-written HDF5 chunks.
+
+query II
+SELECT COUNT(*), COUNT(temperature) FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_zarr_v2.json', format='kerchunk');
+----
+576	288
+
+query II
+SELECT time, COUNT(temperature) FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_zarr_v2.json', format='kerchunk')
+GROUP BY time ORDER BY time;
+----
+0	72
+1	72
+2	72
+3	72
+4	0
+5	0
+6	0
+7	0
+
+# Present chunks read identically through the manifest and the store.
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_zarr_v2.json', format='kerchunk') WHERE time < 4
+    EXCEPT
+    SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_zarr_v2_source.zarr') WHERE time < 4
+);
+----
+0
+
+# ── kerchunk_cog_deflate / kerchunk_cog_zstd ─────────────────────────────────
+# Tiled GeoTIFFs indexed by virtual-tiff: every TIFF tile is one byte-range
+# reference. The single array is named "0" (the IFD index), so its data column
+# is `value`. Deflate float32 with a GDAL nodata tag (rows 10..19 are nodata),
+# and a 3-band int8 ZSTD image stored band-interleaved, whose manifest carries
+# the `imagecodecs_zstd` id that the reader aliases to `zstd`.
+
+query II
+SELECT COUNT(*), COUNT(value) FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_cog_deflate.json', format='kerchunk', array_path='0');
+----
+150000	145000
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_cog_deflate.json', format='kerchunk', array_path='0')
+    EXCEPT
+    SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_cog_deflate_v2.zarr', array_path='0')
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_cog_deflate_v2.zarr', array_path='0')
+    EXCEPT
+    SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_cog_deflate.json', format='kerchunk', array_path='0')
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_cog_deflate.json', format='kerchunk', array_path='0')
+WHERE value IS NULL AND y BETWEEN 10 AND 19;
+----
+5000
+
+query IIII
+SELECT name, dims, dtype, chunk_shape FROM read_zarr_metadata('test/fixtures/xarray_tutorial/kerchunk_cog_zstd.json', format='kerchunk');
+----
+0	["band","y","x"]	int8 / |i1	[1,128,128]
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_cog_zstd.json', format='kerchunk', array_path='0')
+    EXCEPT
+    SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_cog_zstd_v2.zarr', array_path='0')
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_cog_zstd_v2.zarr', array_path='0')
+    EXCEPT
+    SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_cog_zstd.json', format='kerchunk', array_path='0')
+);
+----
+0
+
+# ── errors ───────────────────────────────────────────────────────────────────
+
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_netcdf4.json', format='bogus');
+----
+unknown format 'bogus'
+
+# A manifest passed without format= is not a directory; the error says what to do.
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_netcdf4.json');
+----
+format='kerchunk'
+
+# format='kerchunk' on something that is not a manifest fails at parse time.
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_netcdf4.nc', format='kerchunk');
+----
+kerchunk manifest is not JSON
+
+# ── broken chunk references ──────────────────────────────────────────────────
+# kerchunk_errors/*.json are kerchunk_zarr_v2.json with temperature/0.0.0
+# rewritten to a bad reference. Each fails the query with an error that names
+# the file (and, for a decode failure, the array and chunk), never a panic or
+# silent fill values. The unit tests in manifest_store.rs cover the same paths
+# with an in-memory filesystem; these run them through DuckDB's real one.
+
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_errors/missing_file.json', format='kerchunk');
+----
+could not open referenced file 'test/fixtures/xarray_tutorial/kerchunk_errors/does_not_exist.bin'
+
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_errors/past_end.json', format='kerchunk');
+----
+kerchunk_zarr_v2_source.zarr/temperature/0.0.0': read of 2135 bytes at offset 0 hit end of file after 1135 bytes
+
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_errors/offset_beyond_end.json', format='kerchunk');
+----
+read of 4 bytes at offset 1136 hit end of file after 0 bytes
+
+# A reference shorter than the compressed chunk: the decoder fails, and the
+# error says which chunk.
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_errors/truncated.json', format='kerchunk');
+----
+reading chunk [0, 0, 0] of array 'temperature'
+
+# The metadata functions never touch chunk bytes, so a broken chunk reference
+# does not affect them.
+query I
+SELECT COUNT(*) FROM read_zarr_metadata('test/fixtures/xarray_tutorial/kerchunk_errors/missing_file.json', format='kerchunk');
+----
+4
+
+# ── kerchunk_tiff_lzw_strips ─────────────────────────────────────────────────
+# A stripped (not tiled) uint16 LZW TIFF in the shape of a microscopy plate
+# image: each strip of 45 rows is one byte-range reference, and the manifest
+# carries virtual-tiff's `imagecodecs_lzw` id, decoded by the extension's own
+# LZW codec.
+
+query IIII
+SELECT name, dims, dtype, chunk_shape FROM read_zarr_metadata('test/fixtures/xarray_tutorial/kerchunk_tiff_lzw_strips.json', format='kerchunk');
+----
+0	["y","x"]	uint16 / <u2	[45,360]
+
+query II
+SELECT COUNT(*), COUNT(value) FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_tiff_lzw_strips.json', format='kerchunk', array_path='0');
+----
+97200	97200
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_tiff_lzw_strips.json', format='kerchunk', array_path='0')
+    EXCEPT
+    SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_tiff_lzw_strips_v2.zarr', array_path='0')
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_tiff_lzw_strips_v2.zarr', array_path='0')
+    EXCEPT
+    SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_tiff_lzw_strips.json', format='kerchunk', array_path='0')
+);
+----
+0

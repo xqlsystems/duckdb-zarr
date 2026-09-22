@@ -10,12 +10,14 @@ use duckdb::ffi::{
     duckdb_file_system, duckdb_table_function_get_client_context,
 };
 use zarrs::array::Array;
+use zarrs::array::CodecOptions;
 #[cfg(not(target_family = "wasm"))]
 use zarrs::filesystem::FilesystemStore;
 use zarrs::storage::{Bytes, ReadableStorageTraits, StoreKey};
 
 use super::consolidated_store::ConsolidatedCacheStore;
 use super::duckdb_store::DuckDbStore;
+use super::manifest_store::ManifestStore;
 use super::types::{
     ColumnDef, ColumnEncoding, CoordArray, DimGroup, FillSentinel, WorkUnit, ZarrDtype,
 };
@@ -55,22 +57,72 @@ pub fn is_remote_scheme(path: &str) -> bool {
         || l.starts_with("az://")
 }
 
+/// How the path given to `read_zarr` should be interpreted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StoreFormat {
+    /// A Zarr v2/v3 hierarchy (directory, HTTP prefix, or object-store prefix).
+    #[default]
+    Zarr,
+    /// A kerchunk JSON reference manifest ("virtual Zarr"): metadata inline,
+    /// chunks as byte ranges into other files (NetCDF4/HDF5, GRIB, TIFF, ...).
+    Kerchunk,
+}
+
+impl StoreFormat {
+    /// Parse the `format=` named parameter. Absent means a real Zarr store.
+    pub fn parse(value: Option<&str>) -> Result<Self, Box<dyn std::error::Error>> {
+        match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") | Some("zarr") => Ok(Self::Zarr),
+            Some("kerchunk") => Ok(Self::Kerchunk),
+            Some(other) => Err(format!(
+                "unknown format '{other}'; expected 'zarr' (default) or 'kerchunk'"
+            )
+            .into()),
+        }
+    }
+}
+
+/// Codec options for decoding chunks read from a store of this format.
+///
+/// Kerchunk manifests over NetCDF4/HDF5 routinely carry the `fletcher32`
+/// filter, and zarrs 0.23's `fletcher32` codec miscomputes the checksum for
+/// payloads with an odd byte length (the odd trailing byte is never folded
+/// in), so roughly half of all deflated HDF5 chunks fail validation with a
+/// correct checksum on disk (zarrs/zarrs#460). Until that is fixed upstream, checksum
+/// validation is skipped for manifest reads; the checksum bytes are still
+/// stripped and the data decodes correctly. Real Zarr stores keep validation
+/// (crc32c in sharded v3 stores, in particular).
+pub fn codec_options(format: StoreFormat) -> CodecOptions {
+    CodecOptions::default().with_validate_checksums(format != StoreFormat::Kerchunk)
+}
+
 /// Open a Zarr store.
 ///
 /// - HTTP/HTTPS → `zarrs_http::HTTPStore` (no DuckDB filesystem needed)
 /// - S3/GCS/Azure → `DuckDbStore` backed by the provided `file_system` handle
 ///   (the store takes ownership and destroys it on drop)
 /// - Local path → `zarrs::FilesystemStore` (destroys the handle if provided)
+/// - `format=Kerchunk` → `ManifestStore`: the path names a kerchunk JSON
+///   manifest, read through DuckDB's filesystem (so it may itself be remote),
+///   and the files it references are opened through the same filesystem.
 /// - wasm32: every path → `DuckDbStore` (no `zarrs_http`, no host filesystem)
 ///
 /// Remote stores are additionally wrapped with an in-memory consolidated-
 /// metadata cache when one is available (see [`with_consolidated_cache`]),
 /// so callers get the fast path for free instead of having to remember to
-/// apply it themselves.
+/// apply it themselves. A manifest already is consolidated metadata, so it
+/// is served directly.
 pub fn open_store(
     path: &str,
     file_system: Option<duckdb_file_system>,
+    format: StoreFormat,
 ) -> Result<ZarrStore, Box<dyn std::error::Error>> {
+    if format == StoreFormat::Kerchunk {
+        let fs = file_system.ok_or(
+            "kerchunk manifests require a DuckDB FileSystem handle (call from a table function bind)",
+        )?;
+        return Ok(Arc::new(unsafe { ManifestStore::open(fs, path)? }));
+    }
     let lower = path.to_ascii_lowercase();
     // On wasm there is no reqwest::blocking and no host filesystem: every path
     // (HTTP included, and files registered in duckdb-wasm's virtual FS) is read
@@ -98,6 +150,13 @@ pub fn open_store(
     } else {
         if let Some(mut fs) = file_system {
             unsafe { duckdb_destroy_file_system(&mut fs) };
+        }
+        if Path::new(path).is_file() {
+            return Err(format!(
+                "'{path}' is a file, not a Zarr store directory; \
+                 for a kerchunk reference manifest pass format='kerchunk'"
+            )
+            .into());
         }
         Arc::new(FilesystemStore::new(path)?)
     };
@@ -202,14 +261,17 @@ fn build_consolidated_cache(
 /// List the store-relative paths of all arrays in the Zarr hierarchy.
 ///
 /// - Local paths: recursively scans directories containing `zarr.json` (v3) or `.zarray` (v2).
-/// - Remote paths (HTTP/HTTPS/S3/GCS/Azure): enumerates arrays from consolidated metadata,
-///   since object stores cannot list directories — a v3 `consolidated_metadata` block in
-///   `zarr.json`, or a v2 `.zmetadata` object.
+/// - Remote paths (HTTP/HTTPS/S3/GCS/Azure) and kerchunk manifests: enumerates arrays from
+///   consolidated metadata, since object stores cannot list directories — a v3
+///   `consolidated_metadata` block in `zarr.json`, or a v2 `.zmetadata` object.
 pub fn list_array_names(
     store_path: &str,
     store: &ZarrStore,
+    format: StoreFormat,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    if is_remote_scheme(store_path) {
+    // A kerchunk manifest is consolidated metadata by construction, and its
+    // path is a file, not a directory: always enumerate it from the store.
+    if format == StoreFormat::Kerchunk || is_remote_scheme(store_path) {
         list_array_names_remote(store)
     } else {
         list_array_names_local(store_path)
@@ -896,6 +958,7 @@ pub fn discover_dim_groups(
 pub fn load_coord_array(
     store: &ZarrStore,
     coord_name: &str,
+    options: &CodecOptions,
     decode_times: bool,
 ) -> Result<CoordArray, Box<dyn std::error::Error>> {
     let arr = open_array(store, coord_name)?;
@@ -909,7 +972,8 @@ pub fn load_coord_array(
     // ArrayBytes<'static> is the zarrs convention for requesting owned (non-borrowed)
     // decoded bytes; zarrs allocates a fresh Vec<u8> satisfying the 'static bound.
     let subset = arr.subset_all();
-    let array_bytes = arr.retrieve_array_subset::<zarrs::array::ArrayBytes<'static>>(&subset)?;
+    let array_bytes =
+        arr.retrieve_array_subset_opt::<zarrs::array::ArrayBytes<'static>>(&subset, options)?;
     let raw = array_bytes
         .into_fixed()
         .map_err(|_| "coord array has variable-length dtype")?;

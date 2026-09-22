@@ -20,3 +20,6 @@ test/fixtures/bioimage
 .cce/
 # Claude Code local settings written by cce init
 .claude/settings.local.json
+
+# Hypothesis example database (test/test_kerchunk_property.py)
+.hypothesis/

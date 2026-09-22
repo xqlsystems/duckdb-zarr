@@ -5,10 +5,12 @@ use std::sync::Mutex;
 use duckdb::core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab, Value};
 
+use zarrs::array::CodecOptions;
+
 use crate::zarr_reader::meta::{
-    build_column_defs, build_work_units, dim_group_for_array, dimension_names, extract_file_system,
-    infer_dim_groups, load_coord_array, open_array, open_store, select_array_name, ZarrArray,
-    ZarrStore,
+    build_column_defs, build_work_units, codec_options, dim_group_for_array, dimension_names,
+    extract_file_system, infer_dim_groups, load_coord_array, open_array, open_store,
+    select_array_name, StoreFormat, ZarrArray, ZarrStore,
 };
 use crate::zarr_reader::types::{
     ColumnDef, ColumnEncoding, CoordArray, DimGroup, WorkUnit, ZarrDtype,
@@ -25,6 +27,8 @@ pub struct ReadZarrBind {
     pub coord_arrays: HashMap<String, CoordArray>,
     /// Pre-opened data-variable arrays; avoids O(n_chunks × n_vars) metadata reads.
     pub arrays: HashMap<String, ZarrArray>,
+    /// Decode options for every chunk read (see `meta::codec_options`).
+    pub codec_options: CodecOptions,
     pub work_units: Vec<WorkUnit>,
     pub next_unit: AtomicUsize,
 }
@@ -100,8 +104,13 @@ impl VTab for ReadZarrVTab {
             .map(|value| value.is_null() || value.to_bool())
             .unwrap_or(true);
 
+        let format = StoreFormat::parse(
+            bind.get_named_parameter("format")
+                .map(|value| value.to_string())
+                .as_deref(),
+        )?;
         let fs = unsafe { extract_file_system(bind) };
-        let store = open_store(&store_path, Some(fs))?;
+        let store = open_store(&store_path, Some(fs), format)?;
         if let Some(requested) = requested_array {
             // Only this one array is needed. Listing requires consolidated metadata
             // on remote stores, so here it is best-effort: when available it lets
@@ -109,7 +118,8 @@ impl VTab for ReadZarrVTab {
             // over HTTP without consolidation) the array still reads by array_path,
             // with dimensions synthesized as integer indices.
             let array_names =
-                crate::zarr_reader::meta::list_array_names(&store_path, &store).unwrap_or_default();
+                crate::zarr_reader::meta::list_array_names(&store_path, &store, format)
+                    .unwrap_or_default();
             let array_name = if array_names.is_empty() {
                 requested.trim().trim_matches('/').to_string()
             } else {
@@ -125,10 +135,10 @@ impl VTab for ReadZarrVTab {
                     .into());
                 }
             }
-            return finish_bind(bind, store, &group, decode_times);
+            return finish_bind(bind, store, &group, decode_times, format);
         }
 
-        let array_names = crate::zarr_reader::meta::list_array_names(&store_path, &store)?;
+        let array_names = crate::zarr_reader::meta::list_array_names(&store_path, &store, format)?;
         if array_names.is_empty() {
             return Err(format!("no Zarr arrays found in '{store_path}'").into());
         }
@@ -158,7 +168,7 @@ impl VTab for ReadZarrVTab {
             }
         };
 
-        finish_bind(bind, store, group, decode_times)
+        finish_bind(bind, store, group, decode_times, format)
     }
 
     fn supports_pushdown() -> bool {
@@ -271,6 +281,7 @@ impl VTab for ReadZarrVTab {
             ("array".to_string(), LogicalTypeId::Varchar.into()),
             ("array_path".to_string(), LogicalTypeId::Varchar.into()),
             ("decode_times".to_string(), LogicalTypeId::Boolean.into()),
+            ("format".to_string(), LogicalTypeId::Varchar.into()),
         ])
     }
 }
@@ -302,11 +313,14 @@ fn finish_bind(
     store: ZarrStore,
     group: &DimGroup,
     decode_times: bool,
+    format: StoreFormat,
 ) -> Result<ReadZarrBind, Box<dyn std::error::Error>> {
+    let codec_options = codec_options(format);
+
     // Load coord arrays.
     let mut coord_arrays: HashMap<String, CoordArray> = HashMap::new();
     for coord_name in &group.coord_var_names {
-        let ca = load_coord_array(&store, coord_name, decode_times)?;
+        let ca = load_coord_array(&store, coord_name, &codec_options, decode_times)?;
         let arr = open_array(&store, coord_name)?;
         let dims = dimension_names(&arr, coord_name)?;
         if let Some(dim) = dims.first() {
@@ -348,6 +362,7 @@ fn finish_bind(
         columns,
         coord_arrays,
         arrays,
+        codec_options,
         work_units,
         next_unit: AtomicUsize::new(0),
     })
@@ -373,7 +388,17 @@ fn decode_work_unit(
             .ok_or_else(|| format!("array '{}' not found in bind cache", col.name))?;
         // ArrayBytes<'static>: zarrs convention for requesting owned decoded bytes.
         // retrieve_chunk fills missing (implicit) chunks with fill_value automatically.
-        let raw = arr.retrieve_chunk::<zarrs::array::ArrayBytes<'static>>(&wu.chunk_indices)?;
+        let raw = arr
+            .retrieve_chunk_opt::<zarrs::array::ArrayBytes<'static>>(
+                &wu.chunk_indices,
+                &bind.codec_options,
+            )
+            .map_err(|e| {
+                format!(
+                    "reading chunk {:?} of array '{}': {e}",
+                    wu.chunk_indices, col.name
+                )
+            })?;
         let bytes: Vec<u8> = raw
             .into_fixed()
             .map_err(|_| format!("variable-length dtype not supported for '{}'", col.name))?

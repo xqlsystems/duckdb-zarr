@@ -42,7 +42,8 @@ SELECT dims, shape, data_vars FROM read_zarr_groups('test/fixtures/xarray_tutori
 ```
 
 See [docs/design.md](docs/design.md) for the full design and
-[docs/ome-zarr.md](docs/ome-zarr.md) for a small bioimage example.
+[docs/ome-zarr.md](docs/ome-zarr.md) for a small bioimage example, and
+[docs/virtual-zarr.md](docs/virtual-zarr.md) for reading kerchunk manifests.
 
 ## Remote stores
 
@@ -53,13 +54,35 @@ datasets already do (e.g. anything written by xarray with `consolidated=True`), 
 they read straight from their URL as shown above. S3/GCS/Azure credentials come from
 DuckDB's secrets manager (`CREATE SECRET ... TYPE S3`).
 
-## Status
+## Virtual Zarr (kerchunk manifests)
 
-Active development. Phases 1–3 are implemented:
+A [kerchunk](https://fsspec.github.io/kerchunk/spec.html) JSON manifest describes a
+Zarr store whose chunks are byte ranges inside other files: NetCDF4/HDF5, GRIB,
+GeoTIFF, or another Zarr. Tools such as [VirtualiZarr](https://virtualizarr.readthedocs.io/)
+produce them without copying any data. JSON manifests are read; the Parquet form
+kerchunk writes for very large reference sets is not supported yet. Pass
+`format='kerchunk'` to read one:
 
-- **Phase 1** — `read_zarr`, `read_zarr_metadata`, `read_zarr_groups` table functions; Zarr v3; CF conventions (fill values, scale/offset, time → `TIMESTAMP`, bounds variables, aux coords)
-- **Phase 2** — Zarr v2, Blosc/LZ4, replacement scan for local `.zarr` paths, projection pushdown
-- **Phase 3** — HTTP/HTTPS stores, `dims=` and `array_path=` selection, recursive array discovery
+```sql
+SELECT * FROM read_zarr('refs.json', format='kerchunk');
+SELECT * FROM read_zarr('s3://bucket/index/refs.json', format='kerchunk', dims=['time','lat','lon']);
+SELECT * FROM read_zarr_metadata('refs.json', format='kerchunk');
+```
+
+The manifest and every file it references are read through DuckDB's filesystem, so
+local paths, HTTP(S), S3, GCS and Azure all work and the secrets manager applies.
+Kerchunk Parquet manifests and Icechunk virtual references are not supported yet.
+See [docs/virtual-zarr.md](docs/virtual-zarr.md) for the accepted manifest forms,
+the codecs covered by the tests, and the current limitations.
+
+## Features
+
+- **Table functions**: `read_zarr`, `read_zarr_metadata`, `read_zarr_groups`; replacement scan for local `.zarr` paths
+- **Zarr formats**: v2 and v3; consolidated metadata (`.zmetadata`, `consolidated_metadata`); kerchunk JSON manifests via `format='kerchunk'`
+- **Codecs**: Blosc, LZ4, zstd, gzip/zlib, shuffle, fletcher32, LZW (TIFF)
+- **Conventions**: CF fill values and `missing_value`, `scale_factor`/`add_offset`, CF time to `TIMESTAMP` (`decode_times=`), bounds variables, auxiliary coordinates
+- **Storage**: local filesystem, HTTP/HTTPS, S3, GCS and Azure through DuckDB's filesystem and secrets manager
+- **Selection**: `dims=` and `array_path=`, recursive array discovery, projection pushdown
 
 See the [phased plan](docs/design.md#phased-plan) for what's next.
 
@@ -78,6 +101,7 @@ Requires: Rust toolchain, Python 3.11+, make, git.
 ```shell
 make test_debug   # SQLLogicTest suite over local stores (or make test_release)
 make test_http    # HTTP integration tests: synthetic loopback + a real public store
+make test_kerchunk # Hypothesis property tests: VirtualiZarr manifests vs. real Zarr stores
 ```
 
 SQLLogicTest cases live in `test/sql/`. The HTTP suite (`test/test_http_integration*.py`)

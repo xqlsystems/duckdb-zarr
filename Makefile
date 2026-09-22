@@ -1,4 +1,4 @@
-.PHONY: clean clean_all clippy fmt fmt-check generate_fixtures lint release-check render-community-descriptor test_http test_http_debug test_http_release test_http_real
+.PHONY: clean clean_all clippy fmt fmt-check generate_fixtures lint release-check render-community-descriptor test_http test_http_debug test_http_release test_http_real test_kerchunk test_kerchunk_debug test_kerchunk_deep
 
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
@@ -49,17 +49,38 @@ test_release: generate_fixtures test_extension_release
 # test_http_real runs only the real-data file.
 test_http: test_http_debug
 test_http_debug: generate_fixtures
-	uv run --with pytest --with 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' \
+	uv run --with 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' \
 		pytest test/test_http_integration.py test/test_http_integration_real.py \
 		--extension build/debug/$(EXTENSION_NAME).duckdb_extension -v
 test_http_release: generate_fixtures
-	uv run --with pytest --with 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' \
+	uv run --with 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' \
 		pytest test/test_http_integration.py test/test_http_integration_real.py \
 		--extension build/release/$(EXTENSION_NAME).duckdb_extension -v
 test_http_real:
-	uv run --with pytest --with 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' \
+	uv run --with 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' \
 		pytest test/test_http_integration_real.py \
 		--extension build/debug/$(EXTENSION_NAME).duckdb_extension -v
+
+# pytest and hypothesis come from the `dev` dependency group in pyproject.toml
+# (uv run installs it by default). Only the Python duckdb package is pinned on
+# the command line, to match TARGET_DUCKDB_VERSION.
+# Property-based tests for kerchunk manifests (test/test_kerchunk_property.py).
+# Hypothesis generates random datasets, VirtualiZarr indexes them, and the
+# extension must read the manifest exactly like the data. Build first.
+# HYPOTHESIS_PROFILE=ci|default|deep sets the example count; test_kerchunk_deep
+# is the long search for hunting bugs.
+test_kerchunk: generate_fixtures
+	uv run --with 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' \
+		pytest test/test_kerchunk_property.py \
+		--extension build/release/$(EXTENSION_NAME).duckdb_extension -v
+test_kerchunk_debug: generate_fixtures
+	uv run --with 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' \
+		pytest test/test_kerchunk_property.py \
+		--extension build/debug/$(EXTENSION_NAME).duckdb_extension -v
+test_kerchunk_deep: generate_fixtures
+	HYPOTHESIS_PROFILE=deep uv run --with 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' \
+		pytest test/test_kerchunk_property.py \
+		--extension build/release/$(EXTENSION_NAME).duckdb_extension -v
 
 fmt:
 	cargo fmt --all
@@ -86,7 +107,8 @@ generate_fixtures:
 	@if command -v uv >/dev/null 2>&1; then \
 		uv run scripts/generate_fixtures.py; \
 	elif [ -f "$(PYTHON_VENV_BIN)" ]; then \
-		$(PYTHON_VENV_BIN) -m pip install --quiet "xarray" "zarr>=3.0.0" numpy scipy h5netcdf h5py pooch; \
+		$(PYTHON_VENV_BIN) -m pip install --quiet "xarray" "zarr>=3.0.0" numpy scipy h5netcdf h5py pooch \
+			"virtualizarr>=2.5.1" "tifffile>=2026.3.3" "virtual-tiff>=0.5.0"; \
 		$(PYTHON_VENV_BIN) scripts/generate_fixtures.py; \
 	else \
 		echo "Error: neither uv nor configure/venv found. Run 'make configure' or install uv." >&2; \

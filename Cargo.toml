@@ -32,8 +32,13 @@ zarrs = { version = "0.23", default-features = false, features = [
     "crc32c",
     "sharding",
     "transpose",
+    # HDF5/NetCDF4 filter pipeline as exposed by kerchunk manifests (shuffle
+    # and fixedscaleoffset need no feature flag).
+    "zlib",
+    "fletcher32",
 ] }
 ndarray = "0.17"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 
@@ -41,6 +46,9 @@ base64 = "0.22"
 # HTTP stores go through DuckDbStore (duckdb-wasm's own httpfs) instead.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 zarrs_http = "0.3.1"
+weezl = "0.2"
+inventory = "0.3"
+
 # Already in the tree transitively via duckdb -> arrow -> arrow-arith, so taking
 # it directly costs nothing new; feature unification pulls in std/alloc from
 # that transitive edge regardless of default-features here. Used for calendar
