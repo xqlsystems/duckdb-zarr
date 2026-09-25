@@ -49,7 +49,7 @@ pub struct LocalState {
     /// Index of the current work unit being streamed out row-by-row.
     pub current_unit_idx: usize,
     /// Decoded values for the current work unit, one entry per data variable.
-    pub current_chunk_bytes: HashMap<String, ColumnValues>,
+    pub current_chunk_values: HashMap<String, ColumnValues>,
     /// Row cursor within the current chunk (how many rows have been emitted).
     pub row_cursor: usize,
     /// Total rows in the current chunk.
@@ -182,7 +182,7 @@ impl VTab for ReadZarrVTab {
             projected_cols,
             inner: Mutex::new(LocalState {
                 current_unit_idx: usize::MAX,
-                current_chunk_bytes: HashMap::new(),
+                current_chunk_values: HashMap::new(),
                 row_cursor: 0,
                 chunk_rows: 0,
                 done: false,
@@ -218,10 +218,10 @@ impl VTab for ReadZarrVTab {
                 }
                 let wu = &bind.work_units[unit_idx];
                 // Decode chunk for each data variable.
-                let chunk_bytes = decode_work_unit(bind, wu, projected)?;
+                let chunk_values = decode_work_unit(bind, wu, projected)?;
                 let chunk_rows = compute_chunk_rows(wu, &bind.group_shape, &bind.group_chunk_shape);
                 state.current_unit_idx = unit_idx;
-                state.current_chunk_bytes = chunk_bytes;
+                state.current_chunk_values = chunk_values;
                 state.row_cursor = 0;
                 state.chunk_rows = chunk_rows;
             }
@@ -242,7 +242,7 @@ impl VTab for ReadZarrVTab {
                 wu,
                 &bind.group_shape,
                 &bind.group_chunk_shape,
-                &state.current_chunk_bytes,
+                &state.current_chunk_values,
                 output,
                 rows_written,
                 state.row_cursor,
@@ -358,7 +358,7 @@ fn decode_work_unit(
     wu: &WorkUnit,
     projected: &HashMap<usize, usize>,
 ) -> Result<HashMap<String, ColumnValues>, Box<dyn std::error::Error>> {
-    let mut chunk_bytes = HashMap::new();
+    let mut chunk_values = HashMap::new();
 
     for (col_idx, col) in bind.columns.iter().enumerate() {
         if col.is_coord {
@@ -385,10 +385,10 @@ fn decode_work_unit(
                 .into_owned();
             ColumnValues::Fixed(bytes)
         };
-        chunk_bytes.insert(col.name.clone(), data);
+        chunk_values.insert(col.name.clone(), data);
     }
 
-    Ok(chunk_bytes)
+    Ok(chunk_values)
 }
 
 fn compute_chunk_rows(wu: &WorkUnit, shape: &[u64], chunk_shape: &[u64]) -> usize {
@@ -414,7 +414,7 @@ fn fill_chunk_slice(
     wu: &WorkUnit,
     group_shape: &[u64],
     group_chunk_shape: &[u64],
-    chunk_bytes: &HashMap<String, ColumnValues>,
+    chunk_values: &HashMap<String, ColumnValues>,
     output: &mut DataChunkHandle,
     vector_base: usize,
     chunk_row_start: usize,
@@ -479,7 +479,10 @@ fn fill_chunk_slice(
                 if let Some(ca) = coord_arrays.get(&col_def.name) {
                     match &ca.data {
                         ColumnValues::Fixed(bytes) => {
-                            let elem_size = ca.dtype.byte_size();
+                            let elem_size = ca
+                                .dtype
+                                .byte_size()
+                                .expect("Fixed column values imply a fixed-width dtype");
                             fill_element(
                                 &mut vector,
                                 bytes,
@@ -509,9 +512,12 @@ fn fill_chunk_slice(
                 }
             } else {
                 // Data variable: use zarrs_flat to index into the physical byte buffer.
-                match chunk_bytes.get(&col_def.name) {
+                match chunk_values.get(&col_def.name) {
                     Some(ColumnValues::Fixed(bytes)) => {
-                        let elem_size = col_def.on_disk_dtype.byte_size();
+                        let elem_size = col_def
+                            .on_disk_dtype
+                            .byte_size()
+                            .expect("Fixed column values imply a fixed-width dtype");
                         fill_element(
                             &mut vector,
                             bytes,
@@ -532,7 +538,7 @@ fn fill_chunk_slice(
                         );
                     }
                     None => unreachable!(
-                        "projected data variable '{}' missing from chunk_bytes",
+                        "projected data variable '{}' missing from chunk_values",
                         col_def.name
                     ),
                 }

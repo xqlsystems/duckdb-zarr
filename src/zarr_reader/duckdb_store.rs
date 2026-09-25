@@ -90,11 +90,27 @@ impl ReadableStorageTraits for DuckDbStore {
                 continue;
             }
             let mut buf = vec![0u8; length as usize];
-            let bytes_read =
-                unsafe { duckdb_file_handle_read(handle, buf.as_mut_ptr().cast(), length as i64) };
-            if bytes_read < 0 || bytes_read as u64 != length {
+            // DuckDB file systems may return short reads (duckdb-wasm's HTTP
+            // filesystem hands back 16 KiB pieces), so loop until the buffer
+            // is full or the handle reports EOF (0) / error (<0).
+            let mut filled: usize = 0;
+            let mut bytes_read: i64 = 0;
+            while filled < length as usize {
+                bytes_read = unsafe {
+                    duckdb_file_handle_read(
+                        handle,
+                        buf.as_mut_ptr().add(filled).cast(),
+                        (length as usize - filled) as i64,
+                    )
+                };
+                if bytes_read <= 0 {
+                    break;
+                }
+                filled += bytes_read as usize;
+            }
+            if filled != length as usize {
                 results.push(Err(StorageError::Other(format!(
-                    "read of {length} bytes at offset {offset} returned {bytes_read}"
+                    "read of {length} bytes at offset {offset} returned {filled} (last read {bytes_read})"
                 ))));
                 continue;
             }

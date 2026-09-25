@@ -3207,6 +3207,7 @@ dependencies = [
  "duckdb",
  "ndarray",
  "openssl",
+ "rayon",
  "serde_json",
  "zarrs",
  "zarrs_http",

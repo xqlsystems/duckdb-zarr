@@ -36,6 +36,10 @@ zarrs = { version = "0.23", default-features = false, features = [
 ndarray = "0.17"
 serde_json = "1"
 base64 = "0.22"
+
+# zarrs_http -> reqwest::blocking, which does not exist on wasm32. On wasm,
+# HTTP stores go through DuckDbStore (duckdb-wasm's own httpfs) instead.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
 zarrs_http = "0.3.1"
 # Already in the tree transitively via duckdb -> arrow -> arrow-arith, so taking
 # it directly costs nothing new; feature unification pulls in std/alloc from
@@ -43,6 +47,11 @@ zarrs_http = "0.3.1"
 # arithmetic in cftime.rs (NaiveDate::from_ymd_opt subsumes hand-rolled
 # days_from_civil/days_in_month/is_leap_year, and validates day-of-month too).
 chrono = { version = "0.4", default-features = false }
+
+# wasm has no threads: zarrs' rayon usage must run on a pool that never spawns.
+# See zarr_init_c_api_internal.
+[target.'cfg(target_family = "wasm")'.dependencies]
+rayon = "1.12"
 
 # zarrs_http → reqwest → native-tls → openssl-sys. On Linux the DuckDB CI sets
 # OPENSSL_DIR to a vcpkg path that doesn't exist. Vendored mode compiles OpenSSL
@@ -53,5 +62,7 @@ openssl = { version = "0.10", features = ["vendored"] }
 
 # Enable blosc everywhere except x86_64-pc-windows-gnu (Rtools42/mingw).
 # SKIP_TESTS=1 for that target so blosc is never exercised there in CI.
+# On wasm c-blosc compiles against emscripten's pthread stubs; with nthreads=1
+# (zarrs' default) it never calls pthread_create, so it works without threads.
 [target.'cfg(not(all(target_os = "windows", target_env = "gnu")))'.dependencies]
 zarrs = { version = "0.23", default-features = false, features = ["blosc"] }

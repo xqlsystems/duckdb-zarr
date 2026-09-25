@@ -59,14 +59,14 @@ impl ZarrDtype {
         )
     }
 
-    /// Panics for [`Self::String`], which is variable-length and has no fixed byte size.
-    pub fn byte_size(&self) -> usize {
+    /// `None` for [`Self::String`], which is variable-length and has no fixed byte size.
+    pub fn byte_size(&self) -> Option<usize> {
         match self {
-            Self::Bool | Self::Int8 | Self::UInt8 => 1,
-            Self::Int16 | Self::UInt16 => 2,
-            Self::Int32 | Self::UInt32 | Self::Float32 => 4,
-            Self::Int64 | Self::UInt64 | Self::Float64 => 8,
-            Self::String => unreachable!("String is variable-length and has no fixed byte size"),
+            Self::Bool | Self::Int8 | Self::UInt8 => Some(1),
+            Self::Int16 | Self::UInt16 => Some(2),
+            Self::Int32 | Self::UInt32 | Self::Float32 => Some(4),
+            Self::Int64 | Self::UInt64 | Self::Float64 => Some(8),
+            Self::String => None,
         }
     }
 

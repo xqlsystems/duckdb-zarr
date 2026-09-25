@@ -16,7 +16,7 @@ A design for `duckdb-zarr` — a Rust DuckDB extension that lets users query Zar
 - Automatic relational joins across nested groups. Arrays are discovered recursively and can be selected by store-relative path, but each `read_zarr` scan still operates on one compatible dimension group or one explicitly selected array.
 - Replacing xarray. Users who need lazy array operations should keep using xarray; we just want a SQL handle on the same data.
 - Custom codecs beyond what `zarrs` already supports.
-- WebAssembly. The current scaffold ships a `wasm_lib.rs` target; it is not a supported build because `zarrs` and `ndarray` use threading and I/O patterns that don't trivially compile to `wasm32`. 
+- WebAssembly as a distributed platform. The extension compiles for `wasm32-unknown-emscripten` and loads in duckdb-wasm (`make wasm_mvp`): every store is read through DuckDB's own FileSystem (`DuckDbStore`) because `zarrs_http` depends on `reqwest::blocking`, and `zarrs`' rayon work runs on a one-thread pool built at extension init. The wasm platforms stay in `excluded_platforms` until CI builds and tests them. Local (non-URL) store paths are not supported on wasm: array listing for local stores walks the host filesystem.
 
 ## Future integration boundaries (deferred)
 
@@ -301,7 +301,7 @@ The base dtype mapping is mechanical:
 | CF-encoded time (`f4/f8/i4/i8`)    | `TIMESTAMP`                              | decoded on real-world calendars; raw dtype otherwise |
 | `S<n>` (fixed bytes)               | `BLOB`                                   | not yet implemented; error at bind          |
 | `U<n>` (UTF-32)                    | `VARCHAR`                                | not yet implemented; error at bind          |
-| `string` (v3) / `|O`+vlen-utf8 (v2) | `VARCHAR`                                | variable-length; see below                  |
+| `string` (v3) / `\|O`+vlen-utf8 (v2) | `VARCHAR`                              | variable-length; see below                  |
 | structured / other object          | unsupported                              | error at bind                               |
 
 CF-encoded time appears in real stores as `int32`, `int64`, `float32`, or `float64` depending on the source NetCDF — RASM uses `f8` + `noleap`, `air_temperature` uses `f4` + `gregorian`, ERA5-style stores use `i8`. We decode it to `TIMESTAMP` at scan time; see §CF time decoding and decision 3. The `units` and `calendar` attrs ride along into `read_zarr_metadata.attrs` either way, so a column left raw still says what it is.
@@ -327,14 +327,14 @@ Mechanics worth pinning down:
 
 ### Variable-length strings (`string` / vlen-utf8)
 
-Unlike every other supported dtype, `ZarrDtype::String` has no fixed `byte_size()` — each element is its own UTF-8 byte run, not a fixed-width slot in a flat buffer. This is the on-disk encoding anndata (and zarr-python generally) use for `obs`/`var` text columns such as `gene_symbol` (issue #40), as either the Zarr v3 `string` dtype or the Zarr v2 `dtype: "|O"` + `filters: [{"id": "vlen-utf8"}]` pair — `zarrs` normalizes both to the same `string` data type at open time, so the reader doesn't need to special-case v2.
+Unlike other supported dtypes, `ZarrDtype::String` has no fixed `byte_size()` — each element is its own UTF-8 byte run, not a fixed-width slot in a flat buffer. This is the on-disk encoding [anndata](https://github.com/scverse/anndata) (and [zarr-python](https://github.com/zarr-developers/zarr-python) generally) use for `obs`/`var` text columns such as `gene_symbol` ([see here for more background from the context of `duckdb-zarr`](https://github.com/xqlsystems/duckdb-zarr/issues/40)), as either the Zarr v3 `string` dtype or the Zarr v2 `dtype: "|O"` + `filters: [{"id": "vlen-utf8"}]` pair — `zarrs` normalizes both to the same `string` data type at open time, so the reader doesn't need to special-case v2.
 
 Because the rest of the reader is built around `ColumnEncoding`/byte-offset math (`retrieve_chunk::<ArrayBytes<'static>>().into_fixed()`, indexed by `dtype.byte_size()`), string columns take a parallel path everywhere a byte buffer would otherwise be read or decoded:
 
 - Decoding uses `retrieve_chunk::<Vec<String>>` / `retrieve_array_subset::<Vec<String>>` (zarrs' `ElementOwned` API) instead of `ArrayBytes::into_fixed()`, yielding one `String` per element directly.
 - `ColumnValues` (an enum of `Fixed(Vec<u8>)` or `Strings(Vec<String>)`) replaces the bare `Vec<u8>` used for a coordinate array's pre-loaded values and a data variable's per-chunk decode buffer, so both paths carry either representation.
-- zarrs pads a boundary chunk's *element count* to the full nominal `chunk_shape` for every dtype uniformly (fill-value elements past the array's logical bound), so the existing `zarrs_flat` physical-offset math indexes correctly into a `Vec<String>` with no changes — covered by `test/sql/ragged_chunks.test` (ragged boundary chunks for 2-D and 1-D string and float arrays).
-- No NULL masking applies: CF's `_FillValue`/`missing_value` sentinel convention is numeric-only, so every decoded string (including zarrs' own empty-string fill-value substitution) is written through as-is.
+- zarrs pads a boundary chunk's *element count* to the full nominal `chunk_shape` for every dtype uniformly (fill-value elements past the array's logical bound), so the existing `zarrs_flat` physical-offset math indexes correctly into a `Vec<String>` with no changes. [string_dtype.test](../test/sql/string_dtype.test) (`string_var_v3_2d`) and [ragged_chunks.test](../test/sql/ragged_chunks.test) cover ragged boundary chunks for 1-D and 2-D string and float arrays.
+- No NULL masking applies: `FillSentinel` only represents numeric sentinels (`Float`/`Int`/`UInt`, see [meta.rs](../src/zarr_reader/meta.rs)), so a `_FillValue`/`missing_value` attr on a string variable doesn't parse into a sentinel and every decoded string (including zarrs' own empty-string fill-value substitution) is written through as-is.
 
 `ColumnEncoding::PackedInt` never applies to strings (its trigger condition requires an integer on-disk dtype), and CF-time detection explicitly skips them (a string array carrying a `units` attr is not a time axis), so neither decoding ever intersects string decoding.
 

@@ -23,6 +23,16 @@ unsafe fn zarr_init_c_api_internal(
         }
         let db: duckdb::ffi::duckdb_database = *db_ptr;
 
+        // wasm has no thread spawning; build rayon's global pool with the current
+        // thread as its only worker so zarrs' parallel iterators run inline.
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .use_current_thread()
+                .build_global();
+        }
+
         replacement_scan::register(db);
 
         let con = Connection::open_from_raw(db.cast())?;
