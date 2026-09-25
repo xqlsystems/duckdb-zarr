@@ -8,20 +8,17 @@
 #     "awkward==2.13.0",
 # ]
 # ///
-"""Generate realistic AnnData Zarr fixtures (v2 and v3) for issue 
-https://github.com/xqlsystems/duckdb-zarr/issues/40.
+"""Generate AnnData Zarr stores (Zarr v3 and v2) from anndata's own test helper.
 
-Unlike hand-built xarray fixtures, these are created directly via
-`anndata.tests.helpers.gen_adata`—matching AnnData's native `write_zarr()`
-output and CI test archives (written to directories rather than zip files).
+`anndata.tests.helpers.gen_adata` builds an AnnData object with every encoding
+anndata supports: data frames, categoricals, CSR and CSC matrices, awkward
+arrays, and nested `uns` entries. These stores are for exploring real anndata
+output. No SQL test reads them yet; test/sql/anndata.test uses the smaller,
+deterministic pbmc_like.zarr from scripts/generate_fixtures.py.
 
-Note on current status:
-- Lacks xarray dimension metadata (`dimension_names` / `_ARRAY_DIMENSIONS`),
-  so direct `read_zarr` bindings currently fail.
-- Contains sparse/dataframe encodings in `X`/`obsm`/`varm`/`obsp`/`varp`.
-- `read_zarr_metadata` works on `obs`/`var` (see test/sql/anndata.test).
-
-These fixtures serve as real target data for developing full AnnData support.
+The script pins its own dependencies (PEP 723 metadata above) so that anndata,
+dask and awkward do not constrain the versions in the main fixture environment.
+See https://github.com/xqlsystems/duckdb-zarr/issues/40.
 
 Usage:
     uv run scripts/generate_anndata_fixtures.py

@@ -41,8 +41,9 @@ SELECT * FROM read_zarr('test/fixtures/bioimage/ome_zarr/synthetic_multichannel.
 SELECT dims, shape, data_vars FROM read_zarr_groups('test/fixtures/xarray_tutorial/multi_dim_group.zarr');
 ```
 
-See [docs/design.md](docs/design.md) for the full design and
-[docs/ome-zarr.md](docs/ome-zarr.md) for a small bioimage example.
+See [docs/design.md](docs/design.md) for the full design,
+[docs/ome-zarr.md](docs/ome-zarr.md) for a small bioimage example, and
+[docs/anndata.md](docs/anndata.md) for single-cell data written by AnnData.
 
 ## Remote stores
 

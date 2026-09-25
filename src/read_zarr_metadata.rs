@@ -17,9 +17,11 @@ struct MetaRow {
     dtype: String,
     shape: String, // JSON array string e.g. '[4,6]'
     chunk_shape: String,
-    attrs: String,           // full attrs as JSON string
-    array_path_dims: String, // dims as bound by read_zarr(.., array_path=name)
-    role: String, // "coord" | "data" | "aux_coord" | "bounds" | "scalar" | "unsupported" | "unknown"
+    attrs: String, // full attrs as JSON string; for "unsupported", {"error": ...}
+    role: String,  // "coord" | "data" | "aux_coord" | "bounds" | "scalar" | "unsupported"
+    // Dimension names that read_zarr(store, array_path := name) binds. Differs from
+    // `dims` only when the array declares no names (then dim_0, dim_1, ...).
+    array_path_dims: String,
 }
 
 pub struct ReadZarrMetaBind {
@@ -74,10 +76,9 @@ impl VTab for ReadZarrMetaVTab {
 
         let mut rows = Vec::new();
         for name in &array_names {
-            // zarrs may refuse to open an array whose dtype or codecs it doesn't
-            // support (e.g. some AnnData `uns` entries). List it as `unsupported`
-            // instead of failing the whole call — but only for that class of error:
-            // I/O, auth and missing-metadata failures must still surface.
+            // One array with a data type or codec that zarrs cannot open must not hide
+            // the rest of the store, so list it as "unsupported" and continue. Any
+            // other error (I/O, auth, missing metadata) still fails the call.
             let arr = match open_array(&store, name) {
                 Ok(arr) => arr,
                 Err(err) if is_unsupported_array_error(err.as_ref()) => {

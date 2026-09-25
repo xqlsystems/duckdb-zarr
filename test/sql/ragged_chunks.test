@@ -2,11 +2,10 @@
 # description: boundary chunks smaller than the nominal chunk shape (strings and numbers)
 # group: [zarr]
 #
-# Every other fixture is a single chunk. zarrs pads a boundary chunk's element buffer
-# out to the full nominal chunk shape (fill values past the array's logical edge), and
-# the scan must index around that padding — for variable-length strings as much as for
-# fixed-width numbers (docs/design.md §Variable-length strings). Fixture:
-# scripts/generate_fixtures.py `ragged_chunks`.
+# zarrs pads the element buffer of a boundary chunk to the full chunk shape, with fill
+# values past the edge of the array. The scan must skip that padding, for strings as
+# well as numbers (docs/design.md, Variable-length strings). Fixture: `ragged_chunks`
+# in scripts/generate_fixtures.py.
 #
 #   s, v  (r=5, c=3) chunks (2, 2)  ragged in both dims; s is a string array
 #   t     (i=10)     chunks (4,)    chunks of 4, 4, 2; string
@@ -14,8 +13,8 @@
 
 require zarr
 
-# 2-D, ragged in both dims: 15 rows, and EVERY cell — string and number — must equal
-# what the generator wrote (s = 's<r><c>', v = r*10 + c). Zero mismatches.
+# 2-D, ragged in both dims: all 15 cells of s and v match the generator
+# (s = 's<r><c>', v = r*10 + c).
 query II
 SELECT COUNT(*),
        COUNT(*) FILTER (WHERE s != 's' || r::VARCHAR || c::VARCHAR OR v != r * 10 + c)
@@ -23,15 +22,16 @@ FROM read_zarr('test/fixtures/xarray_tutorial/ragged_chunks.zarr', dims := ['r',
 ----
 15	0
 
-# 1-D ragged string array (last chunk holds 2 of 4 elements). A plain array name is its
-# own column name; only '/'-paths and numeric names are exposed as `value`.
+# 1-D ragged string array; the last chunk holds 2 of 4 elements. A top-level array
+# keeps its name as the column name. Arrays under a group, and numeric names, are
+# exposed as `value`.
 query II
 SELECT COUNT(*), COUNT(*) FILTER (WHERE t != 't' || i::VARCHAR)
 FROM read_zarr('test/fixtures/xarray_tutorial/ragged_chunks.zarr', array_path := 't');
 ----
 10	0
 
-# 1-D ragged float32 (last chunk holds 7 of 10): every element, plus the total.
+# 1-D ragged float32; the last chunk holds 7 of 10 elements.
 query IIR
 SELECT COUNT(*), COUNT(*) FILTER (WHERE x27 != n * 2), SUM(x27)
 FROM read_zarr('test/fixtures/xarray_tutorial/ragged_chunks.zarr', array_path := 'x27');
