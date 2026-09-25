@@ -33,7 +33,21 @@ pub fn fill_scalar_element_pub(
         ZarrDtype::UInt64 => copy_scalar!(vector, bytes, u64, src_idx, dst_idx, sentinel),
         ZarrDtype::Float32 => copy_scalar!(vector, bytes, f32, src_idx, dst_idx, sentinel),
         ZarrDtype::Float64 => copy_scalar!(vector, bytes, f64, src_idx, dst_idx, sentinel),
+        ZarrDtype::String => {
+            unreachable!("String is variable-length; use fill_string_element_pub instead")
+        }
     }
+}
+
+/// Copy one decoded string element into a DuckDB VARCHAR vector slot.
+pub fn fill_string_element_pub(
+    vector: &mut FlatVector<'_>,
+    strings: &[String],
+    src_idx: usize,
+    dst_idx: usize,
+) {
+    use duckdb::core::Inserter;
+    vector.insert(dst_idx, strings[src_idx].as_str());
 }
 
 /// Read any integer dtype from raw bytes at `start` as i64 (for packed-int decoding).

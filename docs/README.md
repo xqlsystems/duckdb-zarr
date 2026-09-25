@@ -59,6 +59,7 @@ above can compare `time` against a date literal. Pass `decode_times := false` if
 you want the raw on-disk offsets instead.
 
 For a small bioimage walkthrough, see [Querying OME-Zarr](ome-zarr.md).
+For single-cell data written by AnnData, see [Querying AnnData stores](anndata.md).
 For the domains covered by the current test suite, see
 [Tested scientific domains](domains.md).
 

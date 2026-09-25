@@ -142,7 +142,7 @@ Two introspection table functions, each with a homogeneous schema (split because
 
 ```sql
 SELECT * FROM read_zarr_metadata('store.zarr');
--- name | kind (coord|data) | dims | dtype | shape | chunks | compressor | attrs
+-- name | dims | dtype | shape | chunk_shape | attrs | role | array_path_dims
 
 SELECT * FROM read_zarr_groups('store.zarr');
 -- group_name | dims | n_variables | variables | n_rows
@@ -183,7 +183,7 @@ The `zarr_reader` module is the natural seam — it depends on [`zarrs`](https:/
 ### Bind phase
 
 1. Open the store with `zarrs` and read group metadata.
-2. Classify arrays as coordinates vs data variables. **Honor xarray's metadata first**, but read it from the right place — Zarr v2 puts `_ARRAY_DIMENSIONS` in `.zattrs` (per-array attrs), while Zarr v3 makes `dimension_names` a first-class field in the array's `zarr.json` metadata, *not* in attrs. The bind code must branch on format version: `zarrs` exposes the v3 field via `ArrayMetadataV3::dimension_names`. Falling through to attrs for v3 stores would silently miss the metadata on every array and degrade to the heuristic. Fall back to "1D = coord, nD = data" only when both metadata locations come up empty.
+2. Classify arrays as coordinates vs data variables. **Honor xarray's metadata first**, but read it from the right place — Zarr v2 puts `_ARRAY_DIMENSIONS` in `.zattrs` (per-array attrs), while Zarr v3 makes `dimension_names` a first-class field in the array's `zarr.json` metadata, *not* in attrs. The bind code must branch on format version: `zarrs` exposes the v3 field via `ArrayMetadataV3::dimension_names`. Falling through to attrs for v3 stores would silently miss the metadata on every array and degrade to the heuristic. An array with neither `dimension_names` nor `_ARRAY_DIMENSIONS` (every array in an AnnData or plain zarr-python store) is a bind error during enumeration. If `array_path=` selects that array alone, its dimensions are named `dim_0..dim_{ndim-1}` instead (decision 7).
 3. Read the `coordinates` attribute on each data variable. xarray uses this to mark *non-dimension* coordinates — typically a 2D `lat(y, x) / lon(y, x)` mesh on satellite swath data, where the coord variable is itself nD. v1 cannot represent these as scalar columns; if encountered, error at bind ("non-dimension coordinate `lat` has shape (1024, 1024); 2D coords are deferred"). **This step must run before step 5 (dim-group enumeration).** An nD array identified here as a non-dimension coord must be excluded from the data-variable pool before grouping. If step 3 runs after grouping, a 2D coord like `xc(y, x)` is indistinguishable from a data variable over `(y, x)` and silently lands in a spurious dim group. The `rasm` fixture demonstrates this: `Tair` carries `coordinates='yc xc'`; without pre-grouping exclusion, `xc` and `yc` form a spurious `(y, x)` group with two float64 columns, no error, and wrong output.
 4. Suppress CF metadata variables that aren't real data:
    - **Bounds variables** (CF §7.1) — a coord with attrs like `time.attrs['bounds'] == 'time_bnds'` declares `time_bnds` as its cell-boundary descriptor. `time_bnds` then has shape `(N, 2)` and an extra `nbnds` dimension. Without filtering, `time_bnds` becomes a spurious dim group with one meaningless table — the `ersstv5` tutorial dataset triggers this exact case. Identification: parent coord has a `bounds` attribute pointing at the variable name. Fallback when the attr is missing: variable name matches `<dim>_bnds` / `<dim>_bounds` *and* shape is `(N, 2)`. Suppressed bounds are exposed in `read_zarr_metadata.attrs` on the parent coord, not as a top-level array.
@@ -299,9 +299,10 @@ The base dtype mapping is mechanical:
 | `bool`                             | `BOOLEAN`                                |                                             |
 | `M8[ns]` / `M8[us]`                | `TIMESTAMP_NS` / `TIMESTAMP`             | native NumPy datetimes; mapped directly     |
 | CF-encoded time (`f4/f8/i4/i8`)    | `TIMESTAMP`                              | decoded on real-world calendars; raw dtype otherwise |
-| `S<n>` (fixed bytes)               | `BLOB`                                   |                                             |
-| `U<n>` (UTF-32)                    | `VARCHAR`                                | decoded                                     |
-| structured / object                | unsupported v1                           | error at bind                               |
+| `S<n>` (fixed bytes)               | `BLOB`                                   | not yet implemented; error at bind          |
+| `U<n>` (UTF-32)                    | `VARCHAR`                                | not yet implemented; error at bind          |
+| `string` (v3) / `\|O`+vlen-utf8 (v2) | `VARCHAR`                              | variable-length; see below                  |
+| structured / other object          | unsupported                              | error at bind                               |
 
 CF-encoded time appears in real stores as `int32`, `int64`, `float32`, or `float64` depending on the source NetCDF — RASM uses `f8` + `noleap`, `air_temperature` uses `f4` + `gregorian`, ERA5-style stores use `i8`. We decode it to `TIMESTAMP` at scan time; see §CF time decoding and decision 3. The `units` and `calendar` attrs ride along into `read_zarr_metadata.attrs` either way, so a column left raw still says what it is.
 
@@ -323,6 +324,19 @@ Mechanics worth pinning down:
 - **Precision.** Float offsets are split into whole and fractional parts before scaling, because `days since 1800-01-01` reaches ~7.0e15 µs — past the point where an f64 multiply still resolves single microseconds. Integer offsets never touch floating point at all.
 - **Masking and range.** The `_FillValue`/`missing_value` sentinel is compared against the *raw* value first, as in packed-int decoding. NaN, and any offset that decodes outside DuckDB's timestamp range, become SQL `NULL` — `i64::MIN`/`i64::MAX` are DuckDB's ±infinity sentinels and must never be collided with.
 - **Escape hatch.** `read_zarr(store, decode_times := false)` turns the whole thing off and restores the raw offsets, mirroring `xarray.open_zarr(decode_times=False)`.
+
+### Variable-length strings (`string` / vlen-utf8)
+
+Unlike other supported dtypes, `ZarrDtype::String` has no fixed `byte_size()` — each element is its own UTF-8 byte run, not a fixed-width slot in a flat buffer. This is the on-disk encoding [anndata](https://github.com/scverse/anndata) (and [zarr-python](https://github.com/zarr-developers/zarr-python) generally) use for `obs`/`var` text columns such as `gene_symbol` ([see here for more background from the context of `duckdb-zarr`](https://github.com/xqlsystems/duckdb-zarr/issues/40)), as either the Zarr v3 `string` dtype or the Zarr v2 `dtype: "|O"` + `filters: [{"id": "vlen-utf8"}]` pair — `zarrs` normalizes both to the same `string` data type at open time, so the reader doesn't need to special-case v2.
+
+Because the rest of the reader is built around `ColumnEncoding`/byte-offset math (`retrieve_chunk::<ArrayBytes<'static>>().into_fixed()`, indexed by `dtype.byte_size()`), string columns take a parallel path everywhere a byte buffer would otherwise be read or decoded:
+
+- Decoding uses `retrieve_chunk::<Vec<String>>` / `retrieve_array_subset::<Vec<String>>` (zarrs' `ElementOwned` API) instead of `ArrayBytes::into_fixed()`, yielding one `String` per element directly.
+- `ColumnValues` (an enum of `Fixed(Vec<u8>)` or `Strings(Vec<String>)`) replaces the bare `Vec<u8>` used for a coordinate array's pre-loaded values and a data variable's per-chunk decode buffer, so both paths carry either representation.
+- zarrs pads a boundary chunk's *element count* to the full nominal `chunk_shape` for every dtype uniformly (fill-value elements past the array's logical bound), so the existing `zarrs_flat` physical-offset math indexes correctly into a `Vec<String>` with no changes. [string_dtype.test](../test/sql/string_dtype.test) (`string_var_v3_2d`) and [ragged_chunks.test](../test/sql/ragged_chunks.test) cover ragged boundary chunks for 1-D and 2-D string and float arrays.
+- No NULL masking applies: `FillSentinel` only represents numeric sentinels (`Float`/`Int`/`UInt`, see [meta.rs](../src/zarr_reader/meta.rs)), so a `_FillValue`/`missing_value` attr on a string variable doesn't parse into a sentinel and every decoded string (including zarrs' own empty-string fill-value substitution) is written through as-is.
+
+`ColumnEncoding::PackedInt` never applies to strings (its trigger condition requires an integer on-disk dtype), and CF-time detection explicitly skips them (a string array carrying a `units` attr is not a time axis), so neither decoding ever intersects string decoding.
 
 ### Packed integer decoding (CF §8.1)
 
@@ -466,6 +480,29 @@ Within a dim group, two data variables might be chunked differently — e.g. `te
 > - Option (c) — row-level iteration — defeats the parallel-scan model entirely.
 >
 > Option (b) is queued for v0.3 alongside the multi-group `ATTACH` work, where the scan engine is being touched anyway. v1 ships the bind-error path; v0.3 relaxes it.
+
+### 7. AnnData stores: name dimensions for `array_path=` reads, add no AnnData parsing
+
+[Issue #40](https://github.com/xqlsystems/duckdb-zarr/issues/40) asks for [AnnData](https://github.com/scverse/anndata/blob/main/docs/fileformat-prose.md) support. AnnData and zarr-python write neither `dimension_names` nor `_ARRAY_DIMENSIONS`, so `dimension_names()` rejected every array in an AnnData store at bind, including single-array `array_path=` reads. A user in the issue thread tested the v0.1.3 extension on a real pbmc3k store, patching dimension names in by hand. With the names in place, the only other blocker was the `string` dtype (#44). Sparse CSR components, categorical codes and `obs`/`var` columns all read as plain arrays, and SQL handled the rest.
+
+> **Decision:** When `array_path=` selects one array that declares no dimension names (and has no OME `multiscales.axes`), name its dimensions `dim_0..dim_{ndim-1}` (`synthesize_dim_names` in `meta.rs`). Whole-store enumeration (`read_zarr(store)`, the replacement scan, `read_zarr_groups` without `array_path=`) does not do this and still fails, with an error that suggests `array_path=`. Add no AnnData-specific code: no data-frame assembly, no categorical decoding, no sparse-matrix expansion. Users write that SQL themselves; [Querying AnnData stores](anndata.md) gives the queries.
+>
+> **Why only for `array_path=`:** a placeholder name carries no meaning. If enumeration gave placeholder names to every unnamed array, two unrelated arrays of the same length would both get `dim_0`, land in the same dim group, and be joined row by row. That returns wrong data with no error. With `array_path=` the user picks exactly one array, so nothing can be misaligned. For the same reason, a synthesized name never binds a coordinate array, even if a sibling array is called `dim_0`.
+>
+> **Why no AnnData parsing:** the field test found the two blockers above and nothing else. The user called AnnData-aware readers a convenience for later. A reader that decodes `encoding-type` can be a separate change.
+
+Two changes to `read_zarr_metadata` support this:
+
+- The `array_path_dims` column holds the names that `read_zarr(store, array_path := name)` binds, from the same function (`array_path_dims`) that the bind uses. The `dims` column is unchanged and still shows only declared names, so `[]` for AnnData arrays. A separate column keeps each column's meaning the same in every call.
+- An array that zarrs cannot open because of its data type, codecs, storage transformers or an unknown extension field is listed with `role = 'unsupported'`, `dtype = 'unsupported'` and the error text in `attrs`, and the call continues (`is_unsupported_array_error`). Other open errors (I/O, auth, missing metadata, an invalid fill value) still fail the call, because hiding them would make a broken store look partly empty.
+
+**Known ways hand-written AnnData SQL goes wrong.** The user guide explains each one, and `test/sql/anndata.test` checks each one against a store written by the real `anndata` package:
+
+- Missing strings are stored outside the data array. A `nullable-string-array` keeps them in a separate `mask`; reading `values` alone returns `''`. A categorical stores them as code `-1`, which an inner join to `categories` drops.
+- An empty CSR row repeats an `indptr` offset. A plain `ASOF JOIN` from positions to `indptr` then picks between tied rows arbitrarily. The guide's `ASOF JOIN` first keeps only the last row per offset; the test checks it against a half-open range join.
+- `indptr` indexes rows for `csr_matrix` and columns for `csc_matrix`. The extension does not read `encoding-type`.
+
+Cost of the sparse expansion, measured on in-memory tables with 4 threads and about 5% empty rows (join only, no `read_zarr` scan): at 2.1M nonzeros, 0.15 s and 170 MB for the deduplicated `ASOF JOIN`, 0.4 to 0.6 s and 390 MB for the range join; at 9.5M nonzeros, 0.7 s and 0.8 GB against 1.7 s and 1.6 GB. Both grow linearly. The issue thread also reports that joining `read_zarr` calls directly took about 50 s where joining materialized tables took 0.25 s; we have not reproduced that figure.
 
 ## Why this is worth building
 

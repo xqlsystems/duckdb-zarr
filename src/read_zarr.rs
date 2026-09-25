@@ -11,7 +11,7 @@ use crate::zarr_reader::meta::{
     ZarrStore,
 };
 use crate::zarr_reader::types::{
-    ColumnDef, ColumnEncoding, CoordArray, DimGroup, WorkUnit, ZarrDtype,
+    ColumnDef, ColumnEncoding, ColumnValues, CoordArray, DimGroup, WorkUnit, ZarrDtype,
 };
 
 // ---------------------------------------------------------------------------
@@ -48,8 +48,8 @@ pub struct ReadZarrInit {
 pub struct LocalState {
     /// Index of the current work unit being streamed out row-by-row.
     pub current_unit_idx: usize,
-    /// Decoded bytes for the current work unit, one entry per data variable.
-    pub current_chunk_bytes: HashMap<String, Vec<u8>>,
+    /// Decoded values for the current work unit, one entry per data variable.
+    pub current_chunk_values: HashMap<String, ColumnValues>,
     /// Row cursor within the current chunk (how many rows have been emitted).
     pub row_cursor: usize,
     /// Total rows in the current chunk.
@@ -182,7 +182,7 @@ impl VTab for ReadZarrVTab {
             projected_cols,
             inner: Mutex::new(LocalState {
                 current_unit_idx: usize::MAX,
-                current_chunk_bytes: HashMap::new(),
+                current_chunk_values: HashMap::new(),
                 row_cursor: 0,
                 chunk_rows: 0,
                 done: false,
@@ -218,10 +218,10 @@ impl VTab for ReadZarrVTab {
                 }
                 let wu = &bind.work_units[unit_idx];
                 // Decode chunk for each data variable.
-                let chunk_bytes = decode_work_unit(bind, wu, projected)?;
+                let chunk_values = decode_work_unit(bind, wu, projected)?;
                 let chunk_rows = compute_chunk_rows(wu, &bind.group_shape, &bind.group_chunk_shape);
                 state.current_unit_idx = unit_idx;
-                state.current_chunk_bytes = chunk_bytes;
+                state.current_chunk_values = chunk_values;
                 state.row_cursor = 0;
                 state.chunk_rows = chunk_rows;
             }
@@ -242,7 +242,7 @@ impl VTab for ReadZarrVTab {
                 wu,
                 &bind.group_shape,
                 &bind.group_chunk_shape,
-                &state.current_chunk_bytes,
+                &state.current_chunk_values,
                 output,
                 rows_written,
                 state.row_cursor,
@@ -357,8 +357,8 @@ fn decode_work_unit(
     bind: &ReadZarrBind,
     wu: &WorkUnit,
     projected: &HashMap<usize, usize>,
-) -> Result<HashMap<String, Vec<u8>>, Box<dyn std::error::Error>> {
-    let mut chunk_bytes = HashMap::new();
+) -> Result<HashMap<String, ColumnValues>, Box<dyn std::error::Error>> {
+    let mut chunk_values = HashMap::new();
 
     for (col_idx, col) in bind.columns.iter().enumerate() {
         if col.is_coord {
@@ -371,17 +371,24 @@ fn decode_work_unit(
             .arrays
             .get(&col.name)
             .ok_or_else(|| format!("array '{}' not found in bind cache", col.name))?;
-        // ArrayBytes<'static>: zarrs convention for requesting owned decoded bytes.
-        // retrieve_chunk fills missing (implicit) chunks with fill_value automatically.
-        let raw = arr.retrieve_chunk::<zarrs::array::ArrayBytes<'static>>(&wu.chunk_indices)?;
-        let bytes: Vec<u8> = raw
-            .into_fixed()
-            .map_err(|_| format!("variable-length dtype not supported for '{}'", col.name))?
-            .into_owned();
-        chunk_bytes.insert(col.name.clone(), bytes);
+        let data = if col.on_disk_dtype == ZarrDtype::String {
+            // retrieve_chunk fills missing (implicit) chunks with the dtype's
+            // fill_value automatically, same as the fixed-width path below.
+            let strings = arr.retrieve_chunk::<Vec<String>>(&wu.chunk_indices)?;
+            ColumnValues::Strings(strings)
+        } else {
+            // ArrayBytes<'static>: zarrs convention for requesting owned decoded bytes.
+            let raw = arr.retrieve_chunk::<zarrs::array::ArrayBytes<'static>>(&wu.chunk_indices)?;
+            let bytes: Vec<u8> = raw
+                .into_fixed()
+                .map_err(|_| format!("variable-length dtype not supported for '{}'", col.name))?
+                .into_owned();
+            ColumnValues::Fixed(bytes)
+        };
+        chunk_values.insert(col.name.clone(), data);
     }
 
-    Ok(chunk_bytes)
+    Ok(chunk_values)
 }
 
 fn compute_chunk_rows(wu: &WorkUnit, shape: &[u64], chunk_shape: &[u64]) -> usize {
@@ -407,7 +414,7 @@ fn fill_chunk_slice(
     wu: &WorkUnit,
     group_shape: &[u64],
     group_chunk_shape: &[u64],
-    chunk_bytes: &HashMap<String, Vec<u8>>,
+    chunk_values: &HashMap<String, ColumnValues>,
     output: &mut DataChunkHandle,
     vector_base: usize,
     chunk_row_start: usize,
@@ -470,17 +477,32 @@ fn fill_chunk_slice(
             if let Some(dim_k) = col_def.dim_idx {
                 let coord_idx = global_indices[dim_k];
                 if let Some(ca) = coord_arrays.get(&col_def.name) {
-                    let elem_size = ca.dtype.byte_size();
-                    fill_element(
-                        &mut vector,
-                        &ca.bytes,
-                        &ca.dtype,
-                        &ca.encoding,
-                        &ca.sentinel,
-                        coord_idx,
-                        elem_size,
-                        dst,
-                    );
+                    match &ca.data {
+                        ColumnValues::Fixed(bytes) => {
+                            let elem_size = ca
+                                .dtype
+                                .byte_size()
+                                .expect("Fixed column values imply a fixed-width dtype");
+                            fill_element(
+                                &mut vector,
+                                bytes,
+                                &ca.dtype,
+                                &ca.encoding,
+                                &ca.sentinel,
+                                coord_idx,
+                                elem_size,
+                                dst,
+                            );
+                        }
+                        ColumnValues::Strings(strings) => {
+                            crate::zarr_reader::scan::fill_string_element_pub(
+                                &mut vector,
+                                strings,
+                                coord_idx,
+                                dst,
+                            );
+                        }
+                    }
                 } else {
                     // Unindexed dim → synthesize range.
                     unsafe {
@@ -490,23 +512,35 @@ fn fill_chunk_slice(
                 }
             } else {
                 // Data variable: use zarrs_flat to index into the physical byte buffer.
-                if let Some(bytes) = chunk_bytes.get(&col_def.name) {
-                    let elem_size = col_def.on_disk_dtype.byte_size();
-                    fill_element(
-                        &mut vector,
-                        bytes,
-                        &col_def.on_disk_dtype,
-                        &col_def.encoding,
-                        &col_def.sentinel,
-                        zarrs_flat,
-                        elem_size,
-                        dst,
-                    );
-                } else {
-                    unreachable!(
-                        "projected data variable '{}' missing from chunk_bytes",
+                match chunk_values.get(&col_def.name) {
+                    Some(ColumnValues::Fixed(bytes)) => {
+                        let elem_size = col_def
+                            .on_disk_dtype
+                            .byte_size()
+                            .expect("Fixed column values imply a fixed-width dtype");
+                        fill_element(
+                            &mut vector,
+                            bytes,
+                            &col_def.on_disk_dtype,
+                            &col_def.encoding,
+                            &col_def.sentinel,
+                            zarrs_flat,
+                            elem_size,
+                            dst,
+                        );
+                    }
+                    Some(ColumnValues::Strings(strings)) => {
+                        crate::zarr_reader::scan::fill_string_element_pub(
+                            &mut vector,
+                            strings,
+                            zarrs_flat,
+                            dst,
+                        );
+                    }
+                    None => unreachable!(
+                        "projected data variable '{}' missing from chunk_values",
                         col_def.name
-                    );
+                    ),
                 }
             }
         }

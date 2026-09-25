@@ -11,6 +11,8 @@ Usage:
 Output:
     test/fixtures/xarray_tutorial/<name>.zarr
     test/fixtures/bioimage/ome_zarr/<name>.ome.zarr
+    test/fixtures/anndata/<name>.zarr (delegated to generate_anndata_fixtures.py,
+        its own pinned/isolated dependency set — see that file's docstring)
 
 Note on base64-encoded _FillValue: xarray encodes ALL float _FillValue attrs
 as base64 when writing zarr v3 — including non-NaN values like -9.97e36.
@@ -64,6 +66,7 @@ import zarr
 ROOT = pathlib.Path(__file__).parent.parent
 FIXTURES = ROOT / "test" / "fixtures" / "xarray_tutorial"
 BIOIMAGE_FIXTURES = ROOT / "test" / "fixtures" / "bioimage" / "ome_zarr"
+ANNDATA_FIXTURES = ROOT / "test" / "fixtures" / "anndata"
 
 
 def write_zarr(ds: xr.Dataset, name: str, encoding: dict | None = None) -> None:
@@ -75,6 +78,28 @@ def write_zarr(ds: xr.Dataset, name: str, encoding: dict | None = None) -> None:
         _rmtree(dest)
     ds.to_zarr(dest, zarr_format=3, consolidated=False, encoding=encoding or {})
     print(f"  wrote {dest}")
+
+
+# Bump a version when you change what its fixture contains. A fixture is reused
+# only when the `<name>.zarr.version` file next to it holds the same version;
+# otherwise it is rebuilt. Without this, a copy left over from an older checkout
+# makes the SQL tests fail on value differences that are hard to trace.
+ANNDATA_FIXTURE_VERSION = "4"
+RAGGED_FIXTURE_VERSION = "1"
+UNSUPPORTED_FIXTURE_VERSION = "1"
+
+
+def _version_marker(dest: pathlib.Path) -> pathlib.Path:
+    return dest.with_name(dest.name + ".version")
+
+
+def fixture_is_current(dest: pathlib.Path, version: str, sentinel: str = "zarr.json") -> bool:
+    marker = _version_marker(dest)
+    return (dest / sentinel).exists() and marker.exists() and marker.read_text().strip() == version
+
+
+def mark_fixture(dest: pathlib.Path, version: str) -> None:
+    _version_marker(dest).write_text(version + "\n")
 
 
 def ensure_attr(ds: xr.Dataset, var: str, key: str, value) -> xr.Dataset:
@@ -111,9 +136,38 @@ def open_tutorial(name: str, **kwargs) -> xr.Dataset:
     raise last_exc
 
 
+def _check_anndata_layout(dest: pathlib.Path) -> None:
+    """Exit with an error if the installed anndata did not write the layout that
+    test/sql/anndata.test expects: which columns are groups, where the mask and
+    the -1 code are, and the repeated indptr offsets for empty rows."""
+    g = zarr.open_group(str(dest), mode="r", use_consolidated=False)
+
+    def need(cond: bool, what: str) -> None:
+        if not cond:
+            raise SystemExit(
+                f"anndata fixture layout drifted from what test/sql/anndata.test expects: {what}. "
+                "The installed anndata behaves differently; update the generator and tests.")
+
+    need(g["var/gene_symbol"].attrs.get("encoding-type") == "nullable-string-array",
+         "var/gene_symbol is not a nullable-string-array")
+    need(bool(g["var/gene_symbol/mask"][6]) and not any(g["var/gene_symbol/mask"][[0, 5, 7]]),
+         "var/gene_symbol mask should be true only at index 6")
+    need(g["obs/cell_type"].attrs.get("encoding-type") == "categorical"
+         and int(g["obs/cell_type/codes"][4]) == -1,
+         "obs/cell_type should be categorical with code -1 at cell 4")
+    need(g["obs/donor"].attrs.get("encoding-type") == "nullable-string-array",
+         "obs/donor should be a nullable-string-array (all-unique strings)")
+    need(g["X"].attrs.get("encoding-type") == "csr_matrix", "X is not a csr_matrix")
+    indptr = [int(v) for v in g["X/indptr"][:]]
+    need(indptr[7] == indptr[8] == indptr[9] and indptr[19] == indptr[20],
+         "X/indptr should repeat offsets for empty rows 7, 8 and 19")
+    need(g["X/data"].shape == (27,), "X/data should hold 27 nonzeros")
+
+
 def main() -> None:
     FIXTURES.mkdir(parents=True, exist_ok=True)
     BIOIMAGE_FIXTURES.mkdir(parents=True, exist_ok=True)
+    ANNDATA_FIXTURES.mkdir(parents=True, exist_ok=True)
 
     # ── synthetic_multichannel (OME-Zarr bioimage) ──────────────────────────
     # A minimal two-channel microscopy image with OME multiscales metadata.
@@ -332,6 +386,50 @@ def main() -> None:
     da = xr.DataArray(data, dims=["dim_0", "lat", "lon"],
                       coords={"lat": lat, "lon": lon})
     write_zarr(xr.Dataset({"values": da}), "unindexed_dim")
+
+    # ── string_var_v3 (synthetic, anndata-style) ────────────────────────────────
+    # Tests: `string` dtype (Zarr v3, vlen-utf8-codec-backed) as a plain data
+    # variable — the shape anndata writes `obs`/`var` columns like
+    # `gene_symbol` in. One row is the empty string to exercise the dtype's
+    # default fill_value. See https://github.com/xqlsystems/duckdb-zarr/issues/40.
+    print("string_var_v3 (synthetic)...")
+    n_var = 5
+    var_idx = np.arange(n_var, dtype="int64")
+    gene_symbol = np.array(["Actb", "Gapdh", "", "Myc", "Tp53"], dtype=object)
+    gene_symbol_da = xr.DataArray(gene_symbol, dims=["var"], coords={"var": var_idx})
+    write_zarr(xr.Dataset({"gene_symbol": gene_symbol_da}), "string_var_v3")
+
+    # ── string_var_v3_2d (synthetic) ─────────────────────────────────────────
+    # Tests: string dtype (Zarr v3) where chunk_shape doesn't evenly divide the
+    # array shape — (3, 5) dims with (2, 3) chunks, so the last row-chunk and
+    # last col-chunk are both boundary chunks padded past the array's logical
+    # bound. Exercises the zarrs_flat physical-offset math against a
+    # Vec<String> decode buffer (see docs/design.md, "Variable-length strings").
+    print("string_var_v3_2d (synthetic)...")
+    n_row, n_col = 3, 5
+    row_idx = np.arange(n_row, dtype="int64")
+    col_idx = np.arange(n_col, dtype="int64")
+    grid = np.array(
+        [[f"r{r}c{c}" for c in range(n_col)] for r in range(n_row)], dtype=object)
+    grid_da = xr.DataArray(grid, dims=["row", "col"],
+                            coords={"row": row_idx, "col": col_idx})
+    write_zarr(xr.Dataset({"grid": grid_da}), "string_var_v3_2d",
+               encoding={"grid": {"chunks": [2, 3]}})
+
+    # ── string_var_v2 (synthetic) ────────────────────────────────────────────
+    # Same data as string_var_v3 but written as Zarr v2: dtype `|O` with a
+    # `vlen-utf8` filter — the exact on-disk encoding anndata (zarr-python)
+    # uses for string columns in a pre-v3 `.zarr` store.
+    print("string_var_v2 (synthetic)...")
+    dest = FIXTURES / "string_var_v2.zarr"
+    if (dest / "gene_symbol" / ".zarray").exists():
+        print(f"  (cached) {dest}")
+    else:
+        if dest.exists():
+            _rmtree(dest)
+        xr.Dataset({"gene_symbol": gene_symbol_da}).to_zarr(
+            dest, zarr_format=2, consolidated=False)
+        print(f"  wrote {dest}")
 
     # ── cf_time (synthetic) ──────────────────────────────────────────────────
     # Tests: CF time decoding to DuckDB TIMESTAMP.
@@ -650,6 +748,163 @@ def main() -> None:
         http_ds.to_zarr(dest, zarr_format=3, consolidated=False)
         zarr.consolidate_metadata(str(dest))
         print(f"  wrote {dest}")
+
+    # ── anndata/pbmc_like (real anndata writer) ──────────────────────────────
+    # Tests: reading an AnnData store with array_path= (issue #40,
+    # test/sql/anndata.test, docs/anndata.md). Written by the real `anndata`
+    # package so the layout matches real stores: no dimension names, string and
+    # categorical columns stored as groups, and a CSR `X`. The data is
+    # deterministic so the tests can check exact values. It includes the cases
+    # that break hand-written SQL without an error:
+    #   * empty rows 7, 8 and 19, so X/indptr repeats offsets;
+    #   * a missing string at var/gene_symbol[6], stored in a separate mask;
+    #   * a missing category at obs/cell_type[4], stored as code -1.
+    # anndata is imported inside this block so that a missing or broken anndata
+    # breaks only this fixture.
+    print("anndata/pbmc_like (synthetic, real anndata writer)...")
+    dest = ANNDATA_FIXTURES / "pbmc_like.zarr"
+    if fixture_is_current(dest, ANNDATA_FIXTURE_VERSION):
+        print(f"  (cached) {dest}")
+    else:
+        import anndata as ad
+        import pandas as pd
+        import scipy.sparse
+
+        if dest.exists():
+            _rmtree(dest)
+
+        # anndata turns a string column with repeated values into a categorical,
+        # both in the constructor and again in write_zarr. To also get the other
+        # layout for missing strings (a nullable-string-array: values + mask), this
+        # allows nullable strings and disables that conversion for this one object.
+        # cell_type stays categorical, so both layouts are present. These anndata
+        # details can change between releases, so _check_anndata_layout checks
+        # the written store and stops generation if it differs.
+
+        n_obs, n_var = 20, 8
+        empty_rows = {7, 8, 19}
+
+        # Nonzero at (i, j) when (i + j) % 5 == 0 and row i is not empty, with
+        # value i*10 + j + 1. No stored value is 0, so no explicit zeros exist.
+        dense = np.zeros((n_obs, n_var), dtype=np.float32)
+        for i in range(n_obs):
+            for j in range(n_var):
+                if (i + j) % 5 == 0 and i not in empty_rows:
+                    dense[i, j] = i * 10 + j + 1
+        X = scipy.sparse.csr_matrix(dense)
+
+        cell_types = [["T cell", "B cell", "NK cell"][i % 3] for i in range(n_obs)]
+        cell_types[4] = None
+        obs = pd.DataFrame(
+            {
+                "cell_type": pd.Categorical(cell_types),
+                "n_genes": np.asarray((dense > 0).sum(axis=1), dtype=np.int64),
+            },
+            index=[f"cell_{i}" for i in range(n_obs)],
+        )
+        symbols = ["Actb", "Gapdh", "Myc", "Tp53", "Cd8a", "Cd4", None, "Foxp3"]
+        var = pd.DataFrame(
+            {
+                "mean_expr": np.asarray(dense.mean(axis=0), dtype=np.float64),
+            },
+            index=[f"gene_{j}" for j in range(n_var)],
+        )
+        obsm = {"X_umap": np.arange(n_obs * 2, dtype=np.float32).reshape(n_obs, 2)}
+
+        # zarr_write_format=3: anndata 0.12 writes Zarr v2 by default, 0.13 writes v3. Pin
+        # v3 so the on-disk store (and the dtype strings the tests assert) is the same
+        # on every version.
+        with ad.settings.override(allow_write_nullable_strings=True, zarr_write_format=3):
+            adata = ad.AnnData(X=X, obs=obs, var=var, obsm=obsm)
+            adata.var["gene_symbol"] = pd.array(symbols, dtype="string")
+            # Explicit `string` dtype (assigned after construction, like gene_symbol) so
+            # donor is a nullable-string-array on every anndata version: older releases
+            # write an all-unique *object* column as a plain string-array instead.
+            adata.obs["donor"] = pd.array([f"donor_{i:02d}" for i in range(n_obs)], dtype="string")
+            adata.strings_to_categoricals = lambda *args, **kwargs: None
+            adata.write_zarr(dest)
+        _check_anndata_layout(dest)
+        mark_fixture(dest, ANNDATA_FIXTURE_VERSION)
+        print(f"  wrote {dest}")
+
+    # ── unsupported_dtype (hand-written metadata) ────────────────────────────
+    # Tests: read_zarr_metadata lists an array zarrs cannot open (unknown dtype)
+    # as role='unsupported' instead of failing the whole call, while the good
+    # array beside it is still listed normally.
+    print("unsupported_dtype (synthetic)...")
+    dest = FIXTURES / "unsupported_dtype.zarr"
+    if fixture_is_current(dest, UNSUPPORTED_FIXTURE_VERSION):
+        print(f"  (cached) {dest}")
+    else:
+        import json
+        if dest.exists():
+            _rmtree(dest)
+
+        def _array_json(data_type, fill_value):
+            return {
+                "zarr_format": 3, "node_type": "array", "shape": [4],
+                "data_type": data_type,
+                "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [4]}},
+                "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+                "fill_value": fill_value,
+                "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}],
+                "attributes": {},
+            }
+
+        for rel, doc in {
+            "": {"zarr_format": 3, "node_type": "group", "attributes": {}},
+            "good": _array_json("float32", 0.0),
+            "bad": _array_json("not_a_real_dtype", 0),
+        }.items():
+            d = dest / rel
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "zarr.json").write_text(json.dumps(doc))
+        mark_fixture(dest, UNSUPPORTED_FIXTURE_VERSION)
+        print(f"  wrote {dest}")
+
+    # ── ragged_chunks (synthetic) ────────────────────────────────────────────
+    # Tests: boundary chunks whose extent is smaller than the nominal chunk shape —
+    # every other fixture is a single chunk. zarrs pads a boundary chunk's element
+    # buffer to the full nominal shape (design.md §Variable-length strings), for
+    # strings as much as numbers, and the reader's offset math must skip the padding.
+    #   s, v  (r=5, c=3), chunks (2, 2): ragged in BOTH dims; s is a string array
+    #   t     (i=10),     chunks (4,):   ragged 1-D string array (4, 4, 2)
+    #   x27   (n=27),     chunks (10,):  ragged 1-D float32, the shape of a CSR X/data
+    print("ragged_chunks (synthetic)...")
+    dest = FIXTURES / "ragged_chunks.zarr"
+    if fixture_is_current(dest, RAGGED_FIXTURE_VERSION):
+        print(f"  (cached) {dest}")
+    else:
+        if dest.exists():
+            _rmtree(dest)
+        rr, cc = np.meshgrid(np.arange(5), np.arange(3), indexing="ij")
+        ds_ragged = xr.Dataset({
+            "s": xr.DataArray(
+                np.array([[f"s{r}{c}" for c in range(3)] for r in range(5)], dtype=object),
+                dims=["r", "c"]),
+            "v": xr.DataArray((rr * 10 + cc).astype("float32"), dims=["r", "c"]),
+            "t": xr.DataArray(np.array([f"t{i}" for i in range(10)], dtype=object), dims=["i"]),
+            "x27": xr.DataArray((np.arange(27) * 2).astype("float32"), dims=["n"]),
+        })
+        ds_ragged.to_zarr(
+            dest, zarr_format=3, consolidated=False,
+            encoding={"s": {"chunks": (2, 2)}, "v": {"chunks": (2, 2)},
+                      "t": {"chunks": (4,)}, "x27": {"chunks": (10,)}})
+        mark_fixture(dest, RAGGED_FIXTURE_VERSION)
+        print(f"  wrote {dest}")
+
+    # ── anndata (real, non-synthetic) ────────────────────────────────────────
+    # Delegated to scripts/generate_anndata_fixtures.py via PEP 723 inline
+    # metadata so heavy deps (anndata/awkward/dask) stay isolated from this venv.
+    # Skipped if `uv` isn't installed to avoid zarr/numpy version clashes.
+    if shutil.which("uv"):
+        print("anndata (real, via scripts/generate_anndata_fixtures.py)...", flush=True)
+        subprocess.run(
+            ["uv", "run", str(ROOT / "scripts" / "generate_anndata_fixtures.py")],
+            check=True,
+        )
+    else:
+        print("Skipping anndata fixtures: uv not found (they need an isolated dependency set).")
 
     print("\nAll fixtures written.")
 
