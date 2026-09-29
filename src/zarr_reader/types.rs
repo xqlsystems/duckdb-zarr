@@ -2,7 +2,7 @@ use duckdb::core::{LogicalTypeHandle, LogicalTypeId};
 
 use super::cftime::CfTimeEncoding;
 
-/// On-disk Zarr numeric dtype as reported by zarrs `DataType::to_string()`.
+/// On-disk Zarr dtype as reported by zarrs `DataType::to_string()`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ZarrDtype {
     Bool,
@@ -16,6 +16,7 @@ pub enum ZarrDtype {
     UInt64,
     Float32,
     Float64,
+    String,
 }
 
 impl ZarrDtype {
@@ -32,6 +33,7 @@ impl ZarrDtype {
             "uint64" => Some(Self::UInt64),
             "float32" | "float" => Some(Self::Float32),
             "float64" | "double" => Some(Self::Float64),
+            "string" => Some(Self::String),
             _ => None,
         }
     }
@@ -57,12 +59,14 @@ impl ZarrDtype {
         )
     }
 
-    pub fn byte_size(&self) -> usize {
+    /// `None` for [`Self::String`], which is variable-length and has no fixed byte size.
+    pub fn byte_size(&self) -> Option<usize> {
         match self {
-            Self::Bool | Self::Int8 | Self::UInt8 => 1,
-            Self::Int16 | Self::UInt16 => 2,
-            Self::Int32 | Self::UInt32 | Self::Float32 => 4,
-            Self::Int64 | Self::UInt64 | Self::Float64 => 8,
+            Self::Bool | Self::Int8 | Self::UInt8 => Some(1),
+            Self::Int16 | Self::UInt16 => Some(2),
+            Self::Int32 | Self::UInt32 | Self::Float32 => Some(4),
+            Self::Int64 | Self::UInt64 | Self::Float64 => Some(8),
+            Self::String => None,
         }
     }
 
@@ -84,6 +88,7 @@ impl ZarrDtype {
                 Self::UInt64 => LogicalTypeId::UBigint.into(),
                 Self::Float32 => LogicalTypeId::Float.into(),
                 Self::Float64 => LogicalTypeId::Double.into(),
+                Self::String => LogicalTypeId::Varchar.into(),
             },
         }
     }
@@ -135,14 +140,24 @@ pub struct DimGroup {
     pub coord_var_names: Vec<String>,
 }
 
-/// Raw bytes of a pre-loaded coordinate array (shape is 1-D: `[n]`).
+/// Decoded element values for one array segment.
+// For fixed-size dtypes, this is a single contiguous byte buffer.
+// For variable-length strings, this is a Vec<String>.
+#[derive(Debug, Clone)]
+pub enum ColumnValues {
+    /// Row-major native-endian bytes, length = `n * dtype.byte_size()`.
+    Fixed(Vec<u8>),
+    /// One decoded string per element, in row-major order.
+    Strings(Vec<String>),
+}
+
+/// A pre-loaded coordinate array (shape is 1-D: `[n]`).
 #[derive(Debug, Clone)]
 pub struct CoordArray {
     pub dtype: ZarrDtype,
     pub encoding: ColumnEncoding,
     pub sentinel: Option<FillSentinel>,
-    /// Row-major bytes, length = `n * dtype.byte_size()`.
-    pub bytes: Vec<u8>,
+    pub data: ColumnValues,
 }
 
 /// One unit of parallel work: a chunk index tuple for all data variables.
