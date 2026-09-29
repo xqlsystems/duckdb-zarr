@@ -5,6 +5,7 @@ mod read_zarr;
 mod read_zarr_groups;
 mod read_zarr_metadata;
 mod replacement_scan;
+mod zarr_attach;
 mod zarr_reader;
 
 unsafe fn zarr_init_c_api_internal(
@@ -35,7 +36,12 @@ unsafe fn zarr_init_c_api_internal(
 
         replacement_scan::register(db);
 
+        let attach_extra = zarr_attach::AttachExtra::connect(db)?;
         let con = Connection::open_from_raw(db.cast())?;
+        con.register_table_function_with_extra_info::<zarr_attach::ZarrAttachVTab, _>(
+            "zarr_attach",
+            &attach_extra,
+        )?;
         con.register_table_function::<read_zarr::ReadZarrVTab>("read_zarr")?;
         con.register_table_function::<read_zarr_metadata::ReadZarrMetaVTab>("read_zarr_metadata")?;
         con.register_table_function::<read_zarr_groups::ReadZarrGroupsVTab>("read_zarr_groups")?;
