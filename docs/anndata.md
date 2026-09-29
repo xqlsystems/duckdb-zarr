@@ -11,6 +11,13 @@ frames, map categorical codes to labels, or expand sparse matrices. You do these
 steps in SQL, and this page gives the queries. Some of the queries are easy to
 get wrong without an error, so read the notes on nulls and empty rows.
 
+This page describes low-level access, and it is an interim interface. Full
+AnnData support is planned: it will read `obs` and `var` as tables, decode
+categorical and nullable columns, and read a sparse `X` as rows. When that
+lands, arrays in an AnnData store will get real dimension names such as `obs`
+and `var` in place of `dim_0` and `dim_1`, so queries written against this page
+will need changes.
+
 The examples use the small test store in this repository. Run
 `make generate_fixtures` to create it. The store has 20 cells and 8 genes.
 

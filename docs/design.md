@@ -489,7 +489,7 @@ Within a dim group, two data variables might be chunked differently — e.g. `te
 >
 > **Why only for `array_path=`:** a placeholder name carries no meaning. If enumeration gave placeholder names to every unnamed array, two unrelated arrays of the same length would both get `dim_0`, land in the same dim group, and be joined row by row. That returns wrong data with no error. With `array_path=` the user picks exactly one array, so nothing can be misaligned. For the same reason, a synthesized name never binds a coordinate array, even if a sibling array is called `dim_0`.
 >
-> **Why no AnnData parsing:** the field test found the two blockers above and nothing else. The user called AnnData-aware readers a convenience for later. A reader that decodes `encoding-type` can be a separate change.
+> **Why no AnnData parsing yet:** the field test found the two blockers above and nothing else. Full support is planned in two later steps: reading nested groups as a tree of tables (the xarray `DataTree` model, shared with xarray-sql), then decoders for AnnData's group encodings (`categorical`, `nullable-*`, `csr_matrix`/`csc_matrix`). The second step will name AnnData's axes, which changes the `dim_N` column names that `array_path=` gives AnnData arrays today. `docs/anndata.md` says so.
 
 Two changes to `read_zarr_metadata` support this:
 
