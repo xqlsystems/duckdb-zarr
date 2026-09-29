@@ -1,0 +1,97 @@
+# name: test/sql/string_dtype.test
+# description: `string` dtype (Zarr v3 vlen-utf8 / Zarr v2 `|O`+vlen-utf8) as VARCHAR
+# group: [zarr]
+#
+# Covers https://github.com/xqlsystems/duckdb-zarr/issues/40 — anndata `obs`/`var`
+# columns (e.g. `gene_symbol`) are written as this dtype, and previously failed
+# with "unsupported dtype 'string'".
+
+require zarr
+
+# ── string_var_v3 (Zarr v3) ──────────────────────────────────────────────────────
+# One data variable `gene_symbol` (dtype `string`) over dim `var`; row 2 is the
+# empty string (the dtype's default fill_value).
+
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/string_var_v3.zarr');
+----
+5
+
+query II
+SELECT var, gene_symbol FROM read_zarr('test/fixtures/xarray_tutorial/string_var_v3.zarr') ORDER BY var;
+----
+0	Actb
+1	Gapdh
+2	(empty)
+3	Myc
+4	Tp53
+
+# Reported as VARCHAR, so ordinary string predicates and functions apply.
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/string_var_v3.zarr') WHERE gene_symbol = 'Myc';
+----
+1
+
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/string_var_v3.zarr') WHERE gene_symbol = '';
+----
+1
+
+query I
+SELECT UPPER(gene_symbol) FROM read_zarr('test/fixtures/xarray_tutorial/string_var_v3.zarr') WHERE var = 0;
+----
+ACTB
+
+# read_zarr_metadata reports the raw on-disk dtype string. zarrs prints both
+# the v3 and v2 names when they differ ("string" vs. `|O`).
+query I
+SELECT dtype FROM read_zarr_metadata('test/fixtures/xarray_tutorial/string_var_v3.zarr') WHERE name = 'gene_symbol';
+----
+string / |O
+
+# ── string_var_v3_2d (Zarr v3, synthetic) ──────────────────────────────────────
+# (3, 5) dims with (2, 3) chunks: the last row-chunk (row 2) and last col-chunk
+# (cols 3-4) are both boundary chunks that zarrs pads to the full chunk_shape.
+# Exercises the zarrs_flat physical-offset math against a Vec<String> decode
+# buffer at that padded corner (row=2, col=4).
+
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/string_var_v3_2d.zarr');
+----
+15
+
+query III
+SELECT row, col, grid FROM read_zarr('test/fixtures/xarray_tutorial/string_var_v3_2d.zarr') ORDER BY row, col;
+----
+0	0	r0c0
+0	1	r0c1
+0	2	r0c2
+0	3	r0c3
+0	4	r0c4
+1	0	r1c0
+1	1	r1c1
+1	2	r1c2
+1	3	r1c3
+1	4	r1c4
+2	0	r2c0
+2	1	r2c1
+2	2	r2c2
+2	3	r2c3
+2	4	r2c4
+
+# ── string_var_v2 (Zarr v2, `|O` + vlen-utf8 filter) ──────────────────────────
+# Same values, but written in the legacy v2 encoding anndata/zarr-python use.
+
+query II
+SELECT var, gene_symbol FROM read_zarr('test/fixtures/xarray_tutorial/string_var_v2.zarr') ORDER BY var;
+----
+0	Actb
+1	Gapdh
+2	(empty)
+3	Myc
+4	Tp53
+
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/string_var_v2.zarr') WHERE gene_symbol = 'Tp53';
+----
+1
