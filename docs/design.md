@@ -71,7 +71,7 @@ We split the store into **one table per distinct dimension set**. The ERA5 examp
 - a surface table over `(time, lat, lon)` with one column per surface variable
 - an atmosphere table over `(time, level, lat, lon)` with one column per pressure-level variable
 
-Tables get a default name derived from the sorted dim names (`t_lat_lon`, `level_t_lat_lon`); users can override via the `ATTACH` syntax below. `read_zarr_metadata` enumerates them so users can discover groupings before issuing the scan.
+Tables get a default name from their dimensions joined in order (`time_lat_lon`, `time_level_lat_lon`, or `scalar` for none), the same rule xarray-sql uses (decision 8); users can override via the `ATTACH` syntax below. `read_zarr_metadata` enumerates them so users can discover groupings before issuing the scan.
 
 ## SQL surface
 
@@ -115,6 +115,9 @@ SELECT * FROM read_zarr(
 -- Pick one array, including a nested OME-Zarr level
 SELECT * FROM read_zarr('image.ome.zarr', array_path := 'labels/nuclei/0');
 
+-- Pick a node of a nested store (planned, decision 8); the root is the default
+SELECT * FROM read_zarr('sim.zarr', group := 'simulation/fine', dims := ['x', 'y']);
+
 ```
 
 Named arguments stay close to xarray's vocabulary (`variables`, `coords`, `chunks`, `dims`). Variables that share the requested dim set become one output column each, joined on coordinate index — exactly the xarray-sql `pivot()` shape. Variables outside that dim set are silently excluded; the user picks them up by querying a different `dims` group.
@@ -134,7 +137,7 @@ FROM era5.atmosphere                -- (time, level, lat, lon)
 GROUP BY level;
 ```
 
-`ATTACH ... (TYPE ZARR)` mounts the store as a DuckDB schema with one view per dimension group. Group names default to a slugified join of the dim names; users can rename with `ALTER VIEW`. This is the recommended UX for ERA5-class stores where you'll be issuing many queries and want stable table names.
+`ATTACH ... (TYPE ZARR)` mounts the store as a DuckDB database with one schema per Zarr group and one view per dimension group (decision 8). The root group is schema `main`, so `era5.surface` above is `era5.main.surface`. Table names default to the dimension names joined in order (`time_lat_lon`); users can rename with `ALTER VIEW`. The C API has no storage-extension hook, so this will likely ship as a procedure rather than `ATTACH` syntax (decision 8, Implementation risk). This is the recommended UX for ERA5-class stores where you'll be issuing many queries and want stable table names.
 
 ### 4. `read_zarr_metadata` and `read_zarr_groups`
 
@@ -503,6 +506,24 @@ Two changes to `read_zarr_metadata` support this:
 - `indptr` indexes rows for `csr_matrix` and columns for `csc_matrix`. The extension does not read `encoding-type`.
 
 Cost of the sparse expansion, measured on in-memory tables with 4 threads and about 5% empty rows (join only, no `read_zarr` scan): at 2.1M nonzeros, 0.15 s and 170 MB for the deduplicated `ASOF JOIN`, 0.4 to 0.6 s and 390 MB for the range join; at 9.5M nonzeros, 0.7 s and 0.8 GB against 1.7 s and 1.6 GB. Both grow linearly. The issue thread also reports that joining `read_zarr` calls directly took about 50 s where joining materialized tables took 0.25 s; we have not reproduced that figure.
+
+### 8. Nested stores: one DuckDB schema per group, tables named like xarray-sql
+
+A Zarr store can nest groups, as an `xarray.DataTree` written with `DataTree.to_zarr()` does. Each group is a node with its own dimensions: `simulation/coarse` and `simulation/fine` can both have `foo(x, y)` with different lengths of `x`. Today the reader lists arrays from every nested group into one pool and groups them by dimension names alone (`infer_dim_groups`). That fails with a shape mismatch in the example above and silently merges the two nodes when the lengths agree. xarray-sql plans DataTree support too ([xarray-sql #82](https://github.com/xqlsystems/xarray-sql/issues/82)), and the two projects should give the same store the same tables.
+
+> **Decision:**
+>
+> - **Scope dimensions per node.** A dimension group is identified by `(node path, dims)`, not `dims` alone. Arrays in different groups never share a table.
+> - **Read the root node by default.** `read_zarr(store)` reads the root group only, like `xarray.open_zarr(store)`. A new `group :=` parameter selects another node, with the same meaning as xarray's `group=`: `read_zarr(store, group := 'simulation/fine', dims := ['x', 'y'])`. This is a breaking change for anyone who reads a nested store today without `array_path=`.
+> - **Inherit coordinates like xarray.** A node's tables include coordinate arrays from its ancestors for dimensions the node shares with them, as `DataTree` does. As in xarray, a child whose shared dimension has a different length from its parent's is an error.
+> - **Name tables like xarray-sql.** The default name of a dimension group is `"_".join(dims)` in dimension order, or `scalar` for none (`xarray_sql.df.default_table_name`). Overrides are keyed by the dimension tuple. Two groups in one node that would get names equal after case folding are an error, because DuckDB identifiers ignore case (`xarray_sql.df.resolve_table_names`).
+> - **Mount a store as a database with one schema per node.** `ATTACH` maps store → database, node path → schema, dimension group → table (a view over `read_zarr`). The root node is schema `main`, and a nested path is one quoted schema name: `sim."simulation/fine".x_y`. This mirrors a DataFusion `CatalogProvider` (catalog → schema → table), which is the shape xarray-sql #82 favors.
+>
+> **Why not keep flattening:** flattening only works when no two nodes reuse a dimension name, and DataTree stores reuse them by design (multiscale levels, ensembles, AnnData's `obs` and `var` against `X`). Scoping per node is the xarray data model; matching it is what lets xarray-sql and this extension agree.
+
+**Implementation risk: mounting.** The C API at DuckDB 1.5.5 still has no storage-extension hook (§Implementability risks, b), and its catalog functions are read-only. It does have `duckdb_connect` and `duckdb_query`, so the planned shape is a procedure, for example `CALL zarr_attach('sim.zarr', 'sim')`. It would open a second connection on the same database, run `ATTACH ':memory:' AS sim`, and create one schema per node and one view per dimension group. Views bind lazily, so this reads metadata only. This needs a spike before it is promised: whether the extension can get the database handle from its entry point, and whether DDL from a second connection during a `CALL` is safe.
+
+**AnnData under this model.** An AnnData store maps onto the tree: `obs` and `var` are nodes, `X`, `layers` and `obsm` share their axes. Two pieces stay AnnData-specific and come after this decision: naming the axes (AnnData writes no dimension names; anndata's own `read_lazy` names an `obs`/`var` data frame's dimension after its `_index` attribute), and decoding group-encoded variables (`categorical`, `nullable-*`, `csr_matrix`/`csc_matrix`) into single columns.
 
 ## Why this is worth building
 
