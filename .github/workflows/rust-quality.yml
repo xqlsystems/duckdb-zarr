@@ -30,10 +30,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      # Fails the PR if the three DuckDB version sites (Makefile
-      # TARGET_DUCKDB_VERSION, MainDistributionPipeline duckdb_version, Cargo.toml
-      # crate pin) disagree, or if the community descriptor fields drift. With
-      # USE_UNSTABLE_C_API=1 an inconsistent pin ships a binary that no DuckDB
-      # can load, so this guards every change — not just releases.
+      # Fails the PR if the DuckDB version pins (Makefile
+      # TARGET_DUCKDB_VERSION, Cargo.toml crate pin) disagree, if the
+      # distribution pipeline carries a stale duckdb_version literal instead
+      # of resolving it from the Makefile, or if the community descriptor
+      # fields drift. With USE_UNSTABLE_C_API=1 an inconsistent pin ships a
+      # binary that no DuckDB can load, so this guards every change — not
+      # just releases.
       - name: Check release-critical metadata
         run: python3 scripts/check_release_ready.py
