@@ -1,4 +1,6 @@
-use duckdb::core::{LogicalTypeHandle, LogicalTypeId};
+use std::sync::Arc;
+
+use duckdb::core::{FlatVector, LogicalTypeHandle, LogicalTypeId};
 
 use super::cftime::CfTimeEncoding;
 
@@ -16,6 +18,7 @@ pub enum ZarrDtype {
     UInt64,
     Float32,
     Float64,
+    String,
 }
 
 impl ZarrDtype {
@@ -32,6 +35,7 @@ impl ZarrDtype {
             "uint64" => Some(Self::UInt64),
             "float32" | "float" => Some(Self::Float32),
             "float64" | "double" => Some(Self::Float64),
+            "string" => Some(Self::String),
             _ => None,
         }
     }
@@ -57,12 +61,14 @@ impl ZarrDtype {
         )
     }
 
-    pub fn byte_size(&self) -> usize {
+    /// `None` for [`Self::String`], which is variable-length and has no fixed byte size.
+    pub fn byte_size(&self) -> Option<usize> {
         match self {
-            Self::Bool | Self::Int8 | Self::UInt8 => 1,
-            Self::Int16 | Self::UInt16 => 2,
-            Self::Int32 | Self::UInt32 | Self::Float32 => 4,
-            Self::Int64 | Self::UInt64 | Self::Float64 => 8,
+            Self::Bool | Self::Int8 | Self::UInt8 => Some(1),
+            Self::Int16 | Self::UInt16 => Some(2),
+            Self::Int32 | Self::UInt32 | Self::Float32 => Some(4),
+            Self::Int64 | Self::UInt64 | Self::Float64 => Some(8),
+            Self::String => None,
         }
     }
 
@@ -84,6 +90,7 @@ impl ZarrDtype {
                 Self::UInt64 => LogicalTypeId::UBigint.into(),
                 Self::Float32 => LogicalTypeId::Float.into(),
                 Self::Float64 => LogicalTypeId::Double.into(),
+                Self::String => LogicalTypeId::Varchar.into(),
             },
         }
     }
@@ -135,14 +142,84 @@ pub struct DimGroup {
     pub coord_var_names: Vec<String>,
 }
 
-/// Raw bytes of a pre-loaded coordinate array (shape is 1-D: `[n]`).
+/// Decoded element values for one array segment (strategy interface).
+///
+/// Each implementation owns its in-memory representation and knows how to
+/// write one element into a DuckDB output vector, so callers never branch on
+/// the dtype family.
+pub trait ColumnValues: std::fmt::Debug + Send + Sync {
+    /// Write the element at row-major index `src_idx` into slot `dst` of `vector`.
+    fn write_element(&self, vector: &mut FlatVector<'_>, src_idx: usize, dst: usize);
+}
+
+/// Shared handle to decoded values; cheap to clone.
+pub type SharedColumnValues = Arc<dyn ColumnValues>;
+
+/// Fixed-width dtypes: one contiguous native-endian byte buffer plus the
+/// bind-time decoding (CF packing / time, fill sentinel) applied per element.
+#[derive(Debug)]
+pub struct FixedValues {
+    /// Row-major native-endian bytes, length = `n * dtype.byte_size()`.
+    pub bytes: Vec<u8>,
+    pub dtype: ZarrDtype,
+    pub encoding: ColumnEncoding,
+    pub sentinel: Option<FillSentinel>,
+    elem_size: usize,
+}
+
+impl FixedValues {
+    /// Returns `None` if `dtype` is not fixed-width.
+    pub fn new(
+        bytes: Vec<u8>,
+        dtype: ZarrDtype,
+        encoding: ColumnEncoding,
+        sentinel: Option<FillSentinel>,
+    ) -> Option<Self> {
+        let elem_size = dtype.byte_size()?;
+        Some(Self {
+            bytes,
+            dtype,
+            encoding,
+            sentinel,
+            elem_size,
+        })
+    }
+}
+
+impl ColumnValues for FixedValues {
+    fn write_element(&self, vector: &mut FlatVector<'_>, src_idx: usize, dst: usize) {
+        crate::zarr_reader::scan::fill_element(
+            vector,
+            &self.bytes,
+            &self.dtype,
+            &self.encoding,
+            &self.sentinel,
+            src_idx,
+            self.elem_size,
+            dst,
+        );
+    }
+}
+
+/// Variable-length UTF-8 strings: one decoded `String` per element.
+#[derive(Debug)]
+pub struct StringValues {
+    pub strings: Vec<String>,
+}
+
+impl ColumnValues for StringValues {
+    fn write_element(&self, vector: &mut FlatVector<'_>, src_idx: usize, dst: usize) {
+        crate::zarr_reader::scan::fill_string_element_pub(vector, &self.strings, src_idx, dst);
+    }
+}
+
+/// A pre-loaded coordinate array (shape is 1-D: `[n]`).
 #[derive(Debug, Clone)]
 pub struct CoordArray {
     pub dtype: ZarrDtype,
     pub encoding: ColumnEncoding,
     pub sentinel: Option<FillSentinel>,
-    /// Row-major bytes, length = `n * dtype.byte_size()`.
-    pub bytes: Vec<u8>,
+    pub data: SharedColumnValues,
 }
 
 /// One unit of parallel work: a chunk index tuple for all data variables.

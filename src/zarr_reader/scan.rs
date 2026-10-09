@@ -1,6 +1,6 @@
 use duckdb::core::FlatVector;
 
-use super::types::{FillSentinel, ZarrDtype};
+use super::types::{ColumnEncoding, FillSentinel, ZarrDtype};
 
 /// Copy one scalar element from raw native-endian bytes into a DuckDB vector slot,
 /// applying NULL masking via the sentinel.
@@ -33,7 +33,21 @@ pub fn fill_scalar_element_pub(
         ZarrDtype::UInt64 => copy_scalar!(vector, bytes, u64, src_idx, dst_idx, sentinel),
         ZarrDtype::Float32 => copy_scalar!(vector, bytes, f32, src_idx, dst_idx, sentinel),
         ZarrDtype::Float64 => copy_scalar!(vector, bytes, f64, src_idx, dst_idx, sentinel),
+        ZarrDtype::String => {
+            unreachable!("String is variable-length; use fill_string_element_pub instead")
+        }
     }
+}
+
+/// Copy one decoded string element into a DuckDB VARCHAR vector slot.
+pub fn fill_string_element_pub(
+    vector: &mut FlatVector<'_>,
+    strings: &[String],
+    src_idx: usize,
+    dst_idx: usize,
+) {
+    use duckdb::core::Inserter;
+    vector.insert(dst_idx, strings[src_idx].as_str());
 }
 
 /// Read any integer dtype from raw bytes at `start` as i64 (for packed-int decoding).
@@ -171,6 +185,80 @@ impl NullCheck for f64 {
                 }
             }
             _ => false,
+        }
+    }
+}
+
+/// Write one fixed-width element into the DuckDB output vector,
+/// applying whatever CF decoding the column's bind-time encoding calls for.
+#[allow(clippy::too_many_arguments)]
+pub fn fill_element(
+    vector: &mut FlatVector<'_>,
+    bytes: &[u8],
+    dtype: &ZarrDtype,
+    encoding: &ColumnEncoding,
+    sentinel: &Option<FillSentinel>,
+    flat_row: usize,
+    elem_size: usize,
+    dst: usize,
+) {
+    match encoding {
+        ColumnEncoding::Plain => {
+            fill_scalar_element_pub(vector, bytes, dtype, sentinel, flat_row, elem_size, dst);
+        }
+        ColumnEncoding::PackedInt {
+            scale_factor,
+            add_offset,
+        } => {
+            let src = flat_row * elem_size;
+            let raw = read_int_as_i64_pub(bytes, dtype, src);
+            // CF §8.1: mask on the raw integer, before scaling shifts the sentinel.
+            if matches_int_sentinel(raw, sentinel) {
+                vector.set_null(dst);
+            } else {
+                // read_int_as_i64_pub bit-reinterprets UInt64, so a value above
+                // i64::MAX comes back negative here; recover the true magnitude
+                // before scaling instead of scaling a sign-flipped one.
+                let numeric = if *dtype == ZarrDtype::UInt64 {
+                    raw as u64 as f64
+                } else {
+                    raw as f64
+                };
+                unsafe {
+                    let slot = vector.as_mut_ptr::<f64>();
+                    *slot.add(dst) = numeric * scale_factor + add_offset;
+                }
+            }
+        }
+        ColumnEncoding::CfTime(cf) => {
+            let src = flat_row * elem_size;
+            // Integers go through the exact i128 path; only float offsets need f64.
+            // Either way an unrepresentable instant (NaN, or past DuckDB's range)
+            // becomes NULL rather than a bogus date.
+            let decoded = if dtype.is_integer() {
+                let raw = read_int_as_i64_pub(bytes, dtype, src);
+                // A UInt64 raw above i64::MAX comes back negative from the same
+                // bit-reinterpret — no legitimate CF-time offset is that large
+                // anyway (see out_of_range_values_decode_to_none), so treat it as
+                // out-of-range rather than decoding a bogus negative-offset date.
+                let overflowed = *dtype == ZarrDtype::UInt64 && raw < 0;
+                (!overflowed && !matches_int_sentinel(raw, sentinel))
+                    .then(|| cf.decode_int(raw))
+                    .flatten()
+            } else {
+                let raw = read_as_f64_pub(bytes, dtype, src);
+                (!matches_float_sentinel(raw, sentinel))
+                    .then(|| cf.decode_float(raw))
+                    .flatten()
+            };
+            match decoded {
+                // DuckDB TIMESTAMP is physically an i64 of microseconds since epoch.
+                Some(micros) => unsafe {
+                    let slot = vector.as_mut_ptr::<i64>();
+                    *slot.add(dst) = micros;
+                },
+                None => vector.set_null(dst),
+            }
         }
     }
 }

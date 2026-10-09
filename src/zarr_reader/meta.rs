@@ -17,7 +17,8 @@ use zarrs::storage::{Bytes, ReadableStorageTraits, StoreKey};
 use super::consolidated_store::ConsolidatedCacheStore;
 use super::duckdb_store::DuckDbStore;
 use super::types::{
-    ColumnDef, ColumnEncoding, CoordArray, DimGroup, FillSentinel, WorkUnit, ZarrDtype,
+    ColumnDef, ColumnEncoding, CoordArray, DimGroup, FillSentinel, FixedValues, SharedColumnValues,
+    StringValues, WorkUnit, ZarrDtype,
 };
 
 pub type ZarrStore = Arc<dyn ReadableStorageTraits>;
@@ -656,6 +657,9 @@ fn parse_zarr_fill_sentinel(array: &ZarrArray, dtype: &ZarrDtype) -> Option<Fill
             let arr: [u8; 8] = bytes.try_into().ok()?;
             Some(FillSentinel::Float(f64::from_ne_bytes(arr)))
         }
+        // Unlike a numeric fill_value, a non-empty string fill_value (e.g. "N/A")
+        // is plausible real data, so we can't safely treat it as a NULL sentinel here.
+        ZarrDtype::String => None,
     }
 }
 
@@ -905,26 +909,43 @@ pub fn load_coord_array(
     let sentinel = sentinel.or_else(|| parse_zarr_fill_sentinel(&arr, &dtype));
     let shape = arr.shape().to_vec();
     let n = shape[0] as usize;
-
-    // ArrayBytes<'static> is the zarrs convention for requesting owned (non-borrowed)
-    // decoded bytes; zarrs allocates a fresh Vec<u8> satisfying the 'static bound.
     let subset = arr.subset_all();
-    let array_bytes = arr.retrieve_array_subset::<zarrs::array::ArrayBytes<'static>>(&subset)?;
-    let raw = array_bytes
-        .into_fixed()
-        .map_err(|_| "coord array has variable-length dtype")?;
-    let bytes: Vec<u8> = raw.into_owned();
-    debug_assert_eq!(
-        bytes.len(),
-        n * dtype.byte_size(),
-        "coord byte count mismatch for '{coord_name}'"
-    );
+
+    let data: SharedColumnValues = if dtype == ZarrDtype::String {
+        let strings = arr.retrieve_array_subset::<Vec<String>>(&subset)?;
+        debug_assert_eq!(
+            strings.len(),
+            n,
+            "coord element count mismatch for '{coord_name}'"
+        );
+        Arc::new(StringValues { strings })
+    } else {
+        // ArrayBytes<'static> is the zarrs convention for requesting owned (non-borrowed)
+        // decoded bytes; zarrs allocates a fresh Vec<u8> satisfying the 'static bound.
+        let array_bytes =
+            arr.retrieve_array_subset::<zarrs::array::ArrayBytes<'static>>(&subset)?;
+        let raw = array_bytes
+            .into_fixed()
+            .map_err(|_| "coord array has variable-length dtype")?;
+        let bytes: Vec<u8> = raw.into_owned();
+        debug_assert_eq!(
+            bytes.len(),
+            n * dtype
+                .byte_size()
+                .expect("Fixed column values imply a fixed-width dtype"),
+            "coord byte count mismatch for '{coord_name}'"
+        );
+        Arc::new(
+            FixedValues::new(bytes, dtype.clone(), encoding.clone(), sentinel.clone())
+                .ok_or_else(|| format!("coord '{coord_name}' has no fixed-width dtype"))?,
+        )
+    };
 
     Ok(CoordArray {
         dtype,
         encoding,
         sentinel,
-        bytes,
+        data,
     })
 }
 
