@@ -33,8 +33,6 @@ ifneq ($(filter wasm_%,$(DUCKDB_PLATFORM)),)
 WASM_RUST_TOOLCHAIN := stable
 $(info $(shell rustup toolchain install $(WASM_RUST_TOOLCHAIN) --profile minimal --target wasm32-unknown-emscripten 1>&2))
 export RUSTUP_TOOLCHAIN := $(WASM_RUST_TOOLCHAIN)
-# emsdk 3.1.71's wasm-opt rejects wasm features newer rustc/LLVM turn on by default.
-export RUSTFLAGS := $(RUSTFLAGS) -C target-feature=-bulk-memory-opt,-call-indirect-overlong
 endif
 
 configure: venv platform extension_version
