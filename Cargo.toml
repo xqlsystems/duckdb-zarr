@@ -37,16 +37,17 @@ ndarray = "0.17"
 serde_json = "1"
 base64 = "0.22"
 
-# zarrs_http -> reqwest::blocking, which does not exist on wasm32. On wasm,
-# HTTP stores go through DuckDbStore (duckdb-wasm's own httpfs) instead.
-[target.'cfg(not(target_family = "wasm"))'.dependencies]
-zarrs_http = "0.3.1"
 # Already in the tree transitively via duckdb -> arrow -> arrow-arith, so taking
 # it directly costs nothing new; feature unification pulls in std/alloc from
 # that transitive edge regardless of default-features here. Used for calendar
 # arithmetic in cftime.rs (NaiveDate::from_ymd_opt subsumes hand-rolled
 # days_from_civil/days_in_month/is_leap_year, and validates day-of-month too).
 chrono = { version = "0.4", default-features = false }
+
+# zarrs_http -> reqwest::blocking, which does not exist on wasm32. On wasm,
+# HTTP stores go through DuckDbStore (duckdb-wasm's own httpfs) instead.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+zarrs_http = "0.3.1"
 
 # wasm has no threads: zarrs' rayon usage must run on a pool that never spawns.
 # See zarr_init_c_api_internal.
