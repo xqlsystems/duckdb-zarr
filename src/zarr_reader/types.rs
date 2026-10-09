@@ -1,4 +1,6 @@
-use duckdb::core::{LogicalTypeHandle, LogicalTypeId};
+use std::sync::Arc;
+
+use duckdb::core::{FlatVector, LogicalTypeHandle, LogicalTypeId};
 
 use super::cftime::CfTimeEncoding;
 
@@ -140,15 +142,75 @@ pub struct DimGroup {
     pub coord_var_names: Vec<String>,
 }
 
-/// Decoded element values for one array segment.
-// For fixed-size dtypes, this is a single contiguous byte buffer.
-// For variable-length strings, this is a Vec<String>.
-#[derive(Debug, Clone)]
-pub enum ColumnValues {
+/// Decoded element values for one array segment (strategy interface).
+///
+/// Each implementation owns its in-memory representation and knows how to
+/// write one element into a DuckDB output vector, so callers never branch on
+/// the dtype family.
+pub trait ColumnValues: std::fmt::Debug + Send + Sync {
+    /// Write the element at row-major index `src_idx` into slot `dst` of `vector`.
+    fn write_element(&self, vector: &mut FlatVector<'_>, src_idx: usize, dst: usize);
+}
+
+/// Shared handle to decoded values; cheap to clone.
+pub type SharedColumnValues = Arc<dyn ColumnValues>;
+
+/// Fixed-width dtypes: one contiguous native-endian byte buffer plus the
+/// bind-time decoding (CF packing / time, fill sentinel) applied per element.
+#[derive(Debug)]
+pub struct FixedValues {
     /// Row-major native-endian bytes, length = `n * dtype.byte_size()`.
-    Fixed(Vec<u8>),
-    /// One decoded string per element, in row-major order.
-    Strings(Vec<String>),
+    pub bytes: Vec<u8>,
+    pub dtype: ZarrDtype,
+    pub encoding: ColumnEncoding,
+    pub sentinel: Option<FillSentinel>,
+    elem_size: usize,
+}
+
+impl FixedValues {
+    /// Returns `None` if `dtype` is not fixed-width.
+    pub fn new(
+        bytes: Vec<u8>,
+        dtype: ZarrDtype,
+        encoding: ColumnEncoding,
+        sentinel: Option<FillSentinel>,
+    ) -> Option<Self> {
+        let elem_size = dtype.byte_size()?;
+        Some(Self {
+            bytes,
+            dtype,
+            encoding,
+            sentinel,
+            elem_size,
+        })
+    }
+}
+
+impl ColumnValues for FixedValues {
+    fn write_element(&self, vector: &mut FlatVector<'_>, src_idx: usize, dst: usize) {
+        crate::zarr_reader::scan::fill_element(
+            vector,
+            &self.bytes,
+            &self.dtype,
+            &self.encoding,
+            &self.sentinel,
+            src_idx,
+            self.elem_size,
+            dst,
+        );
+    }
+}
+
+/// Variable-length UTF-8 strings: one decoded `String` per element.
+#[derive(Debug)]
+pub struct StringValues {
+    pub strings: Vec<String>,
+}
+
+impl ColumnValues for StringValues {
+    fn write_element(&self, vector: &mut FlatVector<'_>, src_idx: usize, dst: usize) {
+        crate::zarr_reader::scan::fill_string_element_pub(vector, &self.strings, src_idx, dst);
+    }
 }
 
 /// A pre-loaded coordinate array (shape is 1-D: `[n]`).
@@ -157,7 +219,7 @@ pub struct CoordArray {
     pub dtype: ZarrDtype,
     pub encoding: ColumnEncoding,
     pub sentinel: Option<FillSentinel>,
-    pub data: ColumnValues,
+    pub data: SharedColumnValues,
 }
 
 /// One unit of parallel work: a chunk index tuple for all data variables.
