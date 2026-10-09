@@ -13,11 +13,35 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The DuckDB version pin lives in exactly one place: TARGET_DUCKDB_VERSION
+  # in the Makefile. The distribution job below resolves it from there at run
+  # time instead of carrying a `duckdb_version:` literal here — a literal in a
+  # workflow file would be a second pin site that automated bump PRs must
+  # rewrite, and GitHub refuses to let the Actions GITHUB_TOKEN push changes
+  # to files under .github/workflows/ under any `permissions:` grant.
+  resolve-duckdb-version:
+    name: Resolve pinned DuckDB version
+    runs-on: ubuntu-latest
+    outputs:
+      duckdb_version: ${{ steps.pin.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Read TARGET_DUCKDB_VERSION from Makefile
+        id: pin
+        run: |
+          ver=$(grep -oE '^TARGET_DUCKDB_VERSION=v[0-9]+\.[0-9]+\.[0-9]+$' Makefile | head -1 | cut -d= -f2)
+          if [ -z "$ver" ]; then
+            echo "::error::could not parse TARGET_DUCKDB_VERSION from Makefile"; exit 1
+          fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "Pinned DuckDB version: $ver"
+
   duckdb-stable-build:
     name: Build extension binaries
+    needs: resolve-duckdb-version
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
     with:
-      duckdb_version: v1.5.5
+      duckdb_version: ${{ needs.resolve-duckdb-version.outputs.duckdb_version }}
       ci_tools_version: v1.5-variegata
       extension_name: zarr
       extra_toolchains: rust;python3

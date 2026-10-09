@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use duckdb::core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab, Value};
@@ -11,7 +11,8 @@ use crate::zarr_reader::meta::{
     ZarrStore,
 };
 use crate::zarr_reader::types::{
-    ColumnDef, ColumnEncoding, ColumnValues, CoordArray, DimGroup, WorkUnit, ZarrDtype,
+    ColumnDef, CoordArray, DimGroup, FixedValues, SharedColumnValues, StringValues, WorkUnit,
+    ZarrDtype,
 };
 
 // ---------------------------------------------------------------------------
@@ -49,7 +50,7 @@ pub struct LocalState {
     /// Index of the current work unit being streamed out row-by-row.
     pub current_unit_idx: usize,
     /// Decoded values for the current work unit, one entry per data variable.
-    pub current_chunk_values: HashMap<String, ColumnValues>,
+    pub current_chunk_values: HashMap<String, SharedColumnValues>,
     /// Row cursor within the current chunk (how many rows have been emitted).
     pub row_cursor: usize,
     /// Total rows in the current chunk.
@@ -357,7 +358,7 @@ fn decode_work_unit(
     bind: &ReadZarrBind,
     wu: &WorkUnit,
     projected: &HashMap<usize, usize>,
-) -> Result<HashMap<String, ColumnValues>, Box<dyn std::error::Error>> {
+) -> Result<HashMap<String, SharedColumnValues>, Box<dyn std::error::Error>> {
     let mut chunk_values = HashMap::new();
 
     for (col_idx, col) in bind.columns.iter().enumerate() {
@@ -371,11 +372,11 @@ fn decode_work_unit(
             .arrays
             .get(&col.name)
             .ok_or_else(|| format!("array '{}' not found in bind cache", col.name))?;
-        let data = if col.on_disk_dtype == ZarrDtype::String {
+        let data: SharedColumnValues = if col.on_disk_dtype == ZarrDtype::String {
             // retrieve_chunk fills missing (implicit) chunks with the dtype's
             // fill_value automatically, same as the fixed-width path below.
             let strings = arr.retrieve_chunk::<Vec<String>>(&wu.chunk_indices)?;
-            ColumnValues::Strings(strings)
+            Arc::new(StringValues { strings })
         } else {
             // ArrayBytes<'static>: zarrs convention for requesting owned decoded bytes.
             let raw = arr.retrieve_chunk::<zarrs::array::ArrayBytes<'static>>(&wu.chunk_indices)?;
@@ -383,7 +384,15 @@ fn decode_work_unit(
                 .into_fixed()
                 .map_err(|_| format!("variable-length dtype not supported for '{}'", col.name))?
                 .into_owned();
-            ColumnValues::Fixed(bytes)
+            Arc::new(
+                FixedValues::new(
+                    bytes,
+                    col.on_disk_dtype.clone(),
+                    col.encoding.clone(),
+                    col.sentinel.clone(),
+                )
+                .ok_or_else(|| format!("no fixed-width dtype for '{}'", col.name))?,
+            )
         };
         chunk_values.insert(col.name.clone(), data);
     }
@@ -414,7 +423,7 @@ fn fill_chunk_slice(
     wu: &WorkUnit,
     group_shape: &[u64],
     group_chunk_shape: &[u64],
-    chunk_values: &HashMap<String, ColumnValues>,
+    chunk_values: &HashMap<String, SharedColumnValues>,
     output: &mut DataChunkHandle,
     vector_base: usize,
     chunk_row_start: usize,
@@ -477,32 +486,7 @@ fn fill_chunk_slice(
             if let Some(dim_k) = col_def.dim_idx {
                 let coord_idx = global_indices[dim_k];
                 if let Some(ca) = coord_arrays.get(&col_def.name) {
-                    match &ca.data {
-                        ColumnValues::Fixed(bytes) => {
-                            let elem_size = ca
-                                .dtype
-                                .byte_size()
-                                .expect("Fixed column values imply a fixed-width dtype");
-                            fill_element(
-                                &mut vector,
-                                bytes,
-                                &ca.dtype,
-                                &ca.encoding,
-                                &ca.sentinel,
-                                coord_idx,
-                                elem_size,
-                                dst,
-                            );
-                        }
-                        ColumnValues::Strings(strings) => {
-                            crate::zarr_reader::scan::fill_string_element_pub(
-                                &mut vector,
-                                strings,
-                                coord_idx,
-                                dst,
-                            );
-                        }
-                    }
+                    ca.data.write_element(&mut vector, coord_idx, dst);
                 } else {
                     // Unindexed dim → synthesize range.
                     unsafe {
@@ -512,117 +496,18 @@ fn fill_chunk_slice(
                 }
             } else {
                 // Data variable: use zarrs_flat to index into the physical byte buffer.
-                match chunk_values.get(&col_def.name) {
-                    Some(ColumnValues::Fixed(bytes)) => {
-                        let elem_size = col_def
-                            .on_disk_dtype
-                            .byte_size()
-                            .expect("Fixed column values imply a fixed-width dtype");
-                        fill_element(
-                            &mut vector,
-                            bytes,
-                            &col_def.on_disk_dtype,
-                            &col_def.encoding,
-                            &col_def.sentinel,
-                            zarrs_flat,
-                            elem_size,
-                            dst,
-                        );
-                    }
-                    Some(ColumnValues::Strings(strings)) => {
-                        crate::zarr_reader::scan::fill_string_element_pub(
-                            &mut vector,
-                            strings,
-                            zarrs_flat,
-                            dst,
-                        );
-                    }
-                    None => unreachable!(
-                        "projected data variable '{}' missing from chunk_values",
-                        col_def.name
-                    ),
-                }
+                chunk_values
+                    .get(&col_def.name)
+                    .unwrap_or_else(|| {
+                        unreachable!(
+                            "projected data variable '{}' missing from chunk_values",
+                            col_def.name
+                        )
+                    })
+                    .write_element(&mut vector, zarrs_flat, dst);
             }
         }
     }
 
     n_rows
-}
-
-/// Write one element — coord or data variable — into the DuckDB output vector,
-/// applying whatever CF decoding the column's bind-time encoding calls for.
-#[allow(clippy::too_many_arguments)]
-fn fill_element(
-    vector: &mut duckdb::core::FlatVector<'_>,
-    bytes: &[u8],
-    dtype: &ZarrDtype,
-    encoding: &ColumnEncoding,
-    sentinel: &Option<crate::zarr_reader::types::FillSentinel>,
-    flat_row: usize,
-    elem_size: usize,
-    dst: usize,
-) {
-    use crate::zarr_reader::scan::{
-        fill_scalar_element_pub, matches_float_sentinel, matches_int_sentinel, read_as_f64_pub,
-        read_int_as_i64_pub,
-    };
-    match encoding {
-        ColumnEncoding::Plain => {
-            fill_scalar_element_pub(vector, bytes, dtype, sentinel, flat_row, elem_size, dst);
-        }
-        ColumnEncoding::PackedInt {
-            scale_factor,
-            add_offset,
-        } => {
-            let src = flat_row * elem_size;
-            let raw = read_int_as_i64_pub(bytes, dtype, src);
-            // CF §8.1: mask on the raw integer, before scaling shifts the sentinel.
-            if matches_int_sentinel(raw, sentinel) {
-                vector.set_null(dst);
-            } else {
-                // read_int_as_i64_pub bit-reinterprets UInt64, so a value above
-                // i64::MAX comes back negative here; recover the true magnitude
-                // before scaling instead of scaling a sign-flipped one.
-                let numeric = if *dtype == ZarrDtype::UInt64 {
-                    raw as u64 as f64
-                } else {
-                    raw as f64
-                };
-                unsafe {
-                    let slot = vector.as_mut_ptr::<f64>();
-                    *slot.add(dst) = numeric * scale_factor + add_offset;
-                }
-            }
-        }
-        ColumnEncoding::CfTime(cf) => {
-            let src = flat_row * elem_size;
-            // Integers go through the exact i128 path; only float offsets need f64.
-            // Either way an unrepresentable instant (NaN, or past DuckDB's range)
-            // becomes NULL rather than a bogus date.
-            let decoded = if dtype.is_integer() {
-                let raw = read_int_as_i64_pub(bytes, dtype, src);
-                // A UInt64 raw above i64::MAX comes back negative from the same
-                // bit-reinterpret — no legitimate CF-time offset is that large
-                // anyway (see out_of_range_values_decode_to_none), so treat it as
-                // out-of-range rather than decoding a bogus negative-offset date.
-                let overflowed = *dtype == ZarrDtype::UInt64 && raw < 0;
-                (!overflowed && !matches_int_sentinel(raw, sentinel))
-                    .then(|| cf.decode_int(raw))
-                    .flatten()
-            } else {
-                let raw = read_as_f64_pub(bytes, dtype, src);
-                (!matches_float_sentinel(raw, sentinel))
-                    .then(|| cf.decode_float(raw))
-                    .flatten()
-            };
-            match decoded {
-                // DuckDB TIMESTAMP is physically an i64 of microseconds since epoch.
-                Some(micros) => unsafe {
-                    let slot = vector.as_mut_ptr::<i64>();
-                    *slot.add(dst) = micros;
-                },
-                None => vector.set_null(dst),
-            }
-        }
-    }
 }

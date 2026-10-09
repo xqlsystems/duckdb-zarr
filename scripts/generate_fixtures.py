@@ -700,7 +700,10 @@ def main() -> None:
                           coords={"time": time, "lat": lat, "lon": lon},
                           attrs={"units": "K", "long_name": "temperature"})
         # Use gzip instead of the default blosc; blosc build fails on macOS Tahoe.
-        v2_enc = {v: {"compressor": {"id": "gzip", "level": 1}}
+        # "compressors" (plural, zarr-3 codec list) works on xarray >=2026.9
+        # which dropped the legacy singular "compressor" key from its valid
+        # encoding parameters.
+        v2_enc = {v: {"compressors": [{"id": "gzip", "level": 1}]}
                   for v in ("temperature", "lat", "lon", "time")}
         xr.Dataset({"temperature": da}).to_zarr(
             dest, zarr_format=2, consolidated=False, encoding=v2_enc)
@@ -732,7 +735,9 @@ def main() -> None:
         if dest.exists():
             _rmtree(dest)
         # gzip (not blosc): blosc build fails on macOS Tahoe; matches float_baseline_v2.
-        v2_enc = {v: {"compressor": {"id": "gzip", "level": 1}}
+        # "compressors" (plural): xarray >=2026.9 dropped the legacy
+        # singular "compressor" encoding key.
+        v2_enc = {v: {"compressors": [{"id": "gzip", "level": 1}]}
                   for v in ("temperature", "lat", "lon", "time")}
         http_ds.to_zarr(dest, zarr_format=2, consolidated=True, encoding=v2_enc)
         print(f"  wrote {dest}")

@@ -1,14 +1,26 @@
 #
-# Detects when the pinned DuckDB version has drifted from the version the
-# sqllogictest test runner installs (pip `duckdb`, latest patch of the active
-# minor line), and opens a PR bumping the three pinned sites. The PR's normal
-# build/test pipeline is the validation gate — a human reviews and merges.
+# Detects when the pinned DuckDB version has drifted from the latest stable
+# pip `duckdb` release (latest patch of the active minor line — what the
+# community-extensions repo builds against), and opens a PR bumping the
+# pinned sites. The PR's normal build/test pipeline is the validation gate —
+# a human reviews and merges.
 #
-# Why three sites: the extension links the `duckdb` crate, the distribution
-# workflow checks out DuckDB at `duckdb_version`, and the Makefile stamps the
-# extension-metadata version via TARGET_DUCKDB_VERSION. With USE_UNSTABLE_C_API=1
-# the loader requires an EXACT version match, so all three must agree with the
-# runner or `Test extension` fails to load the built extension.
+# The sqllogictest test runner itself installs the pinned version
+# (DUCKDB_TEST_VERSION in the Makefile), so a pin that drifts behind the
+# latest stable release no longer breaks CI test loading — it silently ships
+# an extension the community repo can't distribute. This workflow is what
+# surfaces that drift.
+#
+# Why the pinned sites: the extension links the `duckdb` crate and the Makefile
+# stamps the extension-metadata version via TARGET_DUCKDB_VERSION; the
+# distribution workflow resolves its `duckdb_version` from the Makefile at run
+# time, so it is not a pin site. With USE_UNSTABLE_C_API=1 the loader requires
+# an EXACT version match, so every site must agree with the runner or
+# `Test extension` fails to load the built extension.
+#
+# The bump must not touch files under .github/workflows/ (or any other file
+# GITHUB_TOKEN cannot push): GitHub permanently refuses to let the Actions
+# GITHUB_TOKEN push workflow-file changes, so such a PR can never be opened.
 #
 name: DuckDB Version Drift
 
@@ -39,12 +51,13 @@ jobs:
           echo "version=$cur" >> "$GITHUB_OUTPUT"
           echo "Currently pinned: $cur"
 
-      - name: Resolve latest test-runner DuckDB version
+      - name: Resolve latest stable DuckDB version
         id: latest
         run: |
-          # The sqllogictest runner installs the pip `duckdb` package. Stay within
-          # the current minor line — a major/minor jump is a deliberate, manual
-          # upgrade (it usually needs code changes), not an automated bump.
+          # What the community-extensions repo builds against: the latest
+          # stable pip `duckdb`, within the current minor line — a major/minor
+          # jump is a deliberate, manual upgrade (it usually needs code
+          # changes), not an automated bump.
           minor=$(echo "${{ steps.current.outputs.version }}" | sed -E 's/^v([0-9]+\.[0-9]+)\..*/\1/')
           latest=$(curl -fsSL https://pypi.org/pypi/duckdb/json \
             | jq -r --arg m "$minor." '
@@ -96,10 +109,10 @@ jobs:
           crate="${{ steps.crate.outputs.version }}"
           # 1. Makefile target (stamps extension metadata)
           sed -i -E "s/^TARGET_DUCKDB_VERSION=.*/TARGET_DUCKDB_VERSION=$new/" Makefile
-          # 2. Distribution workflow duckdb_version
-          sed -i -E "s/(duckdb_version:[[:space:]]*)v[0-9]+\.[0-9]+\.[0-9]+/\1$new/" \
-            .github/workflows/MainDistributionPipeline.yml
-          # 3. Cargo.toml exact crate pin (the only `version = "=...` line) + lockfile
+          # 2. Cargo.toml exact crate pin (the only `version = "=...` line) + lockfile.
+          #    Never edit files under .github/workflows/ here — GITHUB_TOKEN
+          #    cannot push workflow-file changes, so the PR push would fail
+          #    (the distribution pipeline resolves duckdb_version from the Makefile).
           sed -i -E "s/(version = \")=[0-9]+\.[0-9]+\.[0-9]+/\1=$crate/" Cargo.toml
           cargo update -p duckdb --precise "$crate"
 
@@ -114,14 +127,17 @@ jobs:
           body: |
             Automated DuckDB version bump.
 
-            The sqllogictest test runner (pip `duckdb`) moved to
-            **${{ steps.latest.outputs.version }}**. This updates the three pinned
+            The latest stable pip `duckdb` release (what
+            duckdb/community-extensions builds against) moved to
+            **${{ steps.latest.outputs.version }}**. This updates the pinned
             sites that must match it (exact match is required because
             `USE_UNSTABLE_C_API=1`):
 
             - `Makefile` → `TARGET_DUCKDB_VERSION=${{ steps.latest.outputs.version }}`
-            - `.github/workflows/MainDistributionPipeline.yml` → `duckdb_version: ${{ steps.latest.outputs.version }}`
             - `Cargo.toml` → `duckdb = "=${{ steps.crate.outputs.version }}"` (+ `Cargo.lock`)
+
+            The distribution pipeline reads its `duckdb_version` from the
+            Makefile at build time, so no workflow-file change is needed.
 
             ⚠️ A crate API change may require manual source edits (e.g. the
             1.10504.0 bump made `FlatVector::as_mut_ptr` `unsafe`). **Rely on this
@@ -133,9 +149,12 @@ jobs:
       # or major DuckDB line (e.g. 1.5.x -> 1.6.0) usually needs source changes
       # and the CI-tools codename branch, so it is a deliberate manual migration
       # — but we should not find out by noticing the extension is unavailable.
-      # Surface it as a tracking issue instead.
+      # Surface it as a tracking issue instead. These steps must not depend on
+      # the bump steps succeeding: a failed bump push (e.g. while a crate is
+      # missing) must not silence the migration signal.
       - name: Detect newer DuckDB minor/major line
         id: newline
+        if: ${{ !cancelled() }}
         run: |
           cur_my=$(echo "${{ steps.current.outputs.version }}" | sed -E 's/^v([0-9]+\.[0-9]+)\..*/\1/')
           newest=$(curl -fsSL https://pypi.org/pypi/duckdb/json \
@@ -155,7 +174,7 @@ jobs:
           fi
 
       - name: Open minor/major migration tracking issue
-        if: steps.newline.outputs.newer == 'true'
+        if: ${{ !cancelled() && steps.newline.outputs.newer == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -174,7 +193,7 @@ jobs:
               "${{ steps.newline.outputs.newest }}" "${{ steps.newline.outputs.newest_minor }}" "${{ steps.current.outputs.version }}"
             printf 'The `DuckDB Version Drift` bot only bumps **within** the current minor line, because a new minor/major usually needs source changes and a matching `duckdb-rs` crate. This one is a manual migration:\n\n'
             printf '1. Point the `extension-ci-tools` submodule + `ci_tools_version` at the new DuckDB codename branch.\n'
-            printf '2. Bump the three version sites to `%s` (Makefile `TARGET_DUCKDB_VERSION`, `MainDistributionPipeline.yml` `duckdb_version`, `Cargo.toml` duckdb pin) + `Cargo.lock`.\n' "${{ steps.newline.outputs.newest }}"
+            printf '2. Bump the version pins to `%s` (Makefile `TARGET_DUCKDB_VERSION`, `Cargo.toml` duckdb pin) + `Cargo.lock`. The distribution pipeline reads its `duckdb_version` from the Makefile at build time.\n' "${{ steps.newline.outputs.newest }}"
             printf '3. `make lint && make test_release`; fix any API breaks.\n'
             printf '4. Stage the migrated commit as `ref_next` (see `docs/community-extension-release.md`) so the extension is available the moment `%s` ships.\n\n' "${{ steps.newline.outputs.newest_minor }}"
             printf 'Opened automatically by `.github/workflows/duckdb-version-drift.yml`.\n'

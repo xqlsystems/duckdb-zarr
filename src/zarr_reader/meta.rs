@@ -17,8 +17,8 @@ use zarrs::storage::{Bytes, ReadableStorageTraits, StoreKey};
 use super::consolidated_store::ConsolidatedCacheStore;
 use super::duckdb_store::DuckDbStore;
 use super::types::{
-    ColumnDef, ColumnEncoding, ColumnValues, CoordArray, DimGroup, FillSentinel, WorkUnit,
-    ZarrDtype,
+    ColumnDef, ColumnEncoding, CoordArray, DimGroup, FillSentinel, FixedValues, SharedColumnValues,
+    StringValues, WorkUnit, ZarrDtype,
 };
 
 pub type ZarrStore = Arc<dyn ReadableStorageTraits>;
@@ -978,14 +978,14 @@ pub fn load_coord_array(
     let n = shape[0] as usize;
     let subset = arr.subset_all();
 
-    let data = if dtype == ZarrDtype::String {
+    let data: SharedColumnValues = if dtype == ZarrDtype::String {
         let strings = arr.retrieve_array_subset::<Vec<String>>(&subset)?;
         debug_assert_eq!(
             strings.len(),
             n,
             "coord element count mismatch for '{coord_name}'"
         );
-        ColumnValues::Strings(strings)
+        Arc::new(StringValues { strings })
     } else {
         // ArrayBytes<'static> is the zarrs convention for requesting owned (non-borrowed)
         // decoded bytes; zarrs allocates a fresh Vec<u8> satisfying the 'static bound.
@@ -1002,7 +1002,10 @@ pub fn load_coord_array(
                 .expect("Fixed column values imply a fixed-width dtype"),
             "coord byte count mismatch for '{coord_name}'"
         );
-        ColumnValues::Fixed(bytes)
+        Arc::new(
+            FixedValues::new(bytes, dtype.clone(), encoding.clone(), sentinel.clone())
+                .ok_or_else(|| format!("coord '{coord_name}' has no fixed-width dtype"))?,
+        )
     };
 
     Ok(CoordArray {

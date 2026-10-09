@@ -18,7 +18,6 @@ make test_release
 in a Rust C API extension:
 
 - `Makefile` `TARGET_DUCKDB_VERSION`
-- `.github/workflows/MainDistributionPipeline.yml` `duckdb_version`
 - `Cargo.toml` exact `duckdb` crate pin
 - `description.yml` `language`, `build`, `requires_toolchains`, and excluded
   platforms
@@ -26,6 +25,9 @@ in a Rust C API extension:
   versions agreeing with each other (see
   [docs/versioning.md](versioning.md) — this does not check them against any
   git tag; that sync happens automatically at release time)
+- that `MainDistributionPipeline.yml` resolves `duckdb_version` from the
+  Makefile pin at build time rather than carrying its own literal (see
+  [DuckDB Version Policy](#duckdb-version-policy))
 
 For the final community PR, also run:
 
@@ -75,7 +77,7 @@ Three pieces of automation keep that window small:
 
 - **CI guard** — the `Release metadata consistency` job in
   `.github/workflows/rust-quality.yml` runs `scripts/check_release_ready.py` on
-  every PR, so the three DuckDB version sites can never merge out of sync.
+  every PR, so the DuckDB version pins can never merge out of sync.
 - **`DuckDB Version Drift`** (`.github/workflows/duckdb-version-drift.yml`) runs
   **daily**. Within the current minor line it opens a `chore/bump-duckdb-*` PR
   as soon as pip `duckdb` and the matching `duckdb` crate publish a new patch.
@@ -135,15 +137,23 @@ This extension currently sets `USE_UNSTABLE_C_API=1`, so the produced binary is
 not forward-compatible across DuckDB patch releases: the loader expects the exact
 DuckDB version stamped into the extension metadata.
 
-That means a DuckDB bump must update all version sites in one reviewed change:
+That means a DuckDB bump must update all version pins in one reviewed change:
 
 - `Makefile` `TARGET_DUCKDB_VERSION`
-- `.github/workflows/MainDistributionPipeline.yml` `duckdb_version`
 - `Cargo.toml` exact `duckdb` crate pin
 - `Cargo.lock`
 
-The local release gate checks the first three. `Cargo.lock` should change when
+The local release gate checks the first two and that the distribution pipeline
+resolves its `duckdb_version` from the Makefile. `Cargo.lock` should change when
 `cargo update -p duckdb --precise <crate-version>` is run.
+
+The distribution pipeline deliberately carries **no** `duckdb_version:` literal
+of its own: `.github/workflows/MainDistributionPipeline.yml` resolves it from
+`TARGET_DUCKDB_VERSION` at build time. A literal inside a workflow file cannot
+be updated by an automated PR — GitHub refuses to let the Actions `GITHUB_TOKEN`
+push changes to files under `.github/workflows/` under any `permissions` grant
+— so the drift bot's bump PRs would fail to push and the literal would silently
+go stale. One pin site, the Makefile, keeps the automated path working.
 
 The `duckdb` crate version used here encodes the DuckDB version. For the current
 pin, DuckDB `v1.5.4` maps to:
