@@ -11,6 +11,15 @@ USE_UNSTABLE_C_API=1
 # Target DuckDB version
 TARGET_DUCKDB_VERSION=v1.5.5
 
+# The sqllogictest runner (pip `duckdb`) must match the build pin exactly:
+# USE_UNSTABLE_C_API=1 makes the loader reject an extension built for a
+# different DuckDB version. extension-ci-tools' base.Makefile turns
+# DUCKDB_TEST_VERSION into `duckdb==<version>` when creating configure/venv
+# (default otherwise: latest stable on PyPI). Set BEFORE the includes below —
+# their conditional is evaluated at parse time; `v` is stripped for the pip
+# pin. Drift is surfaced daily by .github/workflows/duckdb-version-drift.yml.
+export DUCKDB_TEST_VERSION := $(TARGET_DUCKDB_VERSION:v%=%)
+
 all: configure debug
 
 # Include makefiles from DuckDB

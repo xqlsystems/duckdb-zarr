@@ -65,11 +65,6 @@ def main() -> int:
             makefile,
             "Makefile TARGET_DUCKDB_VERSION",
         )
-        workflow_duckdb = first_match(
-            r"^\s*duckdb_version:\s*(v\d+\.\d+\.\d+)$",
-            workflow,
-            "workflow duckdb_version",
-        )
         cargo_duckdb = first_match(
             r'duckdb\s*=\s*\{\s*version\s*=\s*"=([0-9]+\.[0-9]+\.[0-9]+)"',
             cargo,
@@ -78,10 +73,24 @@ def main() -> int:
     except ValueError as exc:
         failures.append(str(exc))
     else:
-        if make_duckdb != workflow_duckdb:
+        # The Makefile is the single DuckDB pin site. The distribution
+        # workflow must NOT carry its own `duckdb_version:` literal: GitHub
+        # refuses to let the Actions GITHUB_TOKEN push changes to files under
+        # .github/workflows/, so an automated bump PR can never update such a
+        # literal — it would silently go stale (and the bump bot's push would
+        # fail outright). Instead the pipeline resolves the pin at run time.
+        if re.search(r"^\s*duckdb_version:\s*v\d+\.\d+\.\d+\s*$", workflow, re.MULTILINE):
             failures.append(
-                "DuckDB version drift: "
-                f"Makefile has {make_duckdb}, workflow has {workflow_duckdb}"
+                "stale pin: MainDistributionPipeline.yml has a literal "
+                "`duckdb_version:` — the pipeline must resolve it from the "
+                "Makefile instead (GITHUB_TOKEN cannot push workflow-file "
+                "changes, so the drift bot can never update a literal here)"
+            )
+        if "needs.resolve-duckdb-version.outputs.duckdb_version" not in workflow:
+            failures.append(
+                "MainDistributionPipeline.yml does not resolve duckdb_version "
+                "from the Makefile pin (expected "
+                "`needs.resolve-duckdb-version.outputs.duckdb_version`)"
             )
         expected_crate = duckdb_crate_version(make_duckdb)
         if cargo_duckdb != expected_crate:

@@ -98,8 +98,10 @@ exact DuckDB version stamped into the extension metadata.
 When bumping DuckDB, update all of these in one PR:
 
 - `Makefile` `TARGET_DUCKDB_VERSION`
-- `.github/workflows/MainDistributionPipeline.yml` `duckdb_version`
 - `Cargo.toml` exact `duckdb` crate pin, plus `Cargo.lock`
+
+The distribution workflow reads its `duckdb_version` from the Makefile at build
+time, so it needs no separate edit.
 
 The crate pin follows the `duckdb-rs` encoding used by this project. For example,
 DuckDB `v1.5.4` maps to `duckdb = "=1.10504.0"`.
