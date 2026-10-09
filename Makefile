@@ -26,6 +26,15 @@ all: configure debug
 include extension-ci-tools/makefiles/c_api_extensions/base.Makefile
 include extension-ci-tools/makefiles/c_api_extensions/rust.Makefile
 
+# extension-ci-tools' wasm job installs Rust 1.86.0, but zarrs needs a newer
+# rustc. For wasm platforms only, install and select the stable toolchain with the
+# emscripten target (rustup is a no-op when it is already present).
+ifneq ($(filter wasm_%,$(DUCKDB_PLATFORM)),)
+WASM_RUST_TOOLCHAIN := stable
+$(info $(shell rustup toolchain install $(WASM_RUST_TOOLCHAIN) --profile minimal --target wasm32-unknown-emscripten 1>&2))
+export RUSTUP_TOOLCHAIN := $(WASM_RUST_TOOLCHAIN)
+endif
+
 configure: venv platform extension_version
 
 # DuckDB CI sets CC=gcc/CXX=g++ for windows_amd64_mingw but the Rust default
