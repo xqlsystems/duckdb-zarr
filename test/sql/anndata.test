@@ -1,0 +1,507 @@
+# name: test/sql/anndata.test
+# description: AnnData stores read as a DataTree of tables (issue #40, design decisions 7 and 9)
+# group: [zarr]
+#
+# An AnnData store reads like any nested store (decision 8): one schema per
+# group, one table per dimension group. The AnnData layer (decision 9) names
+# each element's axes (obs, var, ...), reads the obs and var data frames as
+# tables of the root group with their index as the coordinate, and reads
+# encoded groups as one column: categoricals as ENUMs, nullable columns with
+# NULLs, and a table of sparse matrices with one row per stored entry.
+#
+# The second half reads the same data the low-level way, one array at a time
+# with array_path=, and checks the tables against it. Those queries are the
+# ones docs/anndata.md gave before the tables existed; they are kept as an
+# independent check of the decoders.
+#
+# Fixture: test/fixtures/anndata/pbmc_like.zarr, written by the real `anndata`
+# package (scripts/generate_fixtures.py). 20 cells x 8 genes:
+#   obs/cell_type    categorical; cell 4 is missing (code -1)
+#   obs/batch        categorical with integer categories: 2020 + i % 2
+#   obs/donor        nullable-string-array, no missing values
+#   obs/n_genes      int64, nonzero count per cell
+#   var/gene_symbol  nullable-string-array (values + mask); gene 6 is missing
+#   X                csr_matrix float32. Nonzero at (i, j) when (i + j) % 5 == 0,
+#                    with value i*10 + j + 1, except cells 7, 8 and 19, which are
+#                    empty. 27 nonzeros; indptr repeats offsets at the empty cells.
+#   layers/spliced   csr_matrix, i + j + 1 where (i + j) % 3 == 0 (53 entries)
+#   layers/unspliced csr_matrix, -(i + j + 1) where (i + j) % 2 == 0 (80 entries)
+#   obsm/X_umap      dense 2-D float32, values 0..39
+#   obsp/connectivities  csc_matrix 20x20, (i, (i + 1) % 20) = i + 0.5
+#   varp/corr        dense 8x8 float64, values 0..63
+#   varp/corr_csc    csc_matrix, corr where corr % 4 == 0
+#
+# The `dtype` strings are how zarrs prints a data type: "<v3 name> / <v2 name>",
+# whatever the store's format. This store is Zarr v3.
+
+require zarr
+
+# ══ Tables ═══════════════════════════════════════════════════════════════════
+
+# ── The catalog ───────────────────────────────────────────────────────────────
+# obs and var are tables of the root group, beside X. Their index (cell and
+# gene names) is the coordinate of the obs and var dimensions, so every table
+# shows names in those columns, including the tables of child groups.
+query TTTT
+SELECT group_path, table_name, dims, data_vars
+FROM read_zarr_groups('test/fixtures/anndata/pbmc_like.zarr')
+ORDER BY group_path, table_name;
+----
+/	obs	["obs"]	["obs/batch","obs/cell_type","obs/donor","obs/n_genes"]
+/	obs_var	["obs","var"]	["X"]
+/	var	["var"]	["var/gene_symbol","var/mean_expr"]
+/layers	obs_var	["obs","var"]	["layers/spliced","layers/unspliced"]
+/obsm	obs_X_umap_component	["obs","X_umap_component"]	["obsm/X_umap"]
+/obsp	obs_i_obs_j	["obs_i","obs_j"]	["obsp/connectivities"]
+/varp	var_i_var_j	["var_i","var_j"]	["varp/corr","varp/corr_csc"]
+
+# The root has three tables, so a read of it must say which.
+statement error
+SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr');
+----
+contains multiple dimension groups
+
+# Asking for the obs group points at the root.
+statement error
+SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := 'obs');
+----
+in an AnnData store, the columns of '/obs' are in the group '/'
+
+# ── obs and var: one row per cell or gene, encodings decoded ──────────────────
+query TTTI
+SELECT obs, cell_type, donor, batch
+FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', dims := ['obs'])
+WHERE obs IN ('cell_0', 'cell_1', 'cell_4', 'cell_19')
+ORDER BY obs;
+----
+cell_0	T cell	donor_00	2020
+cell_1	B cell	donor_01	2021
+cell_19	B cell	donor_19	2021
+cell_4	NULL	donor_04	2020
+
+# A categorical with string categories is an ENUM; with integer categories it
+# keeps their type, since an ENUM holds strings only.
+query TTT
+SELECT typeof(obs), typeof(cell_type), typeof(batch) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', dims := ['obs']) LIMIT 1;
+----
+VARCHAR	ENUM('B cell', 'NK cell', 'T cell')	BIGINT
+
+query TI
+SELECT cell_type, COUNT(*) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', dims := ['obs']) GROUP BY ALL ORDER BY ALL;
+----
+B cell	6
+NK cell	6
+T cell	7
+NULL	1
+
+query TT
+SELECT var, gene_symbol
+FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', dims := ['var'])
+WHERE var IN ('gene_5', 'gene_6', 'gene_7')
+ORDER BY var;
+----
+gene_5	Cd4
+gene_6	NULL
+gene_7	Foxp3
+
+# ── X: a sparse matrix reads as one row per stored entry ──────────────────────
+query IR
+SELECT COUNT(*), SUM(X) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', dims := ['obs', 'var']);
+----
+27	2590.000000
+
+# Cell i and gene j are named cell_i and gene_j in this store.
+query I
+SELECT COUNT(*) FROM (
+  SELECT CAST(substr(obs, 6) AS INT) AS i, CAST(substr(var, 6) AS INT) AS j, X
+  FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', dims := ['obs', 'var']))
+WHERE NOT ((i + j) % 5 = 0 AND X = i * 10 + j + 1 AND i NOT IN (7, 8, 19));
+----
+0
+
+# ── layers: two sparse matrices make one table of the union of their entries ──
+# A cell one layer stores and the other does not reads as 0 in the other. The
+# names in obs and var are inherited from the root.
+query III
+SELECT COUNT(*), COUNT(*) FILTER (WHERE spliced <> 0), COUNT(*) FILTER (WHERE unspliced <> 0)
+FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := 'layers');
+----
+106	53	80
+
+query TRR
+SELECT var, spliced, unspliced
+FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := 'layers')
+WHERE obs = 'cell_0'
+ORDER BY var;
+----
+gene_0	1.000000	-1.000000
+gene_2	0.000000	-3.000000
+gene_3	4.000000	0.000000
+gene_4	0.000000	-5.000000
+gene_6	7.000000	-7.000000
+
+# ── obsm: one row per cell and component ──────────────────────────────────────
+query IIR
+SELECT COUNT(*), MAX(X_umap_component), SUM(X_umap)
+FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := 'obsm');
+----
+40	1	780.000000
+
+query IR
+SELECT X_umap_component, X_umap FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := 'obsm')
+WHERE obs = 'cell_3' ORDER BY X_umap_component;
+----
+0	6.000000
+1	7.000000
+
+# ── obsp: a CSC matrix (indptr runs over columns); both axes show cell names ──
+query II
+SELECT COUNT(*), COUNT(*) FILTER (
+  WHERE obs_j = 'cell_' || ((CAST(substr(obs_i, 6) AS INT) + 1) % 20)
+    AND connectivities = CAST(substr(obs_i, 6) AS INT) + 0.5)
+FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := 'obsp');
+----
+20	20
+
+query TR
+SELECT obs_j, connectivities FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := 'obsp') WHERE obs_i = 'cell_3';
+----
+cell_4	3.500000
+
+# ── varp: a CSC matrix beside a dense array is read densely ───────────────────
+query IIR
+SELECT COUNT(*),
+       COUNT(*) FILTER (WHERE corr_csc = CASE WHEN corr % 4 = 0 THEN corr ELSE 0 END),
+       SUM(corr_csc)
+FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := 'varp');
+----
+64	64	480.000000
+
+# ── array_path= on an AnnData element binds its axis names ────────────────────
+# The arrays inside an encoded group (codes, values, data, ...) have no AnnData
+# axes and keep dim_0, dim_1, ...
+query TT
+SELECT name, array_path_dims FROM read_zarr_metadata('test/fixtures/anndata/pbmc_like.zarr')
+WHERE name IN ('obs/n_genes', 'obsm/X_umap', 'varp/corr', 'X/data', 'obs/cell_type/codes')
+ORDER BY name;
+----
+X/data	["dim_0"]
+obs/cell_type/codes	["dim_0"]
+obs/n_genes	["obs"]
+obsm/X_umap	["obs","X_umap_component"]
+varp/corr	["var_i","var_j"]
+
+# `dims` still shows only declared names: none, for AnnData.
+query III
+SELECT dtype, dims, array_path_dims FROM read_zarr_metadata('test/fixtures/anndata/pbmc_like.zarr') WHERE name = 'X/data';
+----
+float32 / <f4	[]	["dim_0"]
+
+# One array read alone has no index to take names from, so its dimension
+# columns are positions.
+query II
+SELECT MAX(obs), MAX(X_umap_component) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'obsm/X_umap');
+----
+19	1
+
+query I
+SELECT dtype FROM read_zarr_metadata('test/fixtures/anndata/pbmc_like.zarr') WHERE name = 'var/gene_symbol/values';
+----
+string / |O
+
+# ── The issue #40 query: mean expression of a gene per cell type ──────────────
+# A sparse table omits zeros. Starting from obs with a LEFT JOIN gives one row
+# per cell, so AVG over COALESCE(X, 0) counts them. Cd4 is gene 5, nonzero at
+# cells 0, 5, 10 and 15 with values 6, 56, 106 and 156. T cells (7 of them)
+# hold 6 + 156, B cells (6) 106, NK cells (6) 56, and the cell with no type none.
+query TR
+SELECT o.cell_type, AVG(COALESCE(x.X, 0)) AS mean_cd4
+FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', dims := ['obs']) o
+LEFT JOIN (
+  SELECT x.obs, x.X
+  FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', dims := ['obs', 'var']) x
+  JOIN read_zarr('test/fixtures/anndata/pbmc_like.zarr', dims := ['var']) v USING (var)
+  WHERE v.gene_symbol = 'Cd4'
+) x USING (obs)
+GROUP BY o.cell_type
+ORDER BY o.cell_type NULLS LAST;
+----
+B cell	17.666667
+NK cell	9.333333
+T cell	23.142857
+NULL	0.000000
+
+# ── Mounting the store as a database ──────────────────────────────────────────
+statement ok
+ATTACH ':memory:' AS pbmc;
+
+statement ok
+CREATE VIEW pbmc.main.obs AS SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := '', dims := ['obs']);
+
+statement ok
+CREATE VIEW pbmc.main.var AS SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := '', dims := ['var']);
+
+statement ok
+CREATE VIEW pbmc.main.obs_var AS SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := '', dims := ['obs', 'var']);
+
+statement ok
+CREATE SCHEMA pbmc.layers;
+
+statement ok
+CREATE VIEW pbmc.layers.obs_var AS SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := 'layers', dims := ['obs', 'var']);
+
+# A table in main needs no schema name.
+query TTR
+SELECT o.cell_type, v.gene_symbol, SUM(x.X)
+FROM pbmc.obs_var x
+JOIN pbmc.obs o USING (obs)
+JOIN pbmc.var v USING (var)
+WHERE o.cell_type = 'NK cell' AND v.gene_symbol IN ('Actb', 'Cd4')
+GROUP BY ALL
+ORDER BY ALL;
+----
+NK cell	Actb	51.000000
+NK cell	Cd4	56.000000
+
+# One cell and one gene, filtered by name, with no joins.
+query RR
+SELECT spliced, unspliced FROM pbmc.layers.obs_var WHERE obs = 'cell_0' AND var = 'gene_6';
+----
+7.000000	-7.000000
+
+statement ok
+DETACH pbmc;
+
+# ══ Low level: one array at a time, as a check on the tables ══════════════════
+
+# Listing the whole store includes every component array.
+query I
+SELECT COUNT(*) FROM read_zarr_metadata('test/fixtures/anndata/pbmc_like.zarr')
+WHERE name IN ('X/data', 'X/indices', 'X/indptr', 'var/gene_symbol/values',
+               'var/gene_symbol/mask', 'obs/cell_type/codes',
+               'obs/cell_type/categories', 'obs/n_genes', 'obsm/X_umap');
+----
+9
+
+# ── NULLs, encoding 1: nullable-string-array (values + mask) ──────────────────
+# var/gene_symbol is a group. Read alone, `values` returns '' for the missing gene
+# (index 6). Only the separate `mask` array records that it is missing.
+query I
+SELECT value FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'var/gene_symbol/values') WHERE dim_0 = 6;
+----
+(empty)
+
+query I
+SELECT value FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'var/gene_symbol/mask') WHERE dim_0 = 6;
+----
+true
+
+# Applying the mask gives NULL.
+query II
+SELECT v.dim_0, CASE WHEN m.value THEN NULL ELSE v.value END AS gene_symbol
+FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'var/gene_symbol/values') v
+JOIN read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'var/gene_symbol/mask') m
+  ON v.dim_0 = m.dim_0
+WHERE v.dim_0 IN (0, 5, 6, 7)
+ORDER BY v.dim_0;
+----
+0	Actb
+5	Cd4
+6	NULL
+7	Foxp3
+
+# obs/donor uses the same encoding, all unmasked.
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'obs/donor/values') v
+JOIN read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'obs/donor/mask') m
+  ON v.dim_0 = m.dim_0 WHERE NOT m.value;
+----
+20
+
+# ── NULLs, encoding 2: categorical (codes + categories, code -1 = NULL) ───────
+query I
+SELECT value FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'obs/cell_type/codes') WHERE dim_0 = 4;
+----
+-1
+
+# An inner join of codes to categories drops the missing cell: 19 rows, not 20.
+query I
+SELECT COUNT(*)
+FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'obs/cell_type/codes') codes
+JOIN read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'obs/cell_type/categories') cat
+  ON codes.value = cat.dim_0;
+----
+19
+
+# A LEFT JOIN keeps it as NULL. Check all 20 cells against the generator: cell i is
+# T/B/NK cell for i % 3 = 0/1/2, except cell 4, which is NULL.
+query I
+SELECT COUNT(*) FROM (
+  SELECT codes.dim_0 AS i, cat.value AS decoded
+  FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'obs/cell_type/codes') codes
+  LEFT JOIN read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'obs/cell_type/categories') cat
+    ON codes.value = cat.dim_0
+)
+WHERE decoded IS DISTINCT FROM (
+  CASE WHEN i = 4 THEN NULL
+       WHEN i % 3 = 0 THEN 'T cell'
+       WHEN i % 3 = 1 THEN 'B cell'
+       ELSE 'NK cell' END
+);
+----
+0
+
+# ── sparse X (csr_matrix): components via array_path= ─────────────────────────
+query III
+SELECT
+  (SELECT COUNT(*) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/data')),
+  (SELECT COUNT(*) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/indices')),
+  (SELECT COUNT(*) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/indptr'));
+----
+27	27	21
+
+# ── CSR -> one row per nonzero ────────────────────────────────────────────────
+# Row r owns positions [indptr[r], indptr[r+1]). An empty row repeats an offset,
+# so a plain `ASOF JOIN ... ON pos >= indptr.value` picks between tied rows
+# arbitrarily. Two correct queries follow, and the test asserts they agree:
+#   * a join on the half-open range (easy to check by eye);
+#   * an ASOF JOIN against indptr reduced to the last row per offset (faster;
+#     this is the one docs/anndata.md recommends).
+# Both are CSR-only. For csc_matrix, indptr indexes columns.
+
+# Every nonzero lands on the row and carries the value the generator wrote.
+query II
+WITH bounds AS (
+  SELECT dim_0 AS obs_idx, value AS start_pos, LEAD(value) OVER (ORDER BY dim_0) AS end_pos
+  FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/indptr')
+), csr AS (
+  SELECT b.obs_idx, i.value AS var_idx, d.value AS x_value
+  FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/data') d
+  JOIN read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/indices') i ON d.dim_0 = i.dim_0
+  JOIN bounds b ON d.dim_0 >= b.start_pos AND d.dim_0 < b.end_pos
+)
+SELECT COUNT(*),
+       COUNT(*) FILTER (WHERE NOT ((obs_idx + var_idx) % 5 = 0
+                                   AND x_value = obs_idx * 10 + var_idx + 1
+                                   AND obs_idx NOT IN (7, 8, 19)))
+FROM csr;
+----
+27	0
+
+# The ASOF JOIN puts every nonzero on the same row as the range join, including the
+# positions just after the empty rows.
+query II
+WITH bounds AS (
+  SELECT dim_0 AS obs_idx, value AS start_pos, LEAD(value) OVER (ORDER BY dim_0) AS end_pos
+  FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/indptr')
+), last_row AS (
+  SELECT value AS start_pos, MAX(dim_0) AS obs_idx
+  FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/indptr')
+  GROUP BY value
+), by_range AS (
+  SELECT d.dim_0 AS pos, b.obs_idx
+  FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/data') d
+  JOIN bounds b ON d.dim_0 >= b.start_pos AND d.dim_0 < b.end_pos
+), by_asof AS (
+  SELECT d.dim_0 AS pos, l.obs_idx
+  FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/data') d
+  ASOF JOIN last_row l ON d.dim_0 >= l.start_pos
+)
+SELECT COUNT(*), COUNT(*) FILTER (WHERE r.obs_idx != a.obs_idx)
+FROM by_range r JOIN by_asof a USING (pos);
+----
+27	0
+
+# Cross-check per-row counts against the stored obs/n_genes. The three empty rows
+# must count 0.
+query I
+WITH bounds AS (
+  SELECT dim_0 AS obs_idx, value AS start_pos, LEAD(value) OVER (ORDER BY dim_0) AS end_pos
+  FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/indptr')
+), per_row AS (
+  SELECT b.obs_idx, COUNT(*) AS n
+  FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/data') d
+  JOIN bounds b ON d.dim_0 >= b.start_pos AND d.dim_0 < b.end_pos
+  GROUP BY b.obs_idx
+)
+SELECT COUNT(*)
+FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'obs/n_genes') g
+LEFT JOIN per_row r ON g.obs = r.obs_idx
+WHERE g.value != COALESCE(r.n, 0);
+----
+0
+
+# ── CSR expanded by hand, then decoded by hand ────────────────────────────────
+
+statement ok
+CREATE TEMP TABLE x_data AS
+  SELECT dim_0 AS pos, value FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/data');
+
+statement ok
+CREATE TEMP TABLE x_indices AS
+  SELECT dim_0 AS pos, value AS gene FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/indices');
+
+statement ok
+CREATE TEMP TABLE x_indptr AS
+  SELECT dim_0 AS cell, value AS start_pos FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X/indptr');
+
+statement ok
+CREATE TEMP TABLE x_long AS
+WITH cell_start AS (
+  SELECT start_pos, MAX(cell) AS cell FROM x_indptr GROUP BY start_pos
+)
+SELECT c.cell, i.gene, d.value
+FROM x_data d
+JOIN x_indices i USING (pos)
+ASOF JOIN cell_start c ON d.pos >= c.start_pos;
+
+query II
+SELECT COUNT(*),
+       COUNT(*) FILTER (WHERE NOT ((cell + gene) % 5 = 0
+                                   AND value = cell * 10 + gene + 1
+                                   AND cell NOT IN (7, 8, 19)))
+FROM x_long;
+----
+27	0
+
+# Mean expression per cell type. NK cells are 2, 5, 8, 11, 14, 17 (cell 4 is
+# missing). Gene 6 (missing symbol) is nonzero among them only at cell 14, value
+# 147, so its mean is 147 / 6 = 24.5.
+query TTR
+WITH cell_type AS (
+  SELECT codes.dim_0 AS cell, cat.value AS cell_type
+  FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'obs/cell_type/codes') codes
+  LEFT JOIN read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'obs/cell_type/categories') cat
+    ON codes.value = cat.dim_0
+), gene AS (
+  SELECT v.dim_0 AS gene, CASE WHEN m.value THEN NULL ELSE v.value END AS symbol
+  FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'var/gene_symbol/values') v
+  JOIN read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'var/gene_symbol/mask') m
+    USING (dim_0)
+), cells_per_type AS (
+  SELECT cell_type, COUNT(*) AS n_cells FROM cell_type GROUP BY cell_type
+)
+SELECT ct.cell_type, g.symbol,
+       SUM(x.value) / ANY_VALUE(n.n_cells) AS mean_expression
+FROM x_long x
+JOIN cell_type ct USING (cell)
+JOIN gene g USING (gene)
+JOIN cells_per_type n ON n.cell_type IS NOT DISTINCT FROM ct.cell_type
+WHERE ct.cell_type = 'NK cell'
+GROUP BY ct.cell_type, g.symbol
+ORDER BY g.symbol NULLS LAST;
+----
+NK cell	Actb	8.500000
+NK cell	Cd4	9.333333
+NK cell	Cd8a	19.166667
+NK cell	Gapdh	23.666667
+NK cell	Tp53	33.000000
+NK cell	NULL	24.500000
+
+# The native sparse scan agrees with the hand-written expansion, entry by entry.
+query II
+SELECT COUNT(*), COUNT(*) FILTER (WHERE t.X IS DISTINCT FROM l.value)
+FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', dims := ['obs', 'var']) t
+FULL JOIN x_long l ON t.obs = 'cell_' || l.cell AND t.var = 'gene_' || l.gene;
+----
+27	0

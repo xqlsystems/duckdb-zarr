@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use duckdb::core::{FlatVector, LogicalTypeHandle, LogicalTypeId};
@@ -75,6 +76,13 @@ impl ZarrDtype {
     /// DuckDB output type for this column, accounting for packed-int decoding.
     pub fn to_duckdb_type(&self, encoding: &ColumnEncoding) -> LogicalTypeHandle {
         match encoding {
+            ColumnEncoding::Categorical(categories) => match categories.enum_members() {
+                Some(members) => enum_type(members),
+                None => categories
+                    .values
+                    .dtype
+                    .to_duckdb_type(&categories.values.encoding),
+            },
             ColumnEncoding::PackedInt { .. } => LogicalTypeId::Double.into(),
             // Microseconds since the Unix epoch — DuckDB TIMESTAMP's physical layout.
             ColumnEncoding::CfTime(_) => LogicalTypeId::Timestamp.into(),
@@ -100,12 +108,76 @@ impl ZarrDtype {
 #[derive(Debug, Clone)]
 pub enum ColumnEncoding {
     Plain,
+    /// AnnData `categorical`: the array holds integer codes into `categories`;
+    /// a negative code is a missing value.
+    Categorical(Arc<Categories>),
     PackedInt {
         scale_factor: f64,
         add_offset: f64,
     },
     /// CF-encoded time (`units = "<step> since <reference>"`) → `TIMESTAMP`.
     CfTime(CfTimeEncoding),
+}
+
+/// The categories of an AnnData `categorical`.
+#[derive(Debug)]
+pub struct Categories {
+    /// The categories, written element by element for a non-`ENUM` column.
+    pub values: CoordArray,
+    len: usize,
+    /// The `ENUM` members when the column reads as a DuckDB `ENUM`: the
+    /// categories are strings, distinct, and free of NUL bytes. Other
+    /// categories (integers, say) read as their own type, because an `ENUM`
+    /// holds strings only.
+    enum_members: Option<Vec<String>>,
+}
+
+impl Categories {
+    /// `strings` are the categories when they are strings.
+    pub fn new(values: CoordArray, len: usize, strings: Option<Vec<String>>) -> Self {
+        let enum_members = strings.filter(|s| {
+            let distinct: std::collections::HashSet<&String> = s.iter().collect();
+            !s.is_empty()
+                && distinct.len() == s.len()
+                && u32::try_from(s.len()).is_ok()
+                && s.iter().all(|m| !m.contains('\0'))
+        });
+        Self {
+            values,
+            len,
+            enum_members,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// The `ENUM` members, in code order, if the column reads as an `ENUM`.
+    pub fn enum_members(&self) -> Option<&[String]> {
+        self.enum_members.as_deref()
+    }
+}
+
+/// A DuckDB `ENUM` type with `members` in order, so that member `i` is code `i`.
+fn enum_type(members: &[String]) -> LogicalTypeHandle {
+    use duckdb::ffi::{duckdb_create_enum_type, duckdb_logical_type, idx_t};
+    // duckdb-rs has no public ENUM constructor. LogicalTypeHandle is one
+    // `duckdb_logical_type` field and destroys it on drop, so a handle made
+    // here is owned and freed like any other. The assert catches a future
+    // duckdb-rs that changes the layout.
+    const _: () = assert!(
+        std::mem::size_of::<LogicalTypeHandle>() == std::mem::size_of::<duckdb_logical_type>()
+    );
+    let names: Vec<std::ffi::CString> = members
+        .iter()
+        .map(|m| std::ffi::CString::new(m.as_str()).expect("checked for NUL in Categories::new"))
+        .collect();
+    let mut ptrs: Vec<*const std::os::raw::c_char> = names.iter().map(|n| n.as_ptr()).collect();
+    unsafe {
+        let raw = duckdb_create_enum_type(ptrs.as_mut_ptr(), ptrs.len() as idx_t);
+        std::mem::transmute::<duckdb_logical_type, LogicalTypeHandle>(raw)
+    }
 }
 
 /// Parsed NULL-masking sentinel from CF attrs (`_FillValue` or `missing_value`).
@@ -122,7 +194,17 @@ pub enum FillSentinel {
 /// Describes one output column (either a dim coord or a data variable).
 #[derive(Debug, Clone)]
 pub struct ColumnDef {
+    /// The variable's store-relative path. For an AnnData-encoded variable this
+    /// is the group's path (`obs/cell_type`), not the path of the array that
+    /// holds its values.
     pub name: String,
+    /// The array that holds the values (or codes), when it differs from `name`.
+    pub source: Option<String>,
+    /// An array of the same shape and chunks whose `true` entries are missing
+    /// values (AnnData `nullable-*`).
+    pub mask: Option<String>,
+    /// For a sparse variable read into a dense table: how to scatter it.
+    pub sparse: Option<SparseMatrix>,
     pub on_disk_dtype: ZarrDtype,
     pub encoding: ColumnEncoding,
     pub sentinel: Option<FillSentinel>,
@@ -133,17 +215,59 @@ pub struct ColumnDef {
 }
 
 /// One dim group: arrays sharing an identical ordered dimension set.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DimGroup {
     pub dims: Vec<String>,
     pub shape: Vec<u64>,
     pub chunk_shape: Vec<u64>,
     pub data_var_names: Vec<String>,
-    pub coord_var_names: Vec<String>,
+    /// `(dim, array path)` for each dimension that has a coordinate.
+    pub coords: Vec<(String, String)>,
+    /// Data variables stored as a group of arrays (AnnData encodings), keyed by
+    /// path. Variables not listed here are plain arrays.
+    pub encodings: HashMap<String, VarEncoding>,
     /// Arrays of this table that zarrs cannot open (unsupported data type or
     /// codec), with the error. `read_zarr` fails on such a table rather than
     /// return it without them.
     pub unreadable: Vec<(String, String)>,
+}
+
+impl DimGroup {
+    /// Whether every data variable is a sparse matrix. Such a table has one row
+    /// per stored entry instead of one per cell.
+    pub fn is_sparse(&self) -> bool {
+        !self.data_var_names.is_empty()
+            && self
+                .data_var_names
+                .iter()
+                .all(|name| matches!(self.encodings.get(name), Some(VarEncoding::Sparse(_))))
+    }
+}
+
+/// A variable stored as a group of arrays, as AnnData writes them
+/// (<https://anndata.readthedocs.io/en/stable/fileformat-prose.html>).
+#[derive(Debug, Clone)]
+pub enum VarEncoding {
+    /// `categorical`: integer `codes` into a 1-D `categories` array.
+    Categorical { codes: String, categories: String },
+    /// `nullable-integer`, `nullable-boolean`, `nullable-string-array`:
+    /// `values` plus a boolean `mask` that is `true` where a value is missing.
+    Nullable { values: String, mask: String },
+    /// `csr_matrix` / `csc_matrix`.
+    Sparse(SparseMatrix),
+}
+
+/// A compressed sparse matrix: `data` and `indices` hold the stored entries,
+/// and `indptr[i]..indptr[i + 1]` are the entries of row `i` (CSR) or column
+/// `i` (CSC).
+#[derive(Debug, Clone)]
+pub struct SparseMatrix {
+    /// 0 for CSR (`indptr` runs over rows), 1 for CSC (over columns).
+    pub major_axis: usize,
+    pub data: String,
+    pub indices: String,
+    pub indptr: String,
+    pub shape: Vec<u64>,
 }
 
 /// Decoded element values for one array segment (strategy interface).
@@ -214,6 +338,24 @@ pub struct StringValues {
 impl ColumnValues for StringValues {
     fn write_element(&self, vector: &mut FlatVector<'_>, src_idx: usize, dst: usize) {
         crate::zarr_reader::scan::fill_string_element_pub(vector, &self.strings, src_idx, dst);
+    }
+}
+
+/// Values with a mask: an element whose mask byte is nonzero is NULL (AnnData
+/// `nullable-*`). `mask` has the same layout as the values.
+#[derive(Debug)]
+pub struct MaskedValues {
+    pub values: SharedColumnValues,
+    pub mask: Vec<u8>,
+}
+
+impl ColumnValues for MaskedValues {
+    fn write_element(&self, vector: &mut FlatVector<'_>, src_idx: usize, dst: usize) {
+        if self.mask[src_idx] != 0 {
+            vector.set_null(dst);
+        } else {
+            self.values.write_element(vector, src_idx, dst);
+        }
     }
 }
 

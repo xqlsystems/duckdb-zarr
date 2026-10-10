@@ -14,12 +14,13 @@ use zarrs::array::Array;
 use zarrs::filesystem::FilesystemStore;
 use zarrs::storage::{Bytes, ReadableStorageTraits, StoreKey};
 
+use super::anndata;
 use super::consolidated_store::ConsolidatedCacheStore;
 use super::duckdb_store::DuckDbStore;
 use super::tree;
 use super::types::{
-    ColumnDef, ColumnEncoding, CoordArray, DimGroup, FillSentinel, FixedValues, SharedColumnValues,
-    StringValues, WorkUnit, ZarrDtype,
+    Categories, ColumnDef, ColumnEncoding, CoordArray, DimGroup, FillSentinel, FixedValues,
+    SharedColumnValues, StringValues, VarEncoding, WorkUnit, ZarrDtype,
 };
 
 pub type ZarrStore = Arc<dyn ReadableStorageTraits>;
@@ -441,15 +442,19 @@ pub fn dim_group_for_array(
 ) -> Result<DimGroup, Box<dyn std::error::Error>> {
     let arr = open_array(store, array_name)?;
     let shape = arr.shape().to_vec();
-    let declared = declared_dims(store, &arr, array_name);
+    let declared = declared_dims(store, &arr, array_name)
+        .or_else(|| anndata::axis_names_for_array(store, array_name, shape.len()));
     let chunk_shape = first_chunk_shape(&arr)?;
     // A synthesized `dim_N` is a placeholder, not a name any coordinate array was
     // written under, so only look up coordinates for declared names.
-    let (dims, coord_var_names) = match declared {
+    let (dims, coords) = match declared {
         Some(dims) => {
             let coords = dims
                 .iter()
-                .filter_map(|dim| find_coord_array_path(store, array_names, array_name, dim))
+                .filter_map(|dim| {
+                    find_coord_array_path(store, array_names, array_name, dim)
+                        .map(|path| (dim.clone(), path))
+                })
                 .collect();
             (dims, coords)
         }
@@ -461,18 +466,23 @@ pub fn dim_group_for_array(
         shape,
         chunk_shape,
         data_var_names: vec![array_name.to_string()],
-        coord_var_names,
+        coords,
+        encodings: Default::default(),
         unreadable: Vec::new(),
     })
 }
 
 /// The dimension names that `read_zarr(store, array_path := name)` binds.
 ///
-/// These are the declared names (see [`declared_dims`]) or, for an array that
-/// declares none, `dim_0..dim_{ndim-1}`. `read_zarr_metadata` shows this list in
-/// its `array_path_dims` column.
+/// These are the declared names (see [`declared_dims`]), else the AnnData axis
+/// names for an AnnData element (`obs`, `var`, ...; see
+/// [`anndata::axis_names`]), else `dim_0..dim_{ndim-1}`. `read_zarr_metadata`
+/// shows this list in its `array_path_dims` column.
 pub fn array_path_dims(store: &ZarrStore, arr: &ZarrArray, name: &str) -> Vec<String> {
-    declared_dims(store, arr, name).unwrap_or_else(|| synthesize_dim_names(arr.shape().len()))
+    let ndim = arr.shape().len();
+    declared_dims(store, arr, name)
+        .or_else(|| anndata::axis_names_for_array(store, name, ndim))
+        .unwrap_or_else(|| synthesize_dim_names(ndim))
 }
 
 /// Dimension names that the store itself records for an array: the array's
@@ -881,6 +891,40 @@ pub fn build_work_units(group: &DimGroup) -> Vec<WorkUnit> {
         .collect()
 }
 
+/// Read `arr[start..end]` of a 1-D integer array (a sparse matrix's `indices`
+/// or `indptr`) as `u64`. Negative values are an error.
+pub fn read_index_range(
+    arr: &ZarrArray,
+    name: &str,
+    start: u64,
+    end: u64,
+) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
+    let dtype = parse_dtype(arr, name)?;
+    if !dtype.is_integer() {
+        return Err(format!("'{name}' is not an integer array").into());
+    }
+    if start == end {
+        return Ok(Vec::new());
+    }
+    let subset = zarrs::array::ArraySubset::new_with_ranges(std::slice::from_ref(&(start..end)));
+    let bytes = arr
+        .retrieve_array_subset::<zarrs::array::ArrayBytes<'static>>(&subset)?
+        .into_fixed()
+        .map_err(|_| format!("'{name}' has a variable-length dtype"))?;
+    let size = dtype.byte_size().expect("integer dtypes have a fixed size");
+    bytes
+        .chunks_exact(size)
+        .map(|b| {
+            let v = super::scan::read_int_as_i64_pub(b, &dtype, 0);
+            if v < 0 && !dtype.is_unsigned() {
+                Err(format!("'{name}' holds a negative index").into())
+            } else {
+                Ok(v as u64)
+            }
+        })
+        .collect()
+}
+
 /// Build `ColumnDef`s for one dim group: dims first, then data vars.
 pub fn build_column_defs(
     store: &ZarrStore,
@@ -895,6 +939,9 @@ pub fn build_column_defs(
         if let Some(ca) = coord_arrays.get(dim) {
             cols.push(ColumnDef {
                 name: dim.clone(),
+                source: None,
+                mask: None,
+                sparse: None,
                 on_disk_dtype: ca.dtype.clone(),
                 encoding: ca.encoding.clone(),
                 sentinel: ca.sentinel.clone(),
@@ -906,6 +953,9 @@ pub fn build_column_defs(
             // Mark is_coord=true so decode_work_unit skips it (no zarr array to load).
             cols.push(ColumnDef {
                 name: dim.clone(),
+                source: None,
+                mask: None,
+                sparse: None,
                 on_disk_dtype: ZarrDtype::Int64,
                 encoding: ColumnEncoding::Plain,
                 sentinel: None,
@@ -917,19 +967,102 @@ pub fn build_column_defs(
 
     // Data variable columns.
     for var_name in &group.data_var_names {
-        let arr = open_array(store, var_name)?;
-        let dtype = parse_dtype(&arr, var_name)?;
-        let attrs = arr.attributes().clone();
-        let (encoding, sentinel) = parse_encoding_and_sentinel(&dtype, &attrs, decode_times);
-        let sentinel = sentinel.or_else(|| parse_zarr_fill_sentinel(&arr, &dtype));
-        cols.push(ColumnDef {
-            name: var_name.clone(),
-            on_disk_dtype: dtype,
-            encoding,
-            sentinel,
-            is_coord: false,
-            dim_idx: None,
-        });
+        let col = match group.encodings.get(var_name) {
+            None => {
+                let arr = open_array(store, var_name)?;
+                let dtype = parse_dtype(&arr, var_name)?;
+                let attrs = arr.attributes().clone();
+                let (encoding, sentinel) =
+                    parse_encoding_and_sentinel(&dtype, &attrs, decode_times);
+                let sentinel = sentinel.or_else(|| parse_zarr_fill_sentinel(&arr, &dtype));
+                ColumnDef {
+                    name: var_name.clone(),
+                    source: None,
+                    mask: None,
+                    sparse: None,
+                    on_disk_dtype: dtype,
+                    encoding,
+                    sentinel,
+                    is_coord: false,
+                    dim_idx: None,
+                }
+            }
+            // AnnData encodings mark missing values themselves (a negative
+            // code, a mask), so the Zarr fill value is not a NULL sentinel.
+            Some(VarEncoding::Categorical { codes, categories }) => {
+                let dtype = parse_dtype(&open_array(store, codes)?, codes)?;
+                if !dtype.is_integer() {
+                    return Err(format!("categorical '{var_name}' has non-integer codes").into());
+                }
+                let categories_arr = open_array(store, categories)?;
+                let len = categories_arr.shape().first().copied().unwrap_or(0) as usize;
+                // String categories may become an ENUM, which needs them as strings.
+                let strings = if parse_dtype(&categories_arr, categories)? == ZarrDtype::String {
+                    Some(
+                        categories_arr
+                            .retrieve_array_subset::<Vec<String>>(&categories_arr.subset_all())?,
+                    )
+                } else {
+                    None
+                };
+                let categories = Categories::new(
+                    load_coord_array(store, categories, decode_times)?,
+                    len,
+                    strings,
+                );
+                ColumnDef {
+                    name: var_name.clone(),
+                    source: Some(codes.clone()),
+                    mask: None,
+                    sparse: None,
+                    on_disk_dtype: dtype,
+                    encoding: ColumnEncoding::Categorical(Arc::new(categories)),
+                    sentinel: None,
+                    is_coord: false,
+                    dim_idx: None,
+                }
+            }
+            Some(VarEncoding::Nullable { values, mask }) => {
+                let arr = open_array(store, values)?;
+                let mask_arr = open_array(store, mask)?;
+                // The chunks may differ: the scan then reads both as subsets.
+                if mask_arr.shape() != arr.shape() {
+                    return Err(format!(
+                        "nullable '{var_name}': `mask` and `values` differ in shape"
+                    )
+                    .into());
+                }
+                ColumnDef {
+                    name: var_name.clone(),
+                    source: Some(values.clone()),
+                    mask: Some(mask.clone()),
+                    sparse: None,
+                    on_disk_dtype: parse_dtype(&arr, values)?,
+                    encoding: ColumnEncoding::Plain,
+                    sentinel: None,
+                    is_coord: false,
+                    dim_idx: None,
+                }
+            }
+            Some(VarEncoding::Sparse(matrix)) => {
+                let dtype = parse_dtype(&open_array(store, &matrix.data)?, &matrix.data)?;
+                if dtype == ZarrDtype::String {
+                    return Err(format!("sparse matrix '{var_name}' holds strings").into());
+                }
+                ColumnDef {
+                    name: var_name.clone(),
+                    source: None,
+                    mask: None,
+                    sparse: Some(matrix.clone()),
+                    on_disk_dtype: dtype,
+                    encoding: ColumnEncoding::Plain,
+                    sentinel: None,
+                    is_coord: false,
+                    dim_idx: None,
+                }
+            }
+        };
+        cols.push(col);
     }
 
     Ok(cols)
@@ -1081,11 +1214,7 @@ mod tests {
         let names = vec!["g/X".to_string(), "g/dim_0".to_string()];
         let group = dim_group_for_array(&store, &names, "g/X").unwrap();
         assert_eq!(group.dims, vec!["dim_0", "dim_1"]);
-        assert!(
-            group.coord_var_names.is_empty(),
-            "{:?}",
-            group.coord_var_names
-        );
+        assert!(group.coords.is_empty(), "{:?}", group.coords);
     }
 
     #[test]

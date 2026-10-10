@@ -84,7 +84,10 @@ impl VTab for ReadZarrGroupsVTab {
                     shape: serde_json::to_string(&g.shape).unwrap_or_default(),
                     chunk_shape: serde_json::to_string(&g.chunk_shape).unwrap_or_default(),
                     data_vars: serde_json::to_string(&g.data_var_names).unwrap_or_default(),
-                    coord_vars: serde_json::to_string(&g.coord_var_names).unwrap_or_default(),
+                    coord_vars: serde_json::to_string(
+                        &g.coords.iter().map(|(_, path)| path).collect::<Vec<_>>(),
+                    )
+                    .unwrap_or_default(),
                 }
             };
 

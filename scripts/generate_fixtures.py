@@ -66,6 +66,7 @@ import zarr
 ROOT = pathlib.Path(__file__).parent.parent
 FIXTURES = ROOT / "test" / "fixtures" / "xarray_tutorial"
 BIOIMAGE_FIXTURES = ROOT / "test" / "fixtures" / "bioimage" / "ome_zarr"
+ANNDATA_FIXTURES = ROOT / "test" / "fixtures" / "anndata"
 
 
 def write_zarr(ds: xr.Dataset, name: str, encoding: dict | None = None) -> None:
@@ -83,6 +84,7 @@ def write_zarr(ds: xr.Dataset, name: str, encoding: dict | None = None) -> None:
 # only when the `<name>.zarr.version` file next to it holds the same version;
 # otherwise it is rebuilt. Without this, a copy left over from an older checkout
 # makes the SQL tests fail on value differences that are hard to trace.
+ANNDATA_FIXTURE_VERSION = "5"
 RAGGED_FIXTURE_VERSION = "2"
 DATATREE_FIXTURE_VERSION = "1"
 MANY_TABLES_FIXTURE_VERSION = "1"
@@ -137,9 +139,49 @@ def open_tutorial(name: str, **kwargs) -> xr.Dataset:
     raise last_exc
 
 
+def _check_anndata_layout(dest: pathlib.Path) -> None:
+    """Exit with an error if the installed anndata did not write the layout that
+    test/sql/anndata.test expects: which columns are groups, where the mask and
+    the -1 code are, and the repeated indptr offsets for empty rows."""
+    g = zarr.open_group(str(dest), mode="r", use_consolidated=False)
+
+    def need(cond: bool, what: str) -> None:
+        if not cond:
+            raise SystemExit(
+                f"anndata fixture layout drifted from what test/sql/anndata.test expects: {what}. "
+                "The installed anndata behaves differently; update the generator and tests.")
+
+    need(g["var/gene_symbol"].attrs.get("encoding-type") == "nullable-string-array",
+         "var/gene_symbol is not a nullable-string-array")
+    need(bool(g["var/gene_symbol/mask"][6]) and not any(g["var/gene_symbol/mask"][[0, 5, 7]]),
+         "var/gene_symbol mask should be true only at index 6")
+    need(g["obs/cell_type"].attrs.get("encoding-type") == "categorical"
+         and int(g["obs/cell_type/codes"][4]) == -1,
+         "obs/cell_type should be categorical with code -1 at cell 4")
+    need(g["obs/donor"].attrs.get("encoding-type") == "nullable-string-array",
+         "obs/donor should be a nullable-string-array (all-unique strings)")
+    need(g["X"].attrs.get("encoding-type") == "csr_matrix", "X is not a csr_matrix")
+    indptr = [int(v) for v in g["X/indptr"][:]]
+    need(indptr[7] == indptr[8] == indptr[9] and indptr[19] == indptr[20],
+         "X/indptr should repeat offsets for empty rows 7, 8 and 19")
+    need(g["X/data"].shape == (27,), "X/data should hold 27 nonzeros")
+    need(g["layers/spliced"].attrs.get("encoding-type") == "csr_matrix"
+         and g["layers/unspliced"].attrs.get("encoding-type") == "csr_matrix",
+         "layers spliced and unspliced should be csr_matrix")
+    need(g["obsp/connectivities"].attrs.get("encoding-type") == "csc_matrix",
+         "obsp/connectivities should be a csc_matrix")
+    need(g["varp/corr_csc"].attrs.get("encoding-type") == "csc_matrix"
+         and g["varp/corr"].attrs.get("encoding-type") == "array",
+         "varp should hold a dense corr and a csc_matrix corr_csc")
+    need(g["obs/batch"].attrs.get("encoding-type") == "categorical"
+         and g["obs/batch/categories"].dtype.kind == "i",
+         "obs/batch should be a categorical with integer categories")
+
+
 def main() -> None:
     FIXTURES.mkdir(parents=True, exist_ok=True)
     BIOIMAGE_FIXTURES.mkdir(parents=True, exist_ok=True)
+    ANNDATA_FIXTURES.mkdir(parents=True, exist_ok=True)
 
     # ── synthetic_multichannel (OME-Zarr bioimage) ──────────────────────────
     # A minimal two-channel microscopy image with OME multiscales metadata.
@@ -724,6 +766,117 @@ def main() -> None:
             _rmtree(dest)
         http_ds.to_zarr(dest, zarr_format=3, consolidated=False)
         zarr.consolidate_metadata(str(dest))
+        print(f"  wrote {dest}")
+
+    # ── anndata/pbmc_like (real anndata writer) ──────────────────────────────
+    # Tests: reading an AnnData store with array_path= (issue #40,
+    # test/sql/anndata.test, docs/anndata.md). Written by the real `anndata`
+    # package so the layout matches real stores: no dimension names, string and
+    # categorical columns stored as groups, and a CSR `X`. The data is
+    # deterministic so the tests can check exact values. It includes the cases
+    # that break hand-written SQL without an error:
+    #   * empty rows 7, 8 and 19, so X/indptr repeats offsets;
+    #   * a missing string at var/gene_symbol[6], stored in a separate mask;
+    #   * a missing category at obs/cell_type[4], stored as code -1.
+    # It also has the elements test/sql/anndata_tables.test reads as tables
+    # (design decision 9):
+    #   * layers spliced and unspliced: CSR matrices that store different
+    #     entries, so their table is the union of both;
+    #   * obsp/connectivities: a CSC matrix (indptr runs over columns);
+    #   * varp: a dense array and a CSC matrix of the same shape, so the CSC
+    #     matrix is read densely beside it;
+    #   * obs/batch: a categorical with integer categories.
+    # anndata is imported inside this block so that a missing or broken anndata
+    # breaks only this fixture.
+    print("anndata/pbmc_like (synthetic, real anndata writer)...")
+    dest = ANNDATA_FIXTURES / "pbmc_like.zarr"
+    if fixture_is_current(dest, ANNDATA_FIXTURE_VERSION):
+        print(f"  (cached) {dest}")
+    else:
+        import anndata as ad
+        import pandas as pd
+        import scipy.sparse
+
+        if dest.exists():
+            _rmtree(dest)
+
+        # anndata turns a string column with repeated values into a categorical,
+        # both in the constructor and again in write_zarr. To also get the other
+        # layout for missing strings (a nullable-string-array: values + mask), this
+        # allows nullable strings and disables that conversion for this one object.
+        # cell_type stays categorical, so both layouts are present. These anndata
+        # details can change between releases, so _check_anndata_layout checks
+        # the written store and stops generation if it differs.
+
+        n_obs, n_var = 20, 8
+        empty_rows = {7, 8, 19}
+
+        # Nonzero at (i, j) when (i + j) % 5 == 0 and row i is not empty, with
+        # value i*10 + j + 1. No stored value is 0, so no explicit zeros exist.
+        dense = np.zeros((n_obs, n_var), dtype=np.float32)
+        for i in range(n_obs):
+            for j in range(n_var):
+                if (i + j) % 5 == 0 and i not in empty_rows:
+                    dense[i, j] = i * 10 + j + 1
+        X = scipy.sparse.csr_matrix(dense)
+
+        cell_types = [["T cell", "B cell", "NK cell"][i % 3] for i in range(n_obs)]
+        cell_types[4] = None
+        obs = pd.DataFrame(
+            {
+                "cell_type": pd.Categorical(cell_types),
+                "n_genes": np.asarray((dense > 0).sum(axis=1), dtype=np.int64),
+            },
+            index=[f"cell_{i}" for i in range(n_obs)],
+        )
+        symbols = ["Actb", "Gapdh", "Myc", "Tp53", "Cd8a", "Cd4", None, "Foxp3"]
+        var = pd.DataFrame(
+            {
+                "mean_expr": np.asarray(dense.mean(axis=0), dtype=np.float64),
+            },
+            index=[f"gene_{j}" for j in range(n_var)],
+        )
+        obsm = {"X_umap": np.arange(n_obs * 2, dtype=np.float32).reshape(n_obs, 2)}
+        obs["batch"] = pd.Categorical([2020 + i % 2 for i in range(n_obs)])
+
+        def sparse_from(pred, value, fmt):
+            m = np.zeros((n_obs, n_var), dtype=np.float32)
+            for i in range(n_obs):
+                for j in range(n_var):
+                    if pred(i, j):
+                        m[i, j] = value(i, j)
+            return getattr(scipy.sparse, f"{fmt}_matrix")(m)
+
+        # spliced and unspliced overlap on (i + j) % 6 == 0 only.
+        layers = {
+            "spliced": sparse_from(lambda i, j: (i + j) % 3 == 0, lambda i, j: i + j + 1, "csr"),
+            "unspliced": sparse_from(lambda i, j: (i + j) % 2 == 0, lambda i, j: -(i + j + 1), "csr"),
+        }
+        conn = np.zeros((n_obs, n_obs), dtype=np.float64)
+        for i in range(n_obs):
+            conn[i, (i + 1) % n_obs] = i + 0.5
+        obsp = {"connectivities": scipy.sparse.csc_matrix(conn)}
+        corr = np.arange(n_var * n_var, dtype=np.float64).reshape(n_var, n_var)
+        varp = {
+            "corr": corr,
+            "corr_csc": scipy.sparse.csc_matrix(np.where(corr % 4 == 0, corr, 0.0)),
+        }
+
+        # zarr_write_format=3: anndata 0.12 writes Zarr v2 by default, 0.13 writes v3. Pin
+        # v3 so the on-disk store (and the dtype strings the tests assert) is the same
+        # on every version.
+        with ad.settings.override(allow_write_nullable_strings=True, zarr_write_format=3):
+            adata = ad.AnnData(X=X, obs=obs, var=var, obsm=obsm, layers=layers, obsp=obsp,
+                               varp=varp)
+            adata.var["gene_symbol"] = pd.array(symbols, dtype="string")
+            # Explicit `string` dtype (assigned after construction, like gene_symbol) so
+            # donor is a nullable-string-array on every anndata version: older releases
+            # write an all-unique *object* column as a plain string-array instead.
+            adata.obs["donor"] = pd.array([f"donor_{i:02d}" for i in range(n_obs)], dtype="string")
+            adata.strings_to_categoricals = lambda *args, **kwargs: None
+            adata.write_zarr(dest)
+        _check_anndata_layout(dest)
+        mark_fixture(dest, ANNDATA_FIXTURE_VERSION)
         print(f"  wrote {dest}")
 
     # ── unsupported_dtype (hand-written metadata) ────────────────────────────
