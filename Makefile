@@ -36,9 +36,10 @@ export RUSTUP_TOOLCHAIN := $(WASM_RUST_TOOLCHAIN)
 # emsdk 3.1.71's emcc turns every entry in the linked wasm's target_features section
 # into a `wasm-opt --enable-*` flag, and its binaryen rejects the newer features
 # (bulk-memory-opt, call-indirect-overlong) that recent rustc/LLVM objects carry.
-# Pin the output feature set at link time instead of bumping emsdk, which must
+# Pin the output feature set at link time (and skip wasm-ld's check that every
+# object stays inside it: the extra features are subsets of those listed) instead of bumping emsdk, which must
 # match the emscripten version duckdb-wasm itself was built with.
-export EMCC_CFLAGS := $(EMCC_CFLAGS) -Xlinker --features=bulk-memory,exception-handling,multivalue,mutable-globals,nontrapping-fptoint,reference-types,sign-ext
+export EMCC_CFLAGS := $(EMCC_CFLAGS) -Xlinker --no-check-features -Xlinker --features=bulk-memory,exception-handling,multivalue,mutable-globals,nontrapping-fptoint,reference-types,sign-ext
 endif
 
 configure: venv platform extension_version
