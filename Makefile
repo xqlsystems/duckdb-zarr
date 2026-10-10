@@ -38,7 +38,7 @@ export RUSTUP_TOOLCHAIN := $(WASM_RUST_TOOLCHAIN)
 # (bulk-memory-opt, call-indirect-overlong) that recent rustc/LLVM objects carry.
 # Pin the output feature set at link time instead of bumping emsdk, which must
 # match the emscripten version duckdb-wasm itself was built with.
-export EMCC_CFLAGS := $(EMCC_CFLAGS) -Wl,--features=bulk-memory,exception-handling,multivalue,mutable-globals,nontrapping-fptoint,reference-types,sign-ext
+export EMCC_CFLAGS := $(EMCC_CFLAGS) -Xlinker --features=bulk-memory,exception-handling,multivalue,mutable-globals,nontrapping-fptoint,reference-types,sign-ext
 endif
 
 configure: venv platform extension_version
