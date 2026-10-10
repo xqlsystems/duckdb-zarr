@@ -1,0 +1,19 @@
+{
+  "name": "zarr-map-demo",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@deck.gl/core": "^9.1.0",
+    "@deck.gl/layers": "^9.1.0",
+    "@duckdb/duckdb-wasm": "^1.33.1-dev57.0",
+    "apache-arrow": "^21.0.0"
+  },
+  "devDependencies": {
+    "vite": "^7.0.0"
+  }
+}
