@@ -79,6 +79,27 @@ def write_zarr(ds: xr.Dataset, name: str, encoding: dict | None = None) -> None:
     print(f"  wrote {dest}")
 
 
+# Bump a version when you change what its fixture contains. A fixture is reused
+# only when the `<name>.zarr.version` file next to it holds the same version;
+# otherwise it is rebuilt. Without this, a copy left over from an older checkout
+# makes the SQL tests fail on value differences that are hard to trace.
+RAGGED_FIXTURE_VERSION = "1"
+UNSUPPORTED_FIXTURE_VERSION = "1"
+
+
+def _version_marker(dest: pathlib.Path) -> pathlib.Path:
+    return dest.with_name(dest.name + ".version")
+
+
+def fixture_is_current(dest: pathlib.Path, version: str, sentinel: str = "zarr.json") -> bool:
+    marker = _version_marker(dest)
+    return (dest / sentinel).exists() and marker.exists() and marker.read_text().strip() == version
+
+
+def mark_fixture(dest: pathlib.Path, version: str) -> None:
+    _version_marker(dest).write_text(version + "\n")
+
+
 def ensure_attr(ds: xr.Dataset, var: str, key: str, value) -> xr.Dataset:
     """Add key=value to da.attrs; restores attrs xarray moved to encoding."""
     da = ds[var].copy()
@@ -378,7 +399,7 @@ def main() -> None:
         xr.Dataset({"gene_symbol": gene_symbol_da}).to_zarr(
             dest, zarr_format=2, consolidated=False)
         print(f"  wrote {dest}")
-    
+
     # ── cf_time (synthetic) ──────────────────────────────────────────────────
     # Tests: CF time decoding to DuckDB TIMESTAMP.
     #   (time, lat)        — int64 "hours since 1900-01-01 00:00:00", the
@@ -700,6 +721,73 @@ def main() -> None:
             _rmtree(dest)
         http_ds.to_zarr(dest, zarr_format=3, consolidated=False)
         zarr.consolidate_metadata(str(dest))
+        print(f"  wrote {dest}")
+
+    # ── unsupported_dtype (hand-written metadata) ────────────────────────────
+    # Tests: read_zarr_metadata lists an array zarrs cannot open (unknown dtype)
+    # as role='unsupported' instead of failing the whole call, while the good
+    # array beside it is still listed normally. `good` declares no dimension
+    # names, as in a store written by plain zarr-python (test/sql/unnamed_arrays.test).
+    print("unsupported_dtype (synthetic)...")
+    dest = FIXTURES / "unsupported_dtype.zarr"
+    if fixture_is_current(dest, UNSUPPORTED_FIXTURE_VERSION):
+        print(f"  (cached) {dest}")
+    else:
+        import json
+        if dest.exists():
+            _rmtree(dest)
+
+        def _array_json(data_type, fill_value):
+            return {
+                "zarr_format": 3, "node_type": "array", "shape": [4],
+                "data_type": data_type,
+                "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [4]}},
+                "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+                "fill_value": fill_value,
+                "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}],
+                "attributes": {},
+            }
+
+        for rel, doc in {
+            "": {"zarr_format": 3, "node_type": "group", "attributes": {}},
+            "good": _array_json("float32", 0.0),
+            "bad": _array_json("not_a_real_dtype", 0),
+        }.items():
+            d = dest / rel
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "zarr.json").write_text(json.dumps(doc))
+        mark_fixture(dest, UNSUPPORTED_FIXTURE_VERSION)
+        print(f"  wrote {dest}")
+
+    # ── ragged_chunks (synthetic) ────────────────────────────────────────────
+    # Tests: boundary chunks whose extent is smaller than the nominal chunk shape —
+    # every other fixture is a single chunk. zarrs pads a boundary chunk's element
+    # buffer to the full nominal shape (design.md §Variable-length strings), for
+    # strings as much as numbers, and the reader's offset math must skip the padding.
+    #   s, v  (r=5, c=3), chunks (2, 2): ragged in BOTH dims; s is a string array
+    #   t     (i=10),     chunks (4,):   ragged 1-D string array (4, 4, 2)
+    #   x27   (n=27),     chunks (10,):  ragged 1-D float32, the shape of a CSR X/data
+    print("ragged_chunks (synthetic)...")
+    dest = FIXTURES / "ragged_chunks.zarr"
+    if fixture_is_current(dest, RAGGED_FIXTURE_VERSION):
+        print(f"  (cached) {dest}")
+    else:
+        if dest.exists():
+            _rmtree(dest)
+        rr, cc = np.meshgrid(np.arange(5), np.arange(3), indexing="ij")
+        ds_ragged = xr.Dataset({
+            "s": xr.DataArray(
+                np.array([[f"s{r}{c}" for c in range(3)] for r in range(5)], dtype=object),
+                dims=["r", "c"]),
+            "v": xr.DataArray((rr * 10 + cc).astype("float32"), dims=["r", "c"]),
+            "t": xr.DataArray(np.array([f"t{i}" for i in range(10)], dtype=object), dims=["i"]),
+            "x27": xr.DataArray((np.arange(27) * 2).astype("float32"), dims=["n"]),
+        })
+        ds_ragged.to_zarr(
+            dest, zarr_format=3, consolidated=False,
+            encoding={"s": {"chunks": (2, 2)}, "v": {"chunks": (2, 2)},
+                      "t": {"chunks": (4,)}, "x27": {"chunks": (10,)}})
+        mark_fixture(dest, RAGGED_FIXTURE_VERSION)
         print(f"  wrote {dest}")
 
     # ── anndata (real, non-synthetic) ────────────────────────────────────────

@@ -4,7 +4,7 @@ use duckdb::core::{FlatVector, LogicalTypeHandle, LogicalTypeId};
 
 use super::cftime::CfTimeEncoding;
 
-/// On-disk Zarr numeric dtype as reported by zarrs `DataType::to_string()`.
+/// On-disk Zarr dtype as reported by zarrs `DataType::to_string()`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ZarrDtype {
     Bool,
