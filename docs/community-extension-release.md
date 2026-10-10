@@ -102,9 +102,10 @@ extension:
   requires_toolchains: "rust;python3"
 ```
 
-The descriptor excludes `wasm_mvp`, `wasm_eh`, `wasm_threads`, and
-`linux_amd64_musl`. The local distribution workflow uses the same exclusion set.
-Re-enable platforms only after the CI build and SQLLogic tests pass for them.
+The descriptor excludes only `linux_amd64_musl`. The local distribution workflow
+uses the same exclusion set. The `wasm_mvp`, `wasm_eh`, and `wasm_threads`
+platforms are built and tested by CI; re-add one to the exclusions if it stops
+passing.
 
 ## Submission Steps
 
