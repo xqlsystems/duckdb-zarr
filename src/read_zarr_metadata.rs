@@ -8,6 +8,7 @@ use crate::zarr_reader::meta::{
     is_unsupported_array_error, list_array_names, open_array, open_store, select_array_name,
     ArrayFacts,
 };
+use crate::zarr_reader::{anndata, tree};
 
 /// One metadata row per array.
 #[derive(Debug, Clone)]
@@ -67,7 +68,7 @@ impl VTab for ReadZarrMetaVTab {
         if array_path.is_some() && array_alias.is_some() {
             return Err("use either array_path= or \"array\"=, not both".into());
         }
-        let requested_group = crate::zarr_reader::tree::group_param(bind)?;
+        let requested_group = tree::group_param(bind)?;
         let requested_array = array_path.or(array_alias);
         if requested_group.is_some() && requested_array.is_some() {
             return Err("use either group_path= or array_path=, not both".into());
@@ -79,18 +80,14 @@ impl VTab for ReadZarrMetaVTab {
         // subgroups. In an AnnData store that is the node read_zarr reads each
         // array's variable from: the obs and var columns are in the root, and the
         // arrays of an encoded group (X/data, obs/cell_type/codes) go with it.
+        // The AnnData layout (None for other stores), read once for all arrays.
+        let layout = anndata::layout(&store, &array_names);
         if let Some(node) = requested_group {
-            crate::zarr_reader::tree::ensure_group_exists(&store_path, &array_names, &node)?;
-            match crate::zarr_reader::anndata::layout(&store, &array_names) {
-                Some(layout) => {
-                    crate::zarr_reader::anndata::check_not_folded(
-                        &store_path,
-                        Some(&layout),
-                        &node,
-                    )?;
-                    array_names.retain(|name| layout.node_of_array(name) == node);
-                }
-                None => array_names.retain(|name| crate::zarr_reader::tree::node_of(name) == node),
+            tree::ensure_group_exists(&store_path, &array_names, &node)?;
+            anndata::check_not_folded(&store_path, layout.as_ref(), &node)?;
+            match &layout {
+                Some(layout) => array_names.retain(|name| layout.node_of_array(name) == node),
+                None => array_names.retain(|name| tree::node_of(name) == node),
             }
         }
 
@@ -147,7 +144,7 @@ impl VTab for ReadZarrMetaVTab {
             };
 
             let dims = get_dim_names(arr, name).unwrap_or_default();
-            let bound_dims = array_path_dims(&store, arr, name);
+            let bound_dims = array_path_dims(&store, layout.as_ref(), arr, name);
             let dtype_str = arr.data_type().to_string();
             let attrs = arr.attributes().clone();
 

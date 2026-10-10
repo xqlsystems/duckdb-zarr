@@ -478,10 +478,21 @@ pub fn dim_group_for_array(
 /// names for an AnnData element (`obs`, `var`, ...; see
 /// [`anndata::axis_names`]), else `dim_0..dim_{ndim-1}`. `read_zarr_metadata`
 /// shows this list in its `array_path_dims` column.
-pub fn array_path_dims(store: &ZarrStore, arr: &ZarrArray, name: &str) -> Vec<String> {
+/// `layout` is the store's AnnData layout ([`anndata::layout`], `None` for other
+/// stores). The caller reads it once, so listing many arrays does not read the
+/// root and each ancestor group again for every array.
+pub fn array_path_dims(
+    store: &ZarrStore,
+    layout: Option<&anndata::Layout>,
+    arr: &ZarrArray,
+    name: &str,
+) -> Vec<String> {
     let ndim = arr.shape().len();
     declared_dims(store, arr, name)
-        .or_else(|| anndata::axis_names_for_array(store, name, ndim))
+        .or_else(|| {
+            let layout = layout?;
+            anndata::axis_names(name, ndim, |g| layout.encoding_of(g))
+        })
         .unwrap_or_else(|| synthesize_dim_names(ndim))
 }
 
@@ -996,20 +1007,26 @@ pub fn build_column_defs(
                 }
                 let categories_arr = open_array(store, categories)?;
                 let len = categories_arr.shape().first().copied().unwrap_or(0) as usize;
-                // String categories may become an ENUM, which needs them as strings.
-                let strings = if parse_dtype(&categories_arr, categories)? == ZarrDtype::String {
-                    Some(
-                        categories_arr
-                            .retrieve_array_subset::<Vec<String>>(&categories_arr.subset_all())?,
-                    )
-                } else {
-                    None
-                };
-                let categories = Categories::new(
-                    load_coord_array(store, categories, decode_times)?,
-                    len,
-                    strings,
-                );
+                // String categories may become an ENUM, which needs them as
+                // strings. They are read once and serve as the values as well;
+                // a string array has no sentinel or CF encoding to apply.
+                let (values, strings) =
+                    if parse_dtype(&categories_arr, categories)? == ZarrDtype::String {
+                        let strings = categories_arr
+                            .retrieve_array_subset::<Vec<String>>(&categories_arr.subset_all())?;
+                        let values = CoordArray {
+                            dtype: ZarrDtype::String,
+                            encoding: ColumnEncoding::Plain,
+                            sentinel: None,
+                            data: Arc::new(StringValues {
+                                strings: strings.clone(),
+                            }),
+                        };
+                        (values, Some(strings))
+                    } else {
+                        (load_coord_array(store, categories, decode_times)?, None)
+                    };
+                let categories = Categories::new(values, len, strings);
                 ColumnDef {
                     name: var_name.clone(),
                     source: Some(codes.clone()),
@@ -1190,7 +1207,7 @@ mod tests {
         });
         let arr = open_array(&store, "X").unwrap();
         let group = dim_group_for_array(&store, &["X".to_string()], "X").unwrap();
-        assert_eq!(array_path_dims(&store, &arr, "X"), group.dims);
+        assert_eq!(array_path_dims(&store, None, &arr, "X"), group.dims);
         assert_eq!(group.dims, vec!["dim_0", "dim_1"]);
     }
 

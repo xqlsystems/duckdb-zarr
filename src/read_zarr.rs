@@ -40,6 +40,9 @@ pub struct ReadZarrBind {
     /// For a table of sparse matrices only: ranges of the matrices' major axis,
     /// one per work unit, in place of `work_units`.
     pub sparse_blocks: Option<Vec<(u64, u64)>>,
+    /// For a table of sparse matrices only: the axis that `indptr` indexes
+    /// (0 for CSR, 1 for CSC), the same for every matrix of the table.
+    pub sparse_major_axis: usize,
     pub work_units: Vec<WorkUnit>,
     pub next_unit: AtomicUsize,
 }
@@ -75,6 +78,9 @@ pub struct ReadZarrInit {
     /// Maps schema column index → output-vector index (sorted by schema index).
     /// Explicit mapping avoids any assumption about the order DuckDB returns projected indices.
     pub projected_cols: HashMap<usize, usize>,
+    /// For each data column, in order, whether it is projected. A sparse table
+    /// skips reading the values of the others.
+    pub projected_vars: Vec<bool>,
     pub inner: Mutex<LocalState>,
 }
 
@@ -281,8 +287,16 @@ impl VTab for ReadZarrVTab {
             .enumerate()
             .map(|(out_idx, col_idx)| (col_idx as usize, out_idx))
             .collect();
+        let projected_vars = bind
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.is_coord)
+            .map(|(i, _)| projected_cols.contains_key(&i))
+            .collect();
         Ok(ReadZarrInit {
             projected_cols,
+            projected_vars,
             inner: Mutex::new(LocalState {
                 current_unit_idx: usize::MAX,
                 current_chunk_values: HashMap::new(),
@@ -321,15 +335,11 @@ impl VTab for ReadZarrVTab {
                     break;
                 }
                 if let Some(blocks) = &bind.sparse_blocks {
-                    let projected_vars: Vec<bool> = bind
-                        .columns
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, c)| !c.is_coord)
-                        .map(|(i, _)| projected.contains_key(&i))
-                        .collect();
-                    let block =
-                        decode_block(&bind.sparse_inputs(), blocks[unit_idx], &projected_vars)?;
+                    let block = decode_block(
+                        &bind.sparse_inputs(),
+                        blocks[unit_idx],
+                        &init.projected_vars,
+                    )?;
                     state.chunk_rows = block.len();
                     state.current_sparse = block;
                     state.current_unit_idx = unit_idx;
@@ -517,6 +527,7 @@ fn finish_bind(
 
     // A table of sparse matrices only has one row per stored entry, read in
     // blocks of the major axis. Every matrix must be stored the same way.
+    let mut sparse_major_axis = 0;
     let sparse_blocks = if group.is_sparse() {
         let inputs: Vec<&SparseInput> = columns
             .iter()
@@ -534,6 +545,7 @@ fn finish_bind(
             )
             .into());
         }
+        sparse_major_axis = inputs[0].matrix.major_axis;
         Some(plan_blocks(&inputs, SPARSE_BLOCK_ENTRIES))
     } else {
         None
@@ -551,6 +563,7 @@ fn finish_bind(
         masks,
         sparse,
         sparse_blocks,
+        sparse_major_axis,
         work_units,
         next_unit: AtomicUsize::new(0),
     })
@@ -807,7 +820,7 @@ fn fill_sparse_rows(
     n_rows: usize,
     projected: &HashMap<usize, usize>,
 ) {
-    let major_axis = bind.sparse_inputs()[0].matrix.major_axis;
+    let major_axis = bind.sparse_major_axis;
     let mut var_idx = 0usize;
     for (col_idx, col_def) in bind.columns.iter().enumerate() {
         let this_var = (!col_def.is_coord).then(|| {
@@ -818,25 +831,33 @@ fn fill_sparse_rows(
             continue;
         };
         let mut vector = output.flat_vector(out_vec_idx);
-        for i in 0..n_rows {
-            let (row, dst) = (row_start + i, vector_base + i);
-            if let Some(dim_k) = col_def.dim_idx {
-                let index = if dim_k == major_axis {
-                    block.major[row]
-                } else {
-                    block.minor[row]
-                } as usize;
-                match bind.coord_arrays.get(&col_def.name) {
-                    Some(ca) => ca.data.write_element(&mut vector, index, dst),
-                    None => unsafe {
-                        *vector.as_mut_ptr::<i64>().add(dst) = index as i64;
-                    },
+        let rows = row_start..row_start + n_rows;
+        if let Some(dim_k) = col_def.dim_idx {
+            let indices = if dim_k == major_axis {
+                &block.major[rows]
+            } else {
+                &block.minor[rows]
+            };
+            match bind.coord_arrays.get(&col_def.name) {
+                Some(ca) => {
+                    for (i, &index) in indices.iter().enumerate() {
+                        ca.data
+                            .write_element(&mut vector, index as usize, vector_base + i);
+                    }
                 }
-            } else if let Some(Some(values)) = this_var.map(|v| &block.values[v]) {
-                let size = col_def
-                    .on_disk_dtype
-                    .byte_size()
-                    .expect("sparse data has a fixed-width dtype");
+                None => {
+                    let slot = unsafe { vector.as_mut_ptr::<i64>() };
+                    for (i, &index) in indices.iter().enumerate() {
+                        unsafe { *slot.add(vector_base + i) = index as i64 };
+                    }
+                }
+            }
+        } else if let Some(Some(values)) = this_var.map(|v| &block.values[v]) {
+            let size = col_def
+                .on_disk_dtype
+                .byte_size()
+                .expect("sparse data has a fixed-width dtype");
+            for (i, row) in rows.enumerate() {
                 crate::zarr_reader::scan::fill_scalar_element_pub(
                     &mut vector,
                     values,
@@ -844,7 +865,7 @@ fn fill_sparse_rows(
                     &None,
                     row,
                     size,
-                    dst,
+                    vector_base + i,
                 );
             }
         }
