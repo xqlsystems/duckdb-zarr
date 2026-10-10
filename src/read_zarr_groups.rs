@@ -4,7 +4,7 @@ use duckdb::core::LogicalTypeId;
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
 
 use crate::zarr_reader::meta::{
-    dim_group_for_array, extract_file_system, list_array_names, open_store, select_array_name,
+    array_path_group, extract_file_system, list_array_names, open_store,
 };
 use crate::zarr_reader::tree::{self, StoreTree};
 
@@ -84,21 +84,29 @@ impl VTab for ReadZarrGroupsVTab {
                     shape: serde_json::to_string(&g.shape).unwrap_or_default(),
                     chunk_shape: serde_json::to_string(&g.chunk_shape).unwrap_or_default(),
                     data_vars: serde_json::to_string(&g.data_var_names).unwrap_or_default(),
-                    coord_vars: serde_json::to_string(&g.coord_var_names).unwrap_or_default(),
+                    coord_vars: serde_json::to_string(
+                        &g.coords.iter().map(|(_, path)| path).collect::<Vec<_>>(),
+                    )
+                    .unwrap_or_default(),
                 }
             };
 
         let mut rows = Vec::new();
         if let Some(requested) = requested_array {
             // One array is not a table of its group, so it gets no table name.
-            let array_name = select_array_name(&array_names, &requested)?;
-            let g = dim_group_for_array(&store, &array_names, &array_name)?;
+            let (array_name, g) = array_path_group(&store, &array_names, &requested)?;
             rows.push(row(tree::node_of(&array_name), None, &g));
         } else {
             let store_tree = match &requested_group {
                 Some(node) => {
                     tree::ensure_group_exists(&store_path, &array_names, node)?;
-                    StoreTree::load_for_node(&store, &array_names, node)?
+                    let store_tree = StoreTree::load_for_node(&store, &array_names, node)?;
+                    crate::zarr_reader::anndata::check_group_path(
+                        &store_path,
+                        store_tree.layout.as_ref(),
+                        node,
+                    )?;
+                    store_tree
                 }
                 None => StoreTree::load(&store, &array_names, None)?,
             };
@@ -115,7 +123,7 @@ impl VTab for ReadZarrGroupsVTab {
                 let aligned = node_groups.misaligned.is_none();
                 let names = tree::table_names(&node_groups.groups);
                 for (g, name) in node_groups.groups.iter().zip(names) {
-                    let readable = aligned && g.unreadable.is_empty();
+                    let readable = aligned && g.unreadable.is_empty() && !g.mixes_sparse_storage();
                     rows.push(row(&node, name.filter(|_| readable), g));
                 }
             }

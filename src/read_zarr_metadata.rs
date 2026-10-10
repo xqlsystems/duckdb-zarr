@@ -8,6 +8,7 @@ use crate::zarr_reader::meta::{
     is_unsupported_array_error, list_array_names, open_array, open_store, select_array_name,
     ArrayFacts,
 };
+use crate::zarr_reader::{anndata, tree};
 
 /// One metadata row per array.
 #[derive(Debug, Clone)]
@@ -67,18 +68,40 @@ impl VTab for ReadZarrMetaVTab {
         if array_path.is_some() && array_alias.is_some() {
             return Err("use either array_path= or \"array\"=, not both".into());
         }
-        let requested_group = crate::zarr_reader::tree::group_param(bind)?;
+        let requested_group = tree::group_param(bind)?;
         let requested_array = array_path.or(array_alias);
         if requested_group.is_some() && requested_array.is_some() {
             return Err("use either group_path= or array_path=, not both".into());
         }
         if let Some(requested) = requested_array {
-            array_names = vec![select_array_name(&array_names, &requested)?];
+            // An AnnData encoded variable lists the arrays it is made of.
+            let prefix = format!("{}/", requested.trim().trim_matches('/'));
+            let encoded = !array_names.iter().any(|n| format!("{n}/") == prefix)
+                && array_names.iter().any(|n| n.starts_with(&prefix))
+                && anndata::layout(&store, &array_names).is_some_and(|layout| {
+                    layout
+                        .encoding_of(prefix.trim_end_matches('/'))
+                        .is_some_and(|e| anndata::is_variable_encoding(&e))
+                });
+            if encoded {
+                array_names.retain(|n| n.starts_with(&prefix));
+            } else {
+                array_names = vec![select_array_name(&array_names, &requested)?];
+            }
         }
-        // group_path= lists the arrays directly in that group, not in its subgroups.
+        // group_path= lists the arrays of that node's tables, not of its
+        // subgroups. In an AnnData store that is the node read_zarr reads each
+        // array's variable from: the obs and var columns are in the root, and the
+        // arrays of an encoded group (X/data, obs/cell_type/codes) go with it.
+        // The AnnData layout (None for other stores), read once for all arrays.
+        let layout = anndata::layout(&store, &array_names);
         if let Some(node) = requested_group {
-            crate::zarr_reader::tree::ensure_group_exists(&store_path, &array_names, &node)?;
-            array_names.retain(|name| crate::zarr_reader::tree::node_of(name) == node);
+            tree::ensure_group_exists(&store_path, &array_names, &node)?;
+            anndata::check_group_path(&store_path, layout.as_ref(), &node)?;
+            match &layout {
+                Some(layout) => array_names.retain(|name| layout.node_of_array(name) == node),
+                None => array_names.retain(|name| tree::node_of(name) == node),
+            }
         }
 
         // Open every array once. One with a data type or codec that zarrs cannot
@@ -134,7 +157,7 @@ impl VTab for ReadZarrMetaVTab {
             };
 
             let dims = get_dim_names(arr, name).unwrap_or_default();
-            let bound_dims = array_path_dims(&store, arr, name);
+            let bound_dims = array_path_dims(&store, layout.as_ref(), arr, name);
             let dtype_str = arr.data_type().to_string();
             let attrs = arr.attributes().clone();
 

@@ -489,6 +489,8 @@ AnnData and plain zarr-python write neither `dimension_names` nor `_ARRAY_DIMENS
 > **Decision:** When `array_path=` selects one array that declares no dimension names (and has no OME `multiscales.axes`), name its dimensions `dim_0..dim_{ndim-1}` (`synthesize_dim_names` in `meta.rs`). Whole-store enumeration (`read_zarr(store)`, the replacement scan, `read_zarr_groups` without `array_path=`) does not do this. Since decision 8 it leaves such arrays out of every table, and a group with no other data fails with an error that names them and suggests `array_path=`.
 >
 > **Why only for `array_path=`:** a placeholder name carries no meaning. If enumeration gave placeholder names to every unnamed array, two unrelated arrays of the same length would both get `dim_0`, land in the same dim group, and be joined row by row. That returns wrong data with no error. With `array_path=` the user picks exactly one array, so nothing can be misaligned. For the same reason, a synthesized name never binds a coordinate array, even if a sibling array is called `dim_0`.
+>
+> **Superseded in part by decision 9**, which names AnnData's axes for `array_path=` reads too, so `obs/n_genes` now binds `obs` rather than `dim_0`. The arrays inside an encoded group keep `dim_N`.
 
 Two changes to `read_zarr_metadata` support this:
 
@@ -535,7 +537,48 @@ WHERE table_name IS NOT NULL;
 
 **Mounting: why there is no `zarr_attach`.** A procedure such as `CALL zarr_attach('sim.zarr', 'sim')` that creates the schemas and views was spiked on 2026-09-29 (branch `spike-zarr-attach`) and rejected. The C API at DuckDB 1.5.5 has no storage-extension hook and no way to run SQL on the calling connection, so the procedure needs a second connection. The extension can get a database handle only while it loads: `get_database` returns a wrapper that DuckDB frees when loading ends (`extension_load.cpp`). So the connection must be opened at load and kept. The DDL itself worked: views mounted, a quoted `"demo/nested"` schema worked, and it ran inside `BEGIN ... COMMIT` and was visible to other connections. But the kept connection holds a strong reference to the database instance, and the function catalog that holds the connection belongs to that instance, so the instance is never freed. After `close()`, the database file stays locked against other processes, and reopening it in the same process hangs. This affects everyone who loads the extension, not only users of the procedure. A control build without the side connection released the file normally. Revisit if the C API gains storage extensions, a way to run SQL on a client context, or a callback when a database closes.
 
-**AnnData under this model.** An AnnData store maps onto the tree: `obs` and `var` are nodes, `X`, `layers` and `obsm` share their axes. Two pieces stay AnnData-specific and come after this decision: naming the axes (AnnData writes no dimension names; anndata's own `read_lazy` names an `obs`/`var` data frame's dimension after its `_index` attribute), and decoding group-encoded variables (`categorical`, `nullable-*`, `csr_matrix`/`csc_matrix`) into single columns.
+**AnnData under this model.** An AnnData store maps onto the tree: `obs` and `var` are nodes, `X`, `layers` and `obsm` share their axes. The two AnnData-specific pieces, naming the axes and decoding group-encoded variables, are decision 9.
+
+### 9. AnnData stores: a DataTree with named axes, the obs and var frames at the root, and decoded encodings
+
+Decision 8 reads any nested store as a tree of tables, but an AnnData store needs more before its tables mean anything. AnnData writes no dimension names, so every array was left out of every table. AnnData stores several kinds of variable as a group of arrays (its [on-disk format](https://anndata.readthedocs.io/en/stable/fileformat-prose.html)): a categorical is `codes` plus `categories`, a nullable column is `values` plus `mask`, and a sparse matrix is `data`, `indices` and `indptr`. Read as plain arrays, these give codes instead of labels, `''` instead of NULL, and three unaligned arrays instead of a matrix. And the groups on disk are not the shape users think in: `obs` as a node of its own gives a table `obs.obs` whose rows are joined to `X` through an `_index` column. The issue #40 thread showed that users can decode all of it in SQL, but the queries are long, and two easy mistakes return wrong data with no error: reading a nullable column's `values` without its `mask` gives `''` for NULL, and an `ASOF JOIN` to `indptr` picks arbitrarily between the tied offsets of empty rows.
+
+> **Decision:** When the root group has `encoding-type: anndata`, apply an AnnData layer on top of decision 8 (`src/zarr_reader/anndata.rs`). One schema per group, tables named by dims, inherited coordinates and the catalog in `read_zarr_groups` all stay. Other stores pay for no extra metadata reads.
+>
+> - **Name the axes by element.** An element that declares no dimension names gets them from its place in the object:
+>
+>   | Element | Dimensions | Table |
+>   |---|---|---|
+>   | `X` | `obs`, `var` | `main.obs_var` |
+>   | `obs/*` | `obs` | `main.obs` |
+>   | `var/*` | `var` | `main.var` |
+>   | `layers/*` | `obs`, `var` | `layers.obs_var` |
+>   | `obsm/<k>` | `obs`, `<k>_component` | `obsm.obs_<k>_component` |
+>   | `varm/<k>` | `var`, `<k>_component` | `varm.var_<k>_component` |
+>   | `obsm/<df>/*`, `varm/<df>/*` | `obs` or `var` | `"obsm/<df>".obs`, ... |
+>   | `obsp/*` | `obs_i`, `obs_j` | `obsp.obs_i_obs_j` |
+>   | `varp/*` | `var_i`, `var_j` | `varp.var_i_var_j` |
+>   | `raw/X` | `obs`, `raw_var` | `raw.obs_raw_var` |
+>   | `raw/var/*` | `raw_var` | `raw.raw_var` |
+>
+>   An `obsm` entry with more than two dimensions gets `<k>_component_1`, `<k>_component_2`, and so on. Names apply only where every group between the root and the element is a container (`dict`, `dataframe`, `raw`). The arrays inside an encoded variable, awkward arrays and `uns` get none. `uns` is skipped entirely during enumeration: it has no axes and often holds arrays zarrs cannot open. `array_path=` binds the same names, which replaces the `dim_N` names decision 7 gave these arrays.
+> - **Read `obs` and `var` as tables of the root group.** Their columns are variables of the root node, beside `X`, and `raw/var`'s are variables of `raw`, beside `raw/X` (`logical_node`). The other groups (`layers`, `obsm`, `obsp`, `raw`, ...) stay nodes. `read_zarr(store, group_path := 'obs')` fails with a pointer to `dims := ['obs']`, and so do `read_zarr_groups` and `read_zarr_metadata`; `read_zarr_metadata(group_path := '/')` lists the arrays of the root's variables, including the obs and var columns and the arrays inside encoded groups (`Layout::node_of_array`). A column that is folded into its parent node is never a dimension coordinate, even when it has its axis's name; such a column (`obs/obs`) is named by its store path, because its basename would collide with the dimension column.
+> - **Make each data frame's index the coordinate of its axis.** The column its `_index` attribute names (usually `_index`) is not a data column. It is the coordinate of `obs` (or `var`, `raw_var`) in the frame's node, so the `obs` column holds cell names in every table that has the dimension, through decision 8's inheritance. `obs_i` and `obs_j` take the `obs` coordinate, and `var_i` and `var_j` the `var` coordinate (`COORDINATE_ALIASES`).
+> - **List a data frame's columns in its `column-order`**, as `adata.obs` does; other variables stay in path order.
+> - **Read each encoded group as one variable.** `categorical` reads as an `ENUM` of its categories when they are distinct strings, and as the categories' own type otherwise (an `ENUM` holds strings only). A negative code is NULL. `nullable-integer`, `nullable-boolean` and `nullable-string-array` read as `values` with NULL where `mask` is true. The Zarr fill value is not a NULL sentinel for these: the encoding says what is missing.
+> - **A table's rows are the cells its variables store.** A dense array stores every cell, a sparse matrix (`csr_matrix`, `csc_matrix`) only its entries. A table of sparse matrices alone therefore has one row per stored entry, the union over its matrices, with 0 for a matrix that has nothing at a row another matrix stores (the true value of that cell). A sparse matrix in a table with a dense array of the same dims and shape is read densely, one row per cell, because the dense array needs every row anyway.
+>
+> **Why `obs` and `var` at the root:** they annotate the two axes of `X`. As nodes of their own they gave the tables `obs.obs` and `var.var`, and a root with no `obs` coordinate for `X` to inherit. At the root they are what an xarray `Dataset` of an AnnData object would hold: `X(obs, var)`, `cell_type(obs)`, `gene_symbol(var)`.
+>
+> **Why names, not positions, in the dimension columns:** with the index as the coordinate, every table can be filtered and joined by cell or gene name (`WHERE obs = 'AAACATACAACCAC-1' AND var = 'MKI67'`) with no lookup join. The cost is that joins compare strings, and a store with duplicate names makes a join return extra rows. anndata warns about duplicate names and `obs_names_make_unique()` is a standard step, so the guide documents the risk instead of falling back to positions, which would make a column's type depend on the data. `array_path=` reads still give positions. anndata's own `read_lazy` names an `obs` frame's dimension after its `_index` attribute, which is usually `_index` for `var` too; that works for one frame at a time, not for a tree where `X` shares an axis with each.
+>
+> **Why `<k>_component` and `obs_i`/`obs_j`:** the second axis of an `obsm` entry is its components (of a UMAP, a PCA) and has a different length in each entry, so each entry needs its own dimension name. Long tables keep every value scalar; DuckDB array columns were considered and rejected. A pairwise matrix's axes are both cells, and the row and column of a matrix are `i` and `j`.
+>
+> **Why stored entries for sparse tables:** densifying `X` turns 2.3 million stored values of a 2,700 by 32,738 matrix into 88 million rows, and real atlases are a thousand times larger. A long table of entries is how single-cell users already treat `X` in SQL. The cost is that aggregates must account for the zeros a sparse table omits: start from the `obs` table with a `LEFT JOIN` and average `COALESCE(X, 0)`, or divide a sum by the number of cells. The user guide says so, and the test checks that query.
+>
+> **Why the union, not one table per matrix:** table names come from dims (decision 8), so two `layers` with the same dims must share a table. The union rule is the same rule as for dense arrays, which store every cell, so mixing the two follows from it.
+
+Not done: `awkward-array`, `dataframe` columns in `uns`, and MuData (`encoding-type: MuData`, whose `mod/<name>` subtrees are AnnData objects with their own, shorter `obs`). A CSR matrix with unsorted or duplicate indices reads as stored (scipy would sum duplicates). `array_path=` selects an encoded group as one decoded variable, with integer positions for its dimensions as for one array (`anndata::variable_group`); `group_path=` naming one is an error that points there (`check_group_path`). Sparse matrices on their own share a table only if all have the same major axis; a table that mixes CSR and CSC has a `NULL` `table_name`. Beside a dense array, the decoded major ranges of a matrix are shared by work units only when its major axis is the outer axis of the work-unit order, so memory stays at a few ranges.
 
 ## Why this is worth building
 

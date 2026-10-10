@@ -9,17 +9,22 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use super::anndata;
 use super::meta::{
     cf_auxiliary_vars, declared_dims, first_chunk_shape, is_unsupported_array_error, open_array,
     raw_array_layout, ArrayFacts, ZarrStore,
 };
-use super::types::DimGroup;
+use super::types::{DimGroup, VarEncoding};
 
 /// One array in a node, with the metadata that grouping needs.
 #[derive(Debug, Clone)]
 pub struct NodeVar {
     /// Store-relative path, for example `simulation/fine/foo`.
     pub path: String,
+    /// The node (group path) the variable belongs to: the group that holds it,
+    /// except for AnnData's `obs`, `var` and `raw/var` columns, which belong
+    /// to the parent group (see [`anndata::logical_node`]).
+    pub node: String,
     /// Dimension names the store records, or `None` when it records none.
     pub dims: Option<Vec<String>>,
     pub shape: Vec<u64>,
@@ -29,12 +34,27 @@ pub struct NodeVar {
     /// cannot. Its shape and names then come from the raw metadata document,
     /// so that the table it belongs to can say it is missing.
     pub unreadable: Option<String>,
+    /// How a variable stored as a group of arrays is decoded; `None` for a
+    /// plain array. A sparse matrix's `chunk_shape` is its shape.
+    pub encoding: Option<VarEncoding>,
+    /// Whether the array is a column of an AnnData data frame. The frame's
+    /// index is the coordinate of its axis, so no column is one, even a column
+    /// named like the axis.
+    pub in_dataframe: bool,
 }
 
 /// The arrays of the nodes that were loaded, keyed by store-relative path.
 #[derive(Debug, Default)]
 pub struct StoreTree {
     pub vars: BTreeMap<String, NodeVar>,
+    /// Coordinates by `(node, dim)`: the array that holds the values, and its
+    /// length. A dimension coordinate (a 1-D array named after its only
+    /// dimension) is registered in its node; so is an AnnData data frame's
+    /// index, under its axis (`obs`, `var`).
+    pub coords: HashMap<(String, String), (String, u64)>,
+    /// The AnnData layout, for a store whose root is an AnnData object
+    /// (decision 9); `None` for other stores.
+    pub layout: Option<anndata::Layout>,
     /// Arrays zarrs cannot open and whose metadata document cannot be read
     /// either. They are left out of every table; `read_zarr_metadata` lists
     /// them.
@@ -136,9 +156,32 @@ impl StoreTree {
         array_names: &[String],
         nodes: Option<&HashSet<String>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        // In an AnnData store, name each element's axes and read encoded
+        // groups (categoricals, nullable columns, sparse matrices) as one
+        // variable each (decision 9). Other stores skip this entirely.
+        let layout = anndata::layout(store, array_names);
+        let encodings = layout.as_ref().map(|l| &l.encodings);
+        let encoding_of = |group: &str| layout.as_ref().and_then(|l| l.encoding_of(group));
+        let logical = |path: &str| anndata::logical_node(node_of(path), encoding_of);
+        let in_dataframe = |path: &str| encoding_of(node_of(path)).as_deref() == Some("dataframe");
+        let wanted = |path: &str| nodes.is_none_or(|nodes| nodes.contains(&logical(path)));
+        let is_variable_group = |group: &str| {
+            !group.is_empty()
+                && encoding_of(group).is_some_and(|e| anndata::is_variable_encoding(&e))
+        };
+        // The arrays of an encoded variable belong to it, not to its group.
+        let inside_variable = |path: &str| {
+            self_and_ancestors(node_of(path))
+                .iter()
+                .any(|g| is_variable_group(g))
+        };
+
         let mut tree = StoreTree::default();
         for name in array_names {
-            if nodes.is_some_and(|nodes| !nodes.contains(node_of(name))) {
+            if !wanted(name)
+                || inside_variable(name)
+                || (encodings.is_some() && anndata::is_unstructured(name))
+            {
                 continue;
             }
             let arr = match open_array(store, name) {
@@ -150,11 +193,16 @@ impl StoreTree {
                                 name.clone(),
                                 NodeVar {
                                     path: name.clone(),
-                                    dims,
+                                    node: logical(name),
+                                    dims: dims.or_else(|| {
+                                        anndata::axis_names(name, shape.len(), encoding_of)
+                                    }),
                                     chunk_shape: shape.clone(),
                                     shape,
                                     attrs: Default::default(),
                                     unreadable: Some(err.to_string()),
+                                    encoding: None,
+                                    in_dataframe: in_dataframe(name),
                                 },
                             );
                         }
@@ -166,19 +214,118 @@ impl StoreTree {
             };
             let shape = arr.shape().to_vec();
             let chunk_shape = first_chunk_shape(&arr)?;
+            let dims = declared_dims(store, &arr, name)
+                .or_else(|| anndata::axis_names(name, shape.len(), encoding_of));
             tree.vars.insert(
                 name.clone(),
                 NodeVar {
                     path: name.clone(),
-                    dims: declared_dims(store, &arr, name),
+                    node: logical(name),
+                    dims,
                     shape,
                     chunk_shape,
                     attrs: arr.attributes().clone(),
                     unreadable: None,
+                    encoding: None,
+                    in_dataframe: in_dataframe(name),
                 },
             );
         }
+
+        let Some(anndata_layout) = layout.as_ref() else {
+            tree.register_dim_coords();
+            return Ok(tree);
+        };
+        for (group, encoding) in &anndata_layout.encodings {
+            if !is_variable_group(group) || !wanted(group) || inside_variable(group) {
+                continue;
+            }
+            let Some(var_encoding) = anndata::variable_encoding(anndata_layout, group, encoding)?
+            else {
+                continue;
+            };
+            // Shape and chunks come from the array that holds the values.
+            let (shape, chunk_shape) = match &var_encoding {
+                VarEncoding::Categorical { codes: values, .. }
+                | VarEncoding::Nullable { values, .. } => match open_array(store, values) {
+                    Ok(arr) => (arr.shape().to_vec(), first_chunk_shape(&arr)?),
+                    Err(err) if is_unsupported_array_error(err.as_ref()) => {
+                        tree.unsupported.push(group.clone());
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                },
+                VarEncoding::Sparse(matrix) => (matrix.shape.clone(), matrix.shape.clone()),
+            };
+            let dims = anndata::axis_names(group, shape.len(), encoding_of);
+            tree.vars.insert(
+                group.clone(),
+                NodeVar {
+                    path: group.clone(),
+                    node: logical(group),
+                    dims,
+                    shape,
+                    chunk_shape,
+                    attrs: Default::default(),
+                    encoding: Some(var_encoding),
+                    unreadable: None,
+                    in_dataframe: in_dataframe(group),
+                },
+            );
+        }
+        tree.register_dim_coords();
+        if let Some(layout) = &layout {
+            tree.register_anndata_indexes(layout);
+        }
+        tree.layout = layout;
         Ok(tree)
+    }
+
+    /// Register every dimension coordinate in its node.
+    fn register_dim_coords(&mut self) {
+        for var in self.vars.values().filter(|v| is_dim_coord(v)) {
+            self.coords.insert(
+                (var.node.clone(), basename(&var.path).to_string()),
+                (var.path.clone(), var.shape[0]),
+            );
+        }
+    }
+
+    /// Make each AnnData data frame's index the coordinate of its axis, as
+    /// `obs_names` and `var_names` are, instead of a column called `_index`.
+    /// The axes of `obsp` and `varp` get the same names.
+    fn register_anndata_indexes(&mut self, layout: &anndata::Layout) {
+        for (frame, index) in &layout.indexes {
+            let path = join(frame, index);
+            let Some(var) = self.vars.get(&path) else {
+                continue;
+            };
+            // A string array, or a nullable string array whose values are
+            // never missing in an index.
+            let values = match &var.encoding {
+                None => path.clone(),
+                Some(VarEncoding::Nullable { values, .. }) => values.clone(),
+                Some(_) => continue,
+            };
+            let Some([dim]) = var.dims.as_deref() else {
+                continue;
+            };
+            let key = (var.node.clone(), dim.clone());
+            let len = var.shape[0];
+            self.vars.remove(&path);
+            self.coords.insert(key, (values, len));
+        }
+        let aliased: Vec<_> = self
+            .coords
+            .iter()
+            .flat_map(|((node, dim), coord)| {
+                anndata::COORDINATE_ALIASES
+                    .iter()
+                    .filter(move |(_, of)| of == dim)
+                    .map(move |(alias, _)| ((node.clone(), alias.to_string()), coord.clone()))
+            })
+            .collect();
+        self.coords.extend(aliased);
     }
 
     /// Load `node` and its ancestors, which is everything a read of `node` needs.
@@ -193,12 +340,12 @@ impl StoreTree {
 
     /// Every node that directly holds at least one array, sorted.
     pub fn nodes(&self) -> Vec<String> {
-        let nodes: BTreeSet<&str> = self.vars.keys().map(|p| node_of(p)).collect();
+        let nodes: BTreeSet<&str> = self.vars.values().map(|v| v.node.as_str()).collect();
         nodes.into_iter().map(str::to_string).collect()
     }
 
     fn vars_in<'a>(&'a self, node: &'a str) -> impl Iterator<Item = &'a NodeVar> + 'a {
-        self.vars.values().filter(move |v| node_of(&v.path) == node)
+        self.vars.values().filter(move |v| v.node == node)
     }
 
     /// The tables of one node: arrays grouped by `(dims, shape)`, sorted by
@@ -206,9 +353,9 @@ impl StoreTree {
     /// `chunk_shape` is the largest chunk length in each dimension, the grid
     /// `read_zarr` plans work units on (decision 6). Two entries with the same
     /// dims mean arrays that share dimension names but not a shape; `read_zarr`
-    /// cannot read those dims as one table. A node that is not aligned with its ancestors is reported in
-    /// [`NodeGroups::misaligned`] rather than as an error, so that
-    /// `read_zarr_groups` can still list the rest of the store.
+    /// cannot read those dims as one table. A node that is not aligned with its
+    /// ancestors is reported in [`NodeGroups::misaligned`] rather than as an
+    /// error, so that `read_zarr_groups` can still list the rest of the store.
     pub fn dim_groups(&self, node: &str) -> NodeGroups {
         let mut misaligned = self.check_alignment(node).err();
         let facts: Vec<ArrayFacts> = self
@@ -220,7 +367,11 @@ impl StoreTree {
         type GroupKey = (Vec<String>, Vec<u64>);
         let mut groups: HashMap<GroupKey, DimGroup> = HashMap::new();
         let mut unnamed = Vec::new();
-        for var in self.vars_in(node) {
+        // Sparse matrices go last, so that each can join a dense table with the
+        // same dims and shape (see below).
+        let mut vars: Vec<&NodeVar> = self.vars_in(node).collect();
+        vars.sort_by_key(|var| is_sparse(var));
+        for var in vars {
             if var.shape.is_empty() || bounds.contains(&var.path) || aux_coords.contains(&var.path)
             {
                 continue;
@@ -232,15 +383,20 @@ impl StoreTree {
             if is_dim_coord(var) {
                 continue;
             }
+            // A table's rows are the union of the cells its variables store: a
+            // dense array stores every cell and a sparse matrix only its
+            // entries. So a sparse matrix in a table with a dense array is read
+            // densely there; sparse matrices on their own make a table of
+            // stored entries. Chunk shapes may differ (decision 6).
             let key = (dims.clone(), var.shape.clone());
             if let Some(group) = groups.get_mut(&key) {
                 add_to_group(group, var);
                 continue;
             }
-            let mut coord_var_names = Vec::new();
+            let mut coords = Vec::new();
             for (dim, &len) in dims.iter().zip(&var.shape) {
                 match self.find_coord(node, dim, len) {
-                    Ok(Some(coord)) => coord_var_names.push(coord),
+                    Ok(Some(coord)) => coords.push((dim.clone(), coord)),
                     Ok(None) => {}
                     Err(msg) => {
                         misaligned.get_or_insert(msg);
@@ -252,7 +408,8 @@ impl StoreTree {
                 shape: var.shape.clone(),
                 chunk_shape: Vec::new(),
                 data_var_names: Vec::new(),
-                coord_var_names,
+                coords,
+                encodings: HashMap::new(),
                 unreadable: Vec::new(),
             };
             add_to_group(&mut group, var);
@@ -265,7 +422,37 @@ impl StoreTree {
             }
         }
 
+        // The plan grid is the largest chunk length per dim over the dense
+        // arrays. A sparse matrix has no chunk grid of its own on this shape:
+        // next to dense arrays it is densified per plan chunk, and on its own
+        // it is read in blocks of entries.
+        for group in groups.values_mut() {
+            let dense_chunks = group
+                .data_var_names
+                .iter()
+                .filter(|path| !matches!(group.encodings.get(*path), Some(VarEncoding::Sparse(_))))
+                .map(|path| &self.vars[path].chunk_shape);
+            let mut plan: Option<Vec<u64>> = None;
+            for chunks in dense_chunks {
+                plan = Some(match plan {
+                    None => chunks.clone(),
+                    Some(p) => p.iter().zip(chunks).map(|(&a, &b)| a.max(b)).collect(),
+                });
+            }
+            if let Some(plan) = plan {
+                group.chunk_shape = plan;
+            }
+        }
+
         let mut groups: Vec<DimGroup> = groups.into_values().collect();
+        // An AnnData data frame lists its columns in `column-order`.
+        if let Some(layout) = &self.layout {
+            for group in &mut groups {
+                group
+                    .data_var_names
+                    .sort_by_cached_key(|path| layout.column_rank(path));
+            }
+        }
         groups.sort_by(|a, b| {
             a.dims
                 .cmp(&b.dims)
@@ -279,28 +466,22 @@ impl StoreTree {
         }
     }
 
-    /// The coordinate array for `dim` as seen from `node`: `<node>/<dim>` if it
-    /// is a 1-D array along `dim`, else the same lookup in each ancestor, nearest
-    /// first, as `DataTree` inherits coordinates. An inherited coordinate whose
-    /// length differs from `len` is an error, as in xarray.
+    /// The coordinate array for `dim` as seen from `node`: the node's own, else
+    /// the nearest ancestor's, as `DataTree` inherits coordinates. An inherited
+    /// coordinate whose length differs from `len` is an error, as in xarray.
     fn find_coord(&self, node: &str, dim: &str, len: u64) -> Result<Option<String>, String> {
         for ancestor in self_and_ancestors(node) {
-            let candidate = join(&ancestor, dim);
-            let Some(var) = self.vars.get(&candidate) else {
+            let Some((path, coord_len)) = self.coords.get(&(ancestor, dim.to_string())) else {
                 continue;
             };
-            if !is_dim_coord(var) {
-                continue;
-            }
-            if var.shape[0] != len {
+            if *coord_len != len {
                 return Err(format!(
                     "group '{}' is not aligned with its ancestors: dimension '{dim}' has \
-                     length {len}, but coordinate '{candidate}' has length {}",
+                     length {len}, but coordinate '{path}' has length {coord_len}",
                     display_group(node),
-                    var.shape[0]
                 ));
             }
-            return Ok(Some(candidate));
+            return Ok(Some(path.clone()));
         }
         Ok(None)
     }
@@ -360,6 +541,9 @@ fn add_to_group(group: &mut DimGroup, var: &NodeVar) {
         return;
     }
     group.data_var_names.push(var.path.clone());
+    if let Some(encoding) = &var.encoding {
+        group.encodings.insert(var.path.clone(), encoding.clone());
+    }
     if group.chunk_shape.is_empty() {
         group.chunk_shape = var.chunk_shape.clone();
     } else {
@@ -369,9 +553,16 @@ fn add_to_group(group: &mut DimGroup, var: &NodeVar) {
     }
 }
 
+fn is_sparse(var: &NodeVar) -> bool {
+    matches!(var.encoding, Some(VarEncoding::Sparse(_)))
+}
+
 /// A dimension coordinate: a 1-D array whose only dimension has its name.
+/// An AnnData data frame's columns never are (see [`NodeVar::in_dataframe`]).
 fn is_dim_coord(var: &NodeVar) -> bool {
-    var.shape.len() == 1
+    var.encoding.is_none()
+        && !var.in_dataframe
+        && var.shape.len() == 1
         && var
             .dims
             .as_ref()
@@ -455,7 +646,8 @@ mod tests {
             shape: vec![len; dims.len()],
             chunk_shape: vec![len; dims.len()],
             data_var_names: vec![],
-            coord_var_names: vec![],
+            coords: vec![],
+            encodings: Default::default(),
             unreadable: vec![],
         };
         let names = table_names(&[group(&["x"], 2), group(&["y"], 3), group(&["y"], 4)]);

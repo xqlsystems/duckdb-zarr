@@ -1,4 +1,4 @@
-.PHONY: clean clean_all clippy fmt fmt-check generate_fixtures lint release-check render-community-descriptor test_http test_http_debug test_http_release test_http_real
+.PHONY: check_anndata clean clean_all clippy fmt fmt-check generate_fixtures lint release-check render-community-descriptor test_http test_http_debug test_http_release test_http_real
 
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
@@ -91,11 +91,16 @@ render-community-descriptor:
 	python3 scripts/render_community_descriptor.py --ref "$(REF)" $(if $(REF_NEXT),--ref-next "$(REF_NEXT)",) --out build/community-extensions/extensions/zarr/description.yml
 	python3 scripts/check_release_ready.py --description-path build/community-extensions/extensions/zarr/description.yml --strict-community-ref
 
+# Compare the extension's AnnData tables with anndata.read_zarr (design decision 9).
+# Build the extension and the fixtures first (make debug generate_fixtures).
+check_anndata:
+	uv run scripts/check_anndata_tables.py build/debug/$(EXTENSION_NAME).duckdb_extension
+
 generate_fixtures:
 	@if command -v uv >/dev/null 2>&1; then \
 		uv run scripts/generate_fixtures.py; \
 	elif [ -f "$(PYTHON_VENV_BIN)" ]; then \
-		$(PYTHON_VENV_BIN) -m pip install --quiet "xarray" "zarr>=3.0.0" numpy scipy h5netcdf h5py pooch; \
+		$(PYTHON_VENV_BIN) -m pip install --quiet "xarray" "zarr>=3.0.0" numpy scipy h5netcdf h5py pooch anndata; \
 		$(PYTHON_VENV_BIN) scripts/generate_fixtures.py; \
 	else \
 		echo "Error: neither uv nor configure/venv found. Run 'make configure' or install uv." >&2; \
