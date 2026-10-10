@@ -9,7 +9,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use super::meta::{declared_dims, is_unsupported_array_error, open_array, ZarrStore};
+use super::meta::{
+    declared_dims, first_chunk_shape, is_unsupported_array_error, open_array, ZarrStore,
+};
 use super::types::DimGroup;
 
 /// One array in a node, with the metadata that grouping needs.
@@ -141,14 +143,7 @@ impl StoreTree {
                 Err(err) => return Err(err),
             };
             let shape = arr.shape().to_vec();
-            let chunk_shape = if shape.is_empty() {
-                Vec::new()
-            } else {
-                arr.chunk_shape(&vec![0u64; shape.len()])?
-                    .iter()
-                    .map(|x| x.get())
-                    .collect()
-            };
+            let chunk_shape = first_chunk_shape(&arr)?;
             tree.vars.insert(
                 name.clone(),
                 NodeVar {
@@ -183,10 +178,12 @@ impl StoreTree {
         self.vars.values().filter(move |v| node_of(&v.path) == node)
     }
 
-    /// The tables of one node: arrays grouped by `(dims, shape, chunk_shape)`,
-    /// sorted by dims. Two entries with the same dims mean arrays that share
-    /// dimension names but not a layout; `read_zarr` cannot read those dims as
-    /// one table. A node that is not aligned with its ancestors is reported in
+    /// The tables of one node: arrays grouped by `(dims, shape)`, sorted by
+    /// dims. Arrays in one table may be chunked differently; the table's
+    /// `chunk_shape` is the largest chunk length in each dimension, the grid
+    /// `read_zarr` plans work units on (decision 6). Two entries with the same
+    /// dims mean arrays that share dimension names but not a shape; `read_zarr`
+    /// cannot read those dims as one table. A node that is not aligned with its ancestors is reported in
     /// [`NodeGroups::misaligned`] rather than as an error, so that
     /// `read_zarr_groups` can still list the rest of the store.
     pub fn dim_groups(&self, node: &str) -> NodeGroups {
@@ -205,7 +202,7 @@ impl StoreTree {
             }
         }
 
-        type GroupKey = (Vec<String>, Vec<u64>, Vec<u64>);
+        type GroupKey = (Vec<String>, Vec<u64>);
         let mut groups: HashMap<GroupKey, DimGroup> = HashMap::new();
         let mut unnamed = Vec::new();
         for var in self.vars_in(node) {
@@ -227,9 +224,12 @@ impl StoreTree {
             if is_dim_coord(var) {
                 continue;
             }
-            let key = (dims.clone(), var.shape.clone(), var.chunk_shape.clone());
+            let key = (dims.clone(), var.shape.clone());
             if let Some(group) = groups.get_mut(&key) {
                 group.data_var_names.push(var.path.clone());
+                for (plan, &c) in group.chunk_shape.iter_mut().zip(&var.chunk_shape) {
+                    *plan = (*plan).max(c);
+                }
                 continue;
             }
             let mut coord_var_names = Vec::new();
@@ -349,38 +349,48 @@ fn is_dim_coord(var: &NodeVar) -> bool {
             .is_some_and(|dims| dims.len() == 1 && dims[0] == basename(&var.path))
 }
 
-/// Table names for one node's dim groups, in order. A name is `None` where the
-/// node has several layouts for the same dims. Names that differ only in case
-/// are an error, because DuckDB identifiers ignore case
-/// (`xarray_sql.df.resolve_table_names`).
-pub fn table_names(
+/// Fail unless some array lies in or below group `node` (the root always
+/// exists), so that a mistyped `group_path=` is an error, not an empty result.
+pub fn ensure_group_exists(
+    store_path: &str,
+    array_names: &[String],
     node: &str,
-    groups: &[DimGroup],
-) -> Result<Vec<Option<String>>, Box<dyn std::error::Error>> {
-    let mut layouts: HashMap<&[String], usize> = HashMap::new();
-    for group in groups {
-        *layouts.entry(group.dims.as_slice()).or_default() += 1;
+) -> Result<(), Box<dyn std::error::Error>> {
+    let prefix = format!("{node}/");
+    if node.is_empty() || array_names.iter().any(|name| name.starts_with(&prefix)) {
+        return Ok(());
     }
-    let mut seen: HashMap<String, &[String]> = HashMap::new();
-    let mut names = Vec::with_capacity(groups.len());
+    Err(format!(
+        "'{store_path}': group '{}' not found; run read_zarr_groups('{store_path}') to list \
+         the groups",
+        display_group(node)
+    )
+    .into())
+}
+
+/// Table names for one node's dim groups, in order. A name is `None` where the
+/// node has arrays of different shapes for the same dims, which `read_zarr`
+/// cannot read as one table. It is also `None` for every group whose name equals
+/// another's after case folding, because DuckDB identifiers ignore case.
+/// xarray-sql raises on such a collision (`xarray_sql.df.resolve_table_names`);
+/// here the rest of the node keeps its names, and `dims :=` still reads it.
+pub fn table_names(groups: &[DimGroup]) -> Vec<Option<String>> {
+    let mut shapes: HashMap<&[String], usize> = HashMap::new();
     for group in groups {
-        if layouts[group.dims.as_slice()] > 1 {
-            names.push(None);
-            continue;
-        }
-        let name = default_table_name(&group.dims);
-        if let Some(other) = seen.insert(name.to_lowercase(), &group.dims) {
-            return Err(format!(
-                "group '{}': dims {:?} and {other:?} give table names that differ only \
-                 in case; DuckDB identifiers ignore case",
-                display_group(node),
-                group.dims
-            )
-            .into());
-        }
-        names.push(Some(name));
+        *shapes.entry(group.dims.as_slice()).or_default() += 1;
     }
-    Ok(names)
+    let names: Vec<Option<String>> = groups
+        .iter()
+        .map(|group| (shapes[group.dims.as_slice()] == 1).then(|| default_table_name(&group.dims)))
+        .collect();
+    let mut folded: HashMap<String, usize> = HashMap::new();
+    for name in names.iter().flatten() {
+        *folded.entry(name.to_lowercase()).or_default() += 1;
+    }
+    names
+        .into_iter()
+        .map(|name| name.filter(|n| folded[&n.to_lowercase()] == 1))
+        .collect()
 }
 
 #[cfg(test)]
@@ -418,13 +428,11 @@ mod tests {
             data_var_names: vec![],
             coord_var_names: vec![],
         };
-        let names =
-            table_names("", &[group(&["x"], 2), group(&["y"], 3), group(&["y"], 4)]).unwrap();
+        let names = table_names(&[group(&["x"], 2), group(&["y"], 3), group(&["y"], 4)]);
         assert_eq!(names, vec![Some("x".to_string()), None, None]);
 
-        let err = table_names("", &[group(&["X"], 2), group(&["x"], 3)])
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("differ only in case"), "{err}");
+        // A case collision leaves only the colliding groups unnamed.
+        let names = table_names(&[group(&["X"], 2), group(&["x"], 3), group(&["y"], 4)]);
+        assert_eq!(names, vec![None, None, Some("y".to_string())]);
     }
 }

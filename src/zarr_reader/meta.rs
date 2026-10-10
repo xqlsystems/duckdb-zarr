@@ -380,6 +380,20 @@ pub fn select_array_name(
         })
 }
 
+/// The element shape of an array's first chunk (empty for a 0-d array). With a
+/// regular chunk grid this is the chunk shape of every chunk.
+pub fn first_chunk_shape(arr: &ZarrArray) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
+    let ndim = arr.shape().len();
+    if ndim == 0 {
+        return Ok(Vec::new());
+    }
+    Ok(arr
+        .chunk_shape(&vec![0u64; ndim])?
+        .iter()
+        .map(|x| x.get())
+        .collect())
+}
+
 /// Build a one-array dimension group for `read_zarr(..., array_path='path')`.
 ///
 /// Dimension names come from [`array_path_dims`]. For each declared name, the
@@ -395,12 +409,7 @@ pub fn dim_group_for_array(
     let arr = open_array(store, array_name)?;
     let shape = arr.shape().to_vec();
     let declared = declared_dims(store, &arr, array_name);
-    let first_chunk = vec![0u64; shape.len()];
-    let chunk_shape = arr
-        .chunk_shape(&first_chunk)?
-        .iter()
-        .map(|x| x.get())
-        .collect();
+    let chunk_shape = first_chunk_shape(&arr)?;
     // A synthesized `dim_N` is a placeholder, not a name any coordinate array was
     // written under, so only look up coordinates for declared names.
     let (dims, coord_var_names) = match declared {

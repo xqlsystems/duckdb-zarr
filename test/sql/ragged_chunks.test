@@ -10,6 +10,15 @@
 #   s, v  (r=5, c=3) chunks (2, 2)  ragged in both dims; s is a string array
 #   t     (i=10)     chunks (4,)    chunks of 4, 4, 2; string
 #   x27   (n=27)     chunks (10,)   chunks of 10, 10, 7; float32 (the shape of a CSR X/data)
+#   u     (i=10)     chunks (3,)    float32 3*i, in the table of t (chunks 4)
+#   p     (a=5, b=3) chunks (3, 2)  float32 a*10 + b
+#   q     (a=5, b=3) chunks (2, 1)  int32 a*100 + b
+#   qs    (a=5, b=3) chunks (2, 2)  string 'q<a><b>'
+#
+# One table can hold arrays with different chunk shapes (docs/design.md,
+# decision 6). Work units follow the largest chunk length in each dimension, and
+# arrays chunked otherwise are read as array subsets, which may span several of
+# their chunks or cut one.
 
 require zarr
 
@@ -37,3 +46,36 @@ SELECT COUNT(*), COUNT(*) FILTER (WHERE x27 != n * 2), SUM(x27)
 FROM read_zarr('test/fixtures/xarray_tutorial/ragged_chunks.zarr', array_path := 'x27');
 ----
 27	0	702.000000
+
+# ── different chunk shapes in one table ──────────────────────────────────────
+# read_zarr_groups shows the grid work units follow: the largest chunk length
+# in each dimension.
+query II
+SELECT dims, chunk_shape FROM read_zarr_groups('test/fixtures/xarray_tutorial/ragged_chunks.zarr')
+WHERE dims IN ('["i"]', '["a","b"]') ORDER BY dims;
+----
+["a","b"]	[3,2]
+["i"]	[4]
+
+# t (chunks 4) and u (chunks 3): boundaries that don't nest; t is a string.
+query II
+SELECT COUNT(*), COUNT(*) FILTER (WHERE t != 't' || i::VARCHAR OR u != 3 * i)
+FROM read_zarr('test/fixtures/xarray_tutorial/ragged_chunks.zarr', dims := ['i']);
+----
+10	0
+
+# p is chunked like the plan; q and qs are read as subsets. Every cell matches.
+query II
+SELECT COUNT(*),
+       COUNT(*) FILTER (WHERE p != a * 10 + b OR q != a * 100 + b
+                        OR qs != 'q' || a::VARCHAR || b::VARCHAR)
+FROM read_zarr('test/fixtures/xarray_tutorial/ragged_chunks.zarr', dims := ['a', 'b']);
+----
+15	0
+
+# Projection of a subset-read array alone, and a filter on it.
+query I
+SELECT SUM(q) FROM read_zarr('test/fixtures/xarray_tutorial/ragged_chunks.zarr', dims := ['a', 'b'])
+WHERE a >= 3;
+----
+2106

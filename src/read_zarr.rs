@@ -1,13 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use duckdb::core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab, Value};
+use zarrs::array::ArraySubset;
 
 use crate::zarr_reader::meta::{
     build_column_defs, build_work_units, dim_group_for_array, dimension_names, extract_file_system,
-    load_coord_array, open_array, open_store, select_array_name, ZarrArray, ZarrStore,
+    first_chunk_shape, load_coord_array, open_array, open_store, select_array_name, ZarrArray,
+    ZarrStore,
 };
 use crate::zarr_reader::tree::{self, StoreTree};
 use crate::zarr_reader::types::{
@@ -26,6 +28,9 @@ pub struct ReadZarrBind {
     pub coord_arrays: HashMap<String, CoordArray>,
     /// Pre-opened data-variable arrays; avoids O(n_chunks × n_vars) metadata reads.
     pub arrays: HashMap<String, ZarrArray>,
+    /// Data variables whose chunk shape differs from `group_chunk_shape`. They
+    /// are read as an array subset per work unit instead of one chunk.
+    pub subset_reads: HashSet<String>,
     pub work_units: Vec<WorkUnit>,
     pub next_unit: AtomicUsize,
 }
@@ -50,7 +55,7 @@ pub struct LocalState {
     /// Index of the current work unit being streamed out row-by-row.
     pub current_unit_idx: usize,
     /// Decoded values for the current work unit, one entry per data variable.
-    pub current_chunk_values: HashMap<String, SharedColumnValues>,
+    pub current_chunk_values: HashMap<String, UnitValues>,
     /// Row cursor within the current chunk (how many rows have been emitted).
     pub row_cursor: usize,
     /// Total rows in the current chunk.
@@ -146,19 +151,8 @@ impl VTab for ReadZarrVTab {
         // otherwise, as in xarray.open_zarr (design decision 8).
         let node = requested_group.unwrap_or_default();
         let shown = tree::display_group(&node);
+        tree::ensure_group_exists(&store_path, &array_names, &node)?;
         let store_tree = StoreTree::load_for_node(&store, &array_names, &node)?;
-        let node_prefix = format!("{node}/");
-        if !node.is_empty()
-            && !array_names
-                .iter()
-                .any(|name| name.starts_with(&node_prefix))
-        {
-            return Err(format!(
-                "'{store_path}': group '{shown}' not found; run read_zarr_groups('{store_path}') \
-                 to list the groups"
-            )
-            .into());
-        }
         let node_groups = store_tree.dim_groups(&node);
         if let Some(msg) = node_groups.misaligned {
             return Err(msg.into());
@@ -214,20 +208,10 @@ impl VTab for ReadZarrVTab {
             }
             [group] => *group,
             [a, b, ..] => {
-                let field = if a.shape != b.shape {
-                    "array shape"
-                } else {
-                    "chunk shape"
-                };
-                let (ours, theirs) = if a.shape != b.shape {
-                    (&a.shape, &b.shape)
-                } else {
-                    (&a.chunk_shape, &b.chunk_shape)
-                };
                 return Err(format!(
-                    "{field} mismatch in dim group {wanted:?}: {:?} {ours:?} vs {:?} {theirs:?}; \
+                    "array shape mismatch in dim group {wanted:?}: {:?} {:?} vs {:?} {:?}; \
                      use array_path= to select one array",
-                    a.data_var_names, b.data_var_names
+                    a.data_var_names, a.shape, b.data_var_names, b.shape
                 )
                 .into());
             }
@@ -425,9 +409,13 @@ fn finish_bind(
 
     // Pre-open data variable arrays once at bind time.
     let mut arrays: HashMap<String, ZarrArray> = HashMap::new();
+    let mut subset_reads = HashSet::new();
     for col in &columns {
         if !col.is_coord {
             let arr = open_array(&store, &col.name)?;
+            if first_chunk_shape(&arr)? != group.chunk_shape {
+                subset_reads.insert(col.name.clone());
+            }
             arrays.insert(col.name.clone(), arr);
         }
     }
@@ -440,17 +428,40 @@ fn finish_bind(
         columns,
         coord_arrays,
         arrays,
+        subset_reads,
         work_units,
         next_unit: AtomicUsize::new(0),
     })
+}
+
+/// One data variable's decoded values for a work unit.
+pub struct UnitValues {
+    pub values: SharedColumnValues,
+    /// `true` when the values are one whole chunk as `retrieve_chunk` returns
+    /// it: laid out over the full chunk shape, padded past the array's edge.
+    /// `false` for an array subset, laid out over the work unit's clipped
+    /// region only.
+    pub padded: bool,
+}
+
+/// The region of the array that work unit `wu` covers, clipped to `shape`.
+fn unit_region(wu: &WorkUnit, shape: &[u64], chunk_shape: &[u64]) -> ArraySubset {
+    let ranges: Vec<std::ops::Range<u64>> = (0..shape.len())
+        .map(|k| {
+            let start = wu.chunk_indices[k] * chunk_shape[k];
+            start..(start + chunk_shape[k]).min(shape[k])
+        })
+        .collect();
+    ArraySubset::new_with_ranges(&ranges)
 }
 
 fn decode_work_unit(
     bind: &ReadZarrBind,
     wu: &WorkUnit,
     projected: &HashMap<usize, usize>,
-) -> Result<HashMap<String, SharedColumnValues>, Box<dyn std::error::Error>> {
+) -> Result<HashMap<String, UnitValues>, Box<dyn std::error::Error>> {
     let mut chunk_values = HashMap::new();
+    let region = unit_region(wu, &bind.group_shape, &bind.group_chunk_shape);
 
     for (col_idx, col) in bind.columns.iter().enumerate() {
         if col.is_coord {
@@ -463,14 +474,26 @@ fn decode_work_unit(
             .arrays
             .get(&col.name)
             .ok_or_else(|| format!("array '{}' not found in bind cache", col.name))?;
+        // An array chunked like the plan reads one chunk. An array chunked
+        // differently reads the work unit's region, which may span several of
+        // its chunks or part of one (decision 6).
+        let padded = !bind.subset_reads.contains(&col.name);
         let data: SharedColumnValues = if col.on_disk_dtype == ZarrDtype::String {
-            // retrieve_chunk fills missing (implicit) chunks with the dtype's
+            // Both calls fill missing (implicit) chunks with the dtype's
             // fill_value automatically, same as the fixed-width path below.
-            let strings = arr.retrieve_chunk::<Vec<String>>(&wu.chunk_indices)?;
+            let strings = if padded {
+                arr.retrieve_chunk::<Vec<String>>(&wu.chunk_indices)?
+            } else {
+                arr.retrieve_array_subset::<Vec<String>>(&region)?
+            };
             Arc::new(StringValues { strings })
         } else {
             // ArrayBytes<'static>: zarrs convention for requesting owned decoded bytes.
-            let raw = arr.retrieve_chunk::<zarrs::array::ArrayBytes<'static>>(&wu.chunk_indices)?;
+            let raw = if padded {
+                arr.retrieve_chunk::<zarrs::array::ArrayBytes<'static>>(&wu.chunk_indices)?
+            } else {
+                arr.retrieve_array_subset::<zarrs::array::ArrayBytes<'static>>(&region)?
+            };
             let bytes: Vec<u8> = raw
                 .into_fixed()
                 .map_err(|_| format!("variable-length dtype not supported for '{}'", col.name))?
@@ -485,7 +508,13 @@ fn decode_work_unit(
                 .ok_or_else(|| format!("no fixed-width dtype for '{}'", col.name))?,
             )
         };
-        chunk_values.insert(col.name.clone(), data);
+        chunk_values.insert(
+            col.name.clone(),
+            UnitValues {
+                values: data,
+                padded,
+            },
+        );
     }
 
     Ok(chunk_values)
@@ -514,7 +543,7 @@ fn fill_chunk_slice(
     wu: &WorkUnit,
     group_shape: &[u64],
     group_chunk_shape: &[u64],
-    chunk_values: &HashMap<String, SharedColumnValues>,
+    chunk_values: &HashMap<String, UnitValues>,
     output: &mut DataChunkHandle,
     vector_base: usize,
     chunk_row_start: usize,
@@ -586,16 +615,17 @@ fn fill_chunk_slice(
                     }
                 }
             } else {
-                // Data variable: use zarrs_flat to index into the physical byte buffer.
-                chunk_values
-                    .get(&col_def.name)
-                    .unwrap_or_else(|| {
-                        unreachable!(
-                            "projected data variable '{}' missing from chunk_values",
-                            col_def.name
-                        )
-                    })
-                    .write_element(&mut vector, zarrs_flat, dst);
+                // Data variable: a whole chunk is indexed through the padded
+                // (zarrs) strides; an array subset holds only the clipped region,
+                // in row order.
+                let unit = chunk_values.get(&col_def.name).unwrap_or_else(|| {
+                    unreachable!(
+                        "projected data variable '{}' missing from chunk_values",
+                        col_def.name
+                    )
+                });
+                let idx = if unit.padded { zarrs_flat } else { flat_row };
+                unit.values.write_element(&mut vector, idx, dst);
             }
         }
     }

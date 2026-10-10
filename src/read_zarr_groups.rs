@@ -12,8 +12,9 @@ use crate::zarr_reader::tree::{self, StoreTree};
 struct GroupRow {
     group_path: String,
     schema_name: String,
-    /// `None` when `read_zarr(store, group := ..., dims := ...)` cannot read this
-    /// row as one table (see [`tree::table_names`] and `check_alignment`).
+    /// `None` when `read_zarr(store, group_path := ..., dims := ...)` cannot read
+    /// this row as one table, or its name collides with another table's after
+    /// case folding (see [`tree::table_names`] and `check_alignment`).
     table_name: Option<String>,
     dims: String,
     shape: String,
@@ -93,7 +94,10 @@ impl VTab for ReadZarrGroupsVTab {
             rows.push(row(tree::node_of(&array_name), None, &g));
         } else {
             let store_tree = match &requested_group {
-                Some(node) => StoreTree::load_for_node(&store, &array_names, node)?,
+                Some(node) => {
+                    tree::ensure_group_exists(&store_path, &array_names, node)?;
+                    StoreTree::load_for_node(&store, &array_names, node)?
+                }
                 None => StoreTree::load(&store, &array_names, None)?,
             };
             let nodes = match requested_group {
@@ -102,11 +106,12 @@ impl VTab for ReadZarrGroupsVTab {
             };
             for node in nodes {
                 // A row gets a table name only if read_zarr can read it as one
-                // table: its group is aligned with its ancestors and no other
-                // layout in the group shares its dims.
+                // table (its group is aligned with its ancestors, and no array of
+                // another shape in the group shares its dims) and the name is
+                // unique in the group after case folding.
                 let node_groups = store_tree.dim_groups(&node);
                 let aligned = node_groups.misaligned.is_none();
-                let names = tree::table_names(&node, &node_groups.groups)?;
+                let names = tree::table_names(&node_groups.groups);
                 for (g, name) in node_groups.groups.iter().zip(names) {
                     rows.push(row(&node, name.filter(|_| aligned), g));
                 }

@@ -83,7 +83,7 @@ def write_zarr(ds: xr.Dataset, name: str, encoding: dict | None = None) -> None:
 # only when the `<name>.zarr.version` file next to it holds the same version;
 # otherwise it is rebuilt. Without this, a copy left over from an older checkout
 # makes the SQL tests fail on value differences that are hard to trace.
-RAGGED_FIXTURE_VERSION = "1"
+RAGGED_FIXTURE_VERSION = "2"
 DATATREE_FIXTURE_VERSION = "1"
 UNSUPPORTED_FIXTURE_VERSION = "1"
 
@@ -768,6 +768,12 @@ def main() -> None:
     #   s, v  (r=5, c=3), chunks (2, 2): ragged in BOTH dims; s is a string array
     #   t     (i=10),     chunks (4,):   ragged 1-D string array (4, 4, 2)
     #   x27   (n=27),     chunks (10,):  ragged 1-D float32, the shape of a CSR X/data
+    # Arrays of one table with different chunk shapes (decision 6). The table is
+    # planned on the largest chunk length per dim; the others are read as subsets:
+    #   u     (i=10),     chunks (3,):   beside t (chunks 4), boundaries that don't nest
+    #   p     (a=5, b=3), chunks (3, 2): float32, a*10 + b; chunked like the plan
+    #   q     (a=5, b=3), chunks (2, 1): int32, a*100 + b
+    #   qs    (a=5, b=3), chunks (2, 2): string, 'q<a><b>'
     print("ragged_chunks (synthetic)...")
     dest = FIXTURES / "ragged_chunks.zarr"
     if fixture_is_current(dest, RAGGED_FIXTURE_VERSION):
@@ -776,6 +782,7 @@ def main() -> None:
         if dest.exists():
             _rmtree(dest)
         rr, cc = np.meshgrid(np.arange(5), np.arange(3), indexing="ij")
+        aa, bb = rr, cc
         ds_ragged = xr.Dataset({
             "s": xr.DataArray(
                 np.array([[f"s{r}{c}" for c in range(3)] for r in range(5)], dtype=object),
@@ -783,11 +790,18 @@ def main() -> None:
             "v": xr.DataArray((rr * 10 + cc).astype("float32"), dims=["r", "c"]),
             "t": xr.DataArray(np.array([f"t{i}" for i in range(10)], dtype=object), dims=["i"]),
             "x27": xr.DataArray((np.arange(27) * 2).astype("float32"), dims=["n"]),
+            "u": xr.DataArray((np.arange(10) * 3).astype("float32"), dims=["i"]),
+            "p": xr.DataArray((aa * 10 + bb).astype("float32"), dims=["a", "b"]),
+            "q": xr.DataArray((aa * 100 + bb).astype("int32"), dims=["a", "b"]),
+            "qs": xr.DataArray(
+                np.array([[f"q{a}{b}" for b in range(3)] for a in range(5)], dtype=object),
+                dims=["a", "b"]),
         })
         ds_ragged.to_zarr(
             dest, zarr_format=3, consolidated=False,
             encoding={"s": {"chunks": (2, 2)}, "v": {"chunks": (2, 2)},
-                      "t": {"chunks": (4,)}, "x27": {"chunks": (10,)}})
+                      "t": {"chunks": (4,)}, "x27": {"chunks": (10,)}, "u": {"chunks": (3,)},
+                      "p": {"chunks": (3, 2)}, "q": {"chunks": (2, 1)}, "qs": {"chunks": (2, 2)}})
         mark_fixture(dest, RAGGED_FIXTURE_VERSION)
         print(f"  wrote {dest}")
 

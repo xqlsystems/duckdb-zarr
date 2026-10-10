@@ -77,6 +77,7 @@ impl VTab for ReadZarrMetaVTab {
         }
         // group_path= lists the arrays directly in that group, not in its subgroups.
         if let Some(node) = requested_group {
+            crate::zarr_reader::tree::ensure_group_exists(&store_path, &array_names, &node)?;
             array_names.retain(|name| crate::zarr_reader::tree::node_of(name) == node);
         }
 
