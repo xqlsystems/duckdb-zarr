@@ -4,9 +4,13 @@ import duckdbWorker from "@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js?u
 import { Deck, MapView } from "@deck.gl/core";
 import { ScatterplotLayer } from "@deck.gl/layers";
 
-// Small sample store served from public/data (see scripts/make_sample.py); same
-// origin, so no CORS. Any CORS-enabled public store with consolidated metadata works.
-const DEFAULT_URL = new URL("data/air.zarr", location.href).href;
+// ARCO-ERA5 (https://github.com/google-research/arco-era5), proxied through the
+// dev server at /gcs because the bucket has no CORS headers (see vite.config.js).
+// A tiny local sample is at data/air.zarr (scripts/make_sample.py).
+const DEFAULT_URL = new URL(
+  "gcs/gcp-public-data-arco-era5/ar/1959-2022-full_37-1h-0p25deg-chunk-1.zarr-v2",
+  location.href,
+).href;
 const EXTENSION_URL = new URL("zarr.duckdb_extension.wasm", location.href).href;
 
 const $ = (id) => document.getElementById(id);
@@ -16,10 +20,13 @@ const setStatus = (msg, isError = false) => {
 };
 
 $("url").value = new URLSearchParams(location.search).get("url") ?? DEFAULT_URL;
-$("sql").value = `-- NCEP air temperature (K) at one time step; lon/lat are coordinate columns.
-SELECT lon, lat, air AS value
-FROM read_zarr('{url}')
-WHERE time = TIMESTAMP '2013-01-01 12:00:00'`;
+$("sql").value = `-- ERA5 2m temperature (K) at one hour, thinned to a 2 degree grid.
+-- lon/lat are coordinate columns; only the chunk for this hour is read.
+SELECT longitude AS lon, latitude AS lat, "2m_temperature" AS value
+FROM read_zarr('{url}', dims=['time','latitude','longitude'])
+WHERE time = TIMESTAMP '2022-07-01 12:00:00'
+  AND round(latitude * 4)::INT % 8 = 0
+  AND round(longitude * 4)::INT % 8 = 0`;
 
 const db = await (async () => {
   const worker = new Worker(duckdbWorker);
