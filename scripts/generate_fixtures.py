@@ -85,7 +85,7 @@ def write_zarr(ds: xr.Dataset, name: str, encoding: dict | None = None) -> None:
 # otherwise it is rebuilt. Without this, a copy left over from an older checkout
 # makes the SQL tests fail on value differences that are hard to trace.
 ANNDATA_FIXTURE_VERSION = "6"
-AXIS_NAMED_FIXTURE_VERSION = "1"
+AXIS_NAMED_FIXTURE_VERSION = "3"
 RAGGED_FIXTURE_VERSION = "2"
 DATATREE_FIXTURE_VERSION = "1"
 MANY_TABLES_FIXTURE_VERSION = "1"
@@ -892,9 +892,14 @@ def main() -> None:
         print(f"  wrote {dest}")
 
     # ── anndata/axis_named_columns (real anndata writer) ─────────────────────
-    # Tests: an obs column named `obs`, like the obs dimension, which the obs
-    # table names by its store path (`obs/obs`) so that it does not collide with
-    # the dimension column (test/sql/anndata.test).
+    # Tests (test/sql/anndata.test) for columns named like a dimension, and for
+    # tables that mix sparse storage:
+    #   * obs columns `obs` and `Obs`, which collide with the obs dimension
+    #     column (DuckDB names ignore case), so both keep their store paths;
+    #   * obsm/df, a data frame with a column `obs`;
+    #   * layers a (CSR) and b (CSC) only: a sparse table that mixes storage;
+    #   * obsp d (dense, chunks (2, 2)), r (CSR) and c (CSC), all 3x3: sparse
+    #     matrices of both kinds densified beside a dense array.
     print("anndata/axis_named_columns (real anndata writer)...")
     dest = ANNDATA_FIXTURES / "axis_named_columns.zarr"
     if fixture_is_current(dest, AXIS_NAMED_FIXTURE_VERSION):
@@ -902,13 +907,36 @@ def main() -> None:
     else:
         import anndata as ad
         import pandas as pd
+        import scipy.sparse
         if dest.exists():
             _rmtree(dest)
-        obs = pd.DataFrame({"obs": np.arange(3, dtype=np.int64) * 10},
-                           index=["c0", "c1", "c2"])
+        names = ["c0", "c1", "c2"]
+        obs = pd.DataFrame({"obs": np.arange(3, dtype=np.int64) * 10,
+                            "Obs": np.arange(3, dtype=np.int64) + 1}, index=names)
+        dense = np.arange(9, dtype=np.float64).reshape(3, 3)
         with ad.settings.override(zarr_write_format=3):
-            ad.AnnData(X=np.ones((3, 2), dtype=np.float32), obs=obs,
-                       var=pd.DataFrame(index=["g0", "g1"])).write_zarr(dest)
+            ad.AnnData(
+                X=np.ones((3, 2), dtype=np.float32), obs=obs,
+                var=pd.DataFrame(index=["g0", "g1"]),
+                obsm={"df": pd.DataFrame({"obs": np.array([5, 6, 7], dtype=np.int64)},
+                                         index=names)},
+                layers={"a": scipy.sparse.csr_matrix(np.array([[1., 0.], [0., 0.], [0., 2.]])),
+                        "b": scipy.sparse.csc_matrix(np.array([[0., 3.], [0., 0.], [4., 0.]]))},
+                obsp={"d": dense,
+                      "r": scipy.sparse.csr_matrix(np.where(dense % 2 == 0, dense, 0.0)),
+                      "c": scipy.sparse.csc_matrix(np.where(dense % 3 == 0, dense, 0.0))},
+            ).write_zarr(dest)
+        # Chunk obsp/d as (2, 2): its table then has 4 work units, so r (CSR, its
+        # row ranges shared across units) and c (CSC, read per unit because the
+        # units run row-major) are each densified across several chunks.
+        g = zarr.open_group(str(dest), mode="a", use_consolidated=False)
+        d_attrs = dict(g["obsp/d"].attrs)
+        del g["obsp/d"]
+        rechunked = g["obsp"].create_array("d", shape=dense.shape, chunks=(2, 2),
+                                           dtype=dense.dtype)
+        rechunked[:] = dense
+        rechunked.attrs.update(d_attrs)
+        zarr.consolidate_metadata(str(dest))
         mark_fixture(dest, AXIS_NAMED_FIXTURE_VERSION)
         print(f"  wrote {dest}")
 

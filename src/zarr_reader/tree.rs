@@ -37,6 +37,10 @@ pub struct NodeVar {
     /// How a variable stored as a group of arrays is decoded; `None` for a
     /// plain array. A sparse matrix's `chunk_shape` is its shape.
     pub encoding: Option<VarEncoding>,
+    /// Whether the array is a column of an AnnData data frame. The frame's
+    /// index is the coordinate of its axis, so no column is one, even a column
+    /// named like the axis.
+    pub in_dataframe: bool,
 }
 
 /// The arrays of the nodes that were loaded, keyed by store-relative path.
@@ -159,6 +163,7 @@ impl StoreTree {
         let encodings = layout.as_ref().map(|l| &l.encodings);
         let encoding_of = |group: &str| layout.as_ref().and_then(|l| l.encoding_of(group));
         let logical = |path: &str| anndata::logical_node(node_of(path), encoding_of);
+        let in_dataframe = |path: &str| encoding_of(node_of(path)).as_deref() == Some("dataframe");
         let wanted = |path: &str| nodes.is_none_or(|nodes| nodes.contains(&logical(path)));
         let is_variable_group = |group: &str| {
             !group.is_empty()
@@ -197,6 +202,7 @@ impl StoreTree {
                                     attrs: Default::default(),
                                     unreadable: Some(err.to_string()),
                                     encoding: None,
+                                    in_dataframe: in_dataframe(name),
                                 },
                             );
                         }
@@ -221,19 +227,21 @@ impl StoreTree {
                     attrs: arr.attributes().clone(),
                     unreadable: None,
                     encoding: None,
+                    in_dataframe: in_dataframe(name),
                 },
             );
         }
 
-        let Some(group_encodings) = encodings else {
+        let Some(anndata_layout) = layout.as_ref() else {
             tree.register_dim_coords();
             return Ok(tree);
         };
-        for (group, encoding) in group_encodings {
+        for (group, encoding) in &anndata_layout.encodings {
             if !is_variable_group(group) || !wanted(group) || inside_variable(group) {
                 continue;
             }
-            let Some(var_encoding) = anndata::variable_encoding(store, group, encoding)? else {
+            let Some(var_encoding) = anndata::variable_encoding(anndata_layout, group, encoding)?
+            else {
                 continue;
             };
             // Shape and chunks come from the array that holds the values.
@@ -261,6 +269,7 @@ impl StoreTree {
                     attrs: Default::default(),
                     encoding: Some(var_encoding),
                     unreadable: None,
+                    in_dataframe: in_dataframe(group),
                 },
             );
         }
@@ -548,13 +557,11 @@ fn is_sparse(var: &NodeVar) -> bool {
     matches!(var.encoding, Some(VarEncoding::Sparse(_)))
 }
 
-/// A dimension coordinate: a 1-D array whose only dimension has its name,
-/// stored directly in its node's group. A column of an AnnData data frame that
-/// is folded into its parent node (`obs/obs` in the root) is not one: the
-/// frame's index is the coordinate, and the column stays a data column.
+/// A dimension coordinate: a 1-D array whose only dimension has its name.
+/// An AnnData data frame's columns never are (see [`NodeVar::in_dataframe`]).
 fn is_dim_coord(var: &NodeVar) -> bool {
     var.encoding.is_none()
-        && node_of(&var.path) == var.node
+        && !var.in_dataframe
         && var.shape.len() == 1
         && var
             .dims

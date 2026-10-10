@@ -98,14 +98,83 @@ SELECT COUNT(*) FROM read_zarr_metadata('test/fixtures/anndata/pbmc_like.zarr', 
 ----
 1
 
-# An obs column named like the obs dimension keeps its store path as its name,
-# so it does not collide with the dimension column of cell names.
-query TI
-SELECT obs, "obs/obs" FROM read_zarr('test/fixtures/anndata/axis_named_columns.zarr', dims := ['obs']) ORDER BY obs;
+# axis_named_columns.zarr (scripts/generate_fixtures.py): obs columns `obs`
+# and `Obs` both collide with the obs dimension column (DuckDB column names
+# ignore case), so they keep their store paths; those collide too, so the later
+# one gets a number.
+query TII
+SELECT obs, "obs/obs", "obs/Obs_1" FROM read_zarr('test/fixtures/anndata/axis_named_columns.zarr', dims := ['obs']) ORDER BY obs;
 ----
-c0	0
-c1	10
-c2	20
+c0	0	1
+c1	10	2
+c2	20	3
+
+# A column named `obs` in an obsm data frame is a column, not the coordinate.
+query TI
+SELECT obs, "obsm/df/obs" FROM read_zarr('test/fixtures/anndata/axis_named_columns.zarr', group_path := 'obsm/df') ORDER BY obs;
+----
+c0	5
+c1	6
+c2	7
+
+# layers a (CSR) and b (CSC) alone cannot be read as one table of stored
+# entries: no table name, and an error that points at array_path=.
+query T
+SELECT table_name FROM read_zarr_groups('test/fixtures/anndata/axis_named_columns.zarr', group_path := 'layers');
+----
+NULL
+
+statement error
+SELECT * FROM read_zarr('test/fixtures/anndata/axis_named_columns.zarr', group_path := 'layers');
+----
+stored partly as CSR and partly as CSC
+
+# array_path= reads one encoded variable alone: here the CSC matrix's stored
+# entries, at integer positions.
+query IIR
+SELECT obs, var, value FROM read_zarr('test/fixtures/anndata/axis_named_columns.zarr', array_path := 'layers/b') ORDER BY obs, var;
+----
+0	1	3.000000
+2	0	4.000000
+
+# obsp d (dense, 0..8, chunks (2, 2)), r (CSR, the even values) and c (CSC, the
+# multiples of 3): both kinds are densified beside the dense array, across its
+# four chunks. Every cell matches.
+query IRRRI
+SELECT COUNT(*), SUM(d), SUM(r), SUM(c),
+       COUNT(*) FILTER (WHERE r != CASE WHEN d % 2 = 0 THEN d ELSE 0 END
+                        OR c != CASE WHEN d % 3 = 0 THEN d ELSE 0 END)
+FROM read_zarr('test/fixtures/anndata/axis_named_columns.zarr', group_path := 'obsp');
+----
+9	36.000000	20.000000	9.000000	0
+
+# group_path= cannot name an encoded variable; every function says so.
+statement error
+SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := 'X');
+----
+'/X' is part of the variable 'X', not a group of tables
+
+statement error
+SELECT * FROM read_zarr_metadata('test/fixtures/anndata/pbmc_like.zarr', group_path := 'obs/cell_type');
+----
+'/obs/cell_type' is part of the variable 'obs/cell_type', not a group of tables
+
+statement error
+SELECT * FROM read_zarr_groups('test/fixtures/anndata/pbmc_like.zarr', group_path := 'X');
+----
+'/X' is part of the variable 'X', not a group of tables
+
+# array_path := 'X' reads the sparse X's 27 stored entries; read_zarr_metadata
+# lists the arrays it is made of.
+query II
+SELECT COUNT(*), MAX(obs) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X');
+----
+27	18
+
+query T
+SELECT string_agg(name, ' ' ORDER BY name) FROM read_zarr_metadata('test/fixtures/anndata/pbmc_like.zarr', array_path := 'X');
+----
+X/data X/indices X/indptr
 
 # ── obs and var: one row per cell or gene, encodings decoded ──────────────────
 query TTTI

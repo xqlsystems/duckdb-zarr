@@ -8,9 +8,8 @@ use zarrs::array::ArraySubset;
 
 use crate::zarr_reader::anndata;
 use crate::zarr_reader::meta::{
-    build_column_defs, build_work_units, dim_group_for_array, extract_file_system,
-    first_chunk_shape, load_coord_array, open_array, open_store, select_array_name, ZarrArray,
-    ZarrStore,
+    array_path_group, build_column_defs, build_work_units, extract_file_system, first_chunk_shape,
+    load_coord_array, open_array, open_store, ZarrArray, ZarrStore,
 };
 use crate::zarr_reader::sparse::{decode_block, plan_blocks, MajorRange, SparseBlock, SparseInput};
 use crate::zarr_reader::tree::{self, StoreTree};
@@ -53,6 +52,9 @@ pub struct ReadZarrBind {
     /// and range start; the count is how many work units have yet to use the
     /// range, and the entry is dropped after the last one.
     pub sparse_ranges: Mutex<RangeCache>,
+    /// The outer axis of the work-unit order. Only matrices with this major
+    /// axis use `sparse_ranges`.
+    pub cached_major_axis: usize,
     pub work_units: Vec<WorkUnit>,
     pub next_unit: AtomicUsize,
 }
@@ -67,11 +69,7 @@ impl ReadZarrBind {
 
     /// The sparse matrices of a sparse table, in data-column order.
     fn sparse_inputs(&self) -> Vec<&SparseInput> {
-        self.columns
-            .iter()
-            .filter(|c| !c.is_coord)
-            .map(|c| &self.sparse[&c.name])
-            .collect()
+        sparse_inputs(&self.columns, &self.sparse)
     }
 }
 
@@ -169,12 +167,7 @@ impl VTab for ReadZarrVTab {
             // with dimensions synthesized as integer indices.
             let array_names =
                 crate::zarr_reader::meta::list_array_names(&store_path, &store).unwrap_or_default();
-            let array_name = if array_names.is_empty() {
-                requested.trim().trim_matches('/').to_string()
-            } else {
-                select_array_name(&array_names, &requested)?
-            };
-            let group = dim_group_for_array(&store, &array_names, &array_name)?;
+            let (array_name, group) = array_path_group(&store, &array_names, &requested)?;
             if let Some(dims) = requested_dims {
                 if group.dims != dims {
                     return Err(format!(
@@ -198,7 +191,7 @@ impl VTab for ReadZarrVTab {
         let shown = tree::display_group(&node);
         tree::ensure_group_exists(&store_path, &array_names, &node)?;
         let store_tree = StoreTree::load_for_node(&store, &array_names, &node)?;
-        anndata::check_not_folded(&store_path, store_tree.layout.as_ref(), &node)?;
+        anndata::check_group_path(&store_path, store_tree.layout.as_ref(), &node)?;
         let node_groups = store_tree.dim_groups(&node);
         if let Some(msg) = node_groups.misaligned {
             return Err(msg.into());
@@ -471,6 +464,14 @@ fn finish_bind(
     decode_times: bool,
     names: ColumnNames,
 ) -> Result<ReadZarrBind, Box<dyn std::error::Error>> {
+    if group.mixes_sparse_storage() {
+        return Err(format!(
+            "sparse matrices {:?} are stored partly as CSR and partly as CSC, so their stored \
+             entries cannot be read as one table; read each alone with array_path := '{}'",
+            group.data_var_names, group.data_var_names[0]
+        )
+        .into());
+    }
     // Load coord arrays.
     let mut coord_arrays: HashMap<String, CoordArray> = HashMap::new();
     for (dim, coord_name) in &group.coords {
@@ -486,25 +487,38 @@ fn finish_bind(
     // (`labels/nuclei/0`), surface that value column as `value` so callers don't
     // have to double-quote it. Decoding still keys off `col.name`.
     let single_data_var = columns.iter().filter(|c| !c.is_coord).count() == 1;
+    // DuckDB column names ignore case and must be unique. A data column whose
+    // name equals, ignoring case, a dimension of the table (an AnnData obs
+    // column called `obs` or `Obs`) or an earlier column (`A` and `a`) keeps its
+    // store path instead (`obs/obs`), as array_path= names it.
+    let mut used: HashSet<String> = group.dims.iter().map(|d| d.to_lowercase()).collect();
     for col in &columns {
         let duckdb_type = col.on_disk_dtype.to_duckdb_type(&col.encoding);
-        // A data column named like one of the table's dimensions (an AnnData
-        // obs column called `obs`) would collide with the dimension column, so
-        // it keeps its store path (`obs/obs`), as array_path= names it.
+        let basename = tree::basename(&col.name);
         let collides = matches!(names, ColumnNames::Basename)
             && !col.is_coord
-            && group.dims.iter().any(|d| d == tree::basename(&col.name));
+            && used.contains(&basename.to_lowercase());
         let name = match names {
-            ColumnNames::Basename if !collides => tree::basename(&col.name),
+            ColumnNames::Basename if !collides => basename,
             _ => col.name.as_str(),
         };
-        let display_name =
+        let mut display_name =
             if !col.is_coord && !collides && single_data_var && needs_value_alias(name) {
-                "value"
+                "value".to_string()
             } else {
-                name
+                name.to_string()
             };
-        bind.add_result_column(display_name, duckdb_type);
+        // Paths can collide too (`obs/obs` and `obs/Obs`); number the later one.
+        if collides && used.contains(&display_name.to_lowercase()) {
+            display_name = (1..)
+                .map(|n| format!("{name}_{n}"))
+                .find(|candidate| !used.contains(&candidate.to_lowercase()))
+                .expect("an unused suffix exists");
+        }
+        if !col.is_coord {
+            used.insert(display_name.to_lowercase());
+        }
+        bind.add_result_column(&display_name, duckdb_type);
     }
 
     // Pre-open data variable arrays once at bind time.
@@ -539,22 +553,7 @@ fn finish_bind(
     // blocks of the major axis. Every matrix must be stored the same way.
     let mut sparse_major_axis = 0;
     let sparse_blocks = if group.is_sparse() {
-        let inputs: Vec<&SparseInput> = columns
-            .iter()
-            .filter(|c| !c.is_coord)
-            .map(|c| &sparse[&c.name])
-            .collect();
-        if inputs
-            .iter()
-            .any(|i| i.matrix.major_axis != inputs[0].matrix.major_axis)
-        {
-            return Err(format!(
-                "sparse matrices {:?} mix CSR and CSC storage; read them one at a time with \
-                 array_path=",
-                group.data_var_names
-            )
-            .into());
-        }
+        let inputs = sparse_inputs(&columns, &sparse);
         sparse_major_axis = inputs[0].matrix.major_axis;
         Some(plan_blocks(&inputs, SPARSE_BLOCK_ENTRIES))
     } else {
@@ -563,14 +562,19 @@ fn finish_bind(
 
     let mut work_units = build_work_units(group);
     // Work units run roughly in order, and the decoded range of a sparse matrix
-    // is kept until every unit across it has run (`sparse_ranges`). Order the
-    // units along the matrix's major axis first, so that only a few ranges are
-    // in memory at a time. build_work_units already does this for CSR.
-    if sparse_blocks.is_none() {
-        if let Some(input) = sparse.values().find(|i| i.matrix.major_axis == 1) {
-            let major = input.matrix.major_axis;
-            work_units.sort_by_key(|wu| (wu.chunk_indices[major], wu.chunk_indices[1 - major]));
-        }
+    // is kept until every unit across it has run (`sparse_ranges`). That bounds
+    // memory to a few ranges only for a matrix whose major axis is the outer
+    // axis of the unit order. build_work_units puts axis 0 outermost, which
+    // suits CSR; when every sparse matrix of the table is CSC, put axis 1
+    // outermost instead. A matrix stored the other way from the order is read
+    // per work unit without the cache.
+    let mut cached_major_axis = 0;
+    if sparse_blocks.is_none()
+        && !sparse.is_empty()
+        && sparse.values().all(|i| i.matrix.major_axis == 1)
+    {
+        cached_major_axis = 1;
+        work_units.sort_by_key(|wu| (wu.chunk_indices[1], wu.chunk_indices[0]));
     }
 
     Ok(ReadZarrBind {
@@ -585,6 +589,7 @@ fn finish_bind(
         sparse_blocks,
         sparse_major_axis,
         sparse_ranges: Mutex::new(HashMap::new()),
+        cached_major_axis,
         work_units,
         next_unit: AtomicUsize::new(0),
     })
@@ -609,6 +614,18 @@ fn unit_region(wu: &WorkUnit, shape: &[u64], chunk_shape: &[u64]) -> ArraySubset
         })
         .collect();
     ArraySubset::new_with_ranges(&ranges)
+}
+
+/// The sparse matrices of a sparse table, in data-column order.
+fn sparse_inputs<'a>(
+    columns: &[ColumnDef],
+    sparse: &'a HashMap<String, SparseInput>,
+) -> Vec<&'a SparseInput> {
+    columns
+        .iter()
+        .filter(|c| !c.is_coord)
+        .map(|c| &sparse[&c.name])
+        .collect()
 }
 
 /// About how many stored entries one work unit of a sparse table decodes.
@@ -731,6 +748,12 @@ fn sparse_range(
     let minor = 1 - major;
     let m0 = origin[major];
     let m1 = (m0 + bind.group_chunk_shape[major]).min(bind.group_shape[major]);
+    // Stored the other way from the unit order, the units across one range
+    // are spread over the whole scan, so caching it would keep every range of
+    // the matrix in memory at once.
+    if major != bind.cached_major_axis {
+        return Ok(Arc::new(input.major_range(m0, m1)?));
+    }
     let uses = bind.group_shape[minor].div_ceil(bind.group_chunk_shape[minor]);
     let key = (name.to_string(), m0);
     // Count one use of the cached range; drop it after the last.

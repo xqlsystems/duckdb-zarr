@@ -578,7 +578,7 @@ Decision 8 reads any nested store as a tree of tables, but an AnnData store need
 >
 > **Why the union, not one table per matrix:** table names come from dims (decision 8), so two `layers` with the same dims must share a table. The union rule is the same rule as for dense arrays, which store every cell, so mixing the two follows from it.
 
-Not done: `awkward-array`, `dataframe` columns in `uns`, and MuData (`encoding-type: MuData`, whose `mod/<name>` subtrees are AnnData objects with their own, shorter `obs`). A CSR matrix with unsorted or duplicate indices reads as stored (scipy would sum duplicates). `array_path=` cannot select an encoded group itself (`array_path := 'X'`); read its group instead.
+Not done: `awkward-array`, `dataframe` columns in `uns`, and MuData (`encoding-type: MuData`, whose `mod/<name>` subtrees are AnnData objects with their own, shorter `obs`). A CSR matrix with unsorted or duplicate indices reads as stored (scipy would sum duplicates). `array_path=` selects an encoded group as one decoded variable, with integer positions for its dimensions as for one array (`anndata::variable_group`); `group_path=` naming one is an error that points there (`check_group_path`). Sparse matrices on their own share a table only if all have the same major axis; a table that mixes CSR and CSC has a `NULL` `table_name`. Beside a dense array, the decoded major ranges of a matrix are shared by work units only when its major axis is the outer axis of the work-unit order, so memory stays at a few ranges.
 
 ## Why this is worth building
 

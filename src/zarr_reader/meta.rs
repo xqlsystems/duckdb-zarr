@@ -381,6 +381,32 @@ pub fn select_array_name(
         })
 }
 
+/// What `array_path := requested` reads, as its path and its one-variable
+/// table: one array, or an AnnData encoded variable (a group of arrays read as
+/// one variable, see [`anndata::variable_group`]). With no listing (a remote
+/// store without consolidated metadata) the path is taken as an array.
+pub fn array_path_group(
+    store: &ZarrStore,
+    array_names: &[String],
+    requested: &str,
+) -> Result<(String, DimGroup), Box<dyn std::error::Error>> {
+    let normalized = requested.trim().trim_matches('/');
+    if !array_names.is_empty() && !array_names.iter().any(|n| n == normalized) {
+        if let Some(layout) = anndata::layout(store, array_names) {
+            if let Some(group) = anndata::variable_group(store, &layout, normalized)? {
+                return Ok((normalized.to_string(), group));
+            }
+        }
+    }
+    let name = if array_names.is_empty() {
+        normalized.to_string()
+    } else {
+        select_array_name(array_names, requested)?
+    };
+    let group = dim_group_for_array(store, array_names, &name)?;
+    Ok((name, group))
+}
+
 /// The shape and declared dimension names of an array, read from its metadata
 /// document without opening it. For an array zarrs cannot open (unknown codec
 /// or data type), so that it can still be placed in its table. `None` when the

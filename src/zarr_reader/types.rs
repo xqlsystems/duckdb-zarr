@@ -233,6 +233,18 @@ pub struct DimGroup {
 }
 
 impl DimGroup {
+    /// Whether this is a table of sparse matrices only, some stored as CSR and
+    /// some as CSC. Its stored entries cannot be read in blocks of one major
+    /// axis, so `read_zarr` cannot read it as one table.
+    pub fn mixes_sparse_storage(&self) -> bool {
+        let mut axes = self.encodings.values().filter_map(|e| match e {
+            VarEncoding::Sparse(m) => Some(m.major_axis),
+            _ => None,
+        });
+        let first = axes.next();
+        self.is_sparse() && axes.any(|a| Some(a) != first)
+    }
+
     /// Whether every data variable is a sparse matrix. Such a table has one row
     /// per stored entry instead of one per cell.
     pub fn is_sparse(&self) -> bool {

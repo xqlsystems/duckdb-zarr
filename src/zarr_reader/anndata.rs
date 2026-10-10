@@ -13,9 +13,9 @@
 
 use std::collections::HashMap;
 
-use super::meta::ZarrStore;
+use super::meta::{first_chunk_shape, open_array, ZarrStore};
 use super::tree::{basename, display_group, join, node_of, self_and_ancestors};
-use super::types::{SparseMatrix, VarEncoding};
+use super::types::{DimGroup, SparseMatrix, VarEncoding};
 
 /// The dimension of AnnData's rows (cells): `n_obs` long.
 pub const OBS: &str = "obs";
@@ -68,6 +68,9 @@ pub struct Layout {
     /// For each `dataframe` group, its columns in order (its `column-order`
     /// attribute), so that tables list them as `adata.obs` does.
     pub column_orders: HashMap<String, Vec<String>>,
+    /// For each `csr_matrix` / `csc_matrix` group, its `shape` attribute, kept
+    /// so that the group's metadata is read once.
+    pub sparse_shapes: HashMap<String, Option<Vec<u64>>>,
 }
 
 impl Layout {
@@ -75,9 +78,6 @@ impl Layout {
         self.encodings.get(group).cloned()
     }
 
-    /// The node whose tables hold the array at `path`: the node of the variable
-    /// it belongs to, which is the outermost encoded group around it
-    /// (categorical, nullable, sparse) or else the array itself.
     /// Where a variable sorts among the columns of its table: by its data
     /// frame's `column-order`, then by path for anything the order does not
     /// list (which keeps other variables in path order).
@@ -89,6 +89,9 @@ impl Layout {
         (rank.unwrap_or(usize::MAX), path.to_string())
     }
 
+    /// The node whose tables hold the array at `path`: the node of the variable
+    /// it belongs to, which is the outermost encoded group around it
+    /// (categorical, nullable, sparse) or else the array itself.
     pub fn node_of_array(&self, path: &str) -> String {
         let variable = self_and_ancestors(node_of(path))
             .into_iter()
@@ -104,9 +107,12 @@ impl Layout {
     }
 }
 
-/// In an AnnData store, `group_path=` naming the `obs`, `var` or `raw/var`
-/// data frame is an error that points at the group its columns belong to.
-pub fn check_not_folded(
+/// In an AnnData store, `group_path=` must name a node of tables. Naming the
+/// `obs`, `var` or `raw/var` data frame is an error that points at the group
+/// its columns belong to, and naming an encoded variable (a sparse matrix, a
+/// categorical) or a group inside one is an error that points at its table and
+/// at `array_path=`.
+pub fn check_group_path(
     store_path: &str,
     layout: Option<&Layout>,
     node: &str,
@@ -114,6 +120,23 @@ pub fn check_not_folded(
     let Some(layout) = layout else {
         return Ok(());
     };
+    let variable = self_and_ancestors(node).into_iter().rev().find(|g| {
+        !g.is_empty()
+            && layout
+                .encoding_of(g)
+                .is_some_and(|e| is_variable_encoding(&e))
+    });
+    if let Some(variable) = variable {
+        let parent = logical_node(node_of(&variable), |g| layout.encoding_of(g));
+        return Err(format!(
+            "'{store_path}': in an AnnData store, '{}' is part of the variable '{variable}', \
+             not a group of tables. It is a column of a table in group '{}'; read it alone \
+             with array_path := '{variable}'",
+            display_group(node),
+            display_group(&parent)
+        )
+        .into());
+    }
     let parent = logical_node(node, |g| layout.encoding_of(g));
     if parent == node {
         return Ok(());
@@ -145,6 +168,13 @@ pub fn layout(store: &ZarrStore, array_names: &[String]) -> Option<Layout> {
             }
             let attrs = read_group_attrs(store, &group).unwrap_or_default();
             let encoding = attr_str(&attrs, "encoding-type").unwrap_or_default();
+            if encoding == "csr_matrix" || encoding == "csc_matrix" {
+                let shape = attrs
+                    .get("shape")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|dims| dims.iter().map(serde_json::Value::as_u64).collect());
+                layout.sparse_shapes.insert(group.clone(), shape);
+            }
             if encoding == "dataframe" {
                 if let Some(index) = attr_str(&attrs, "_index") {
                     layout.indexes.insert(group.clone(), index);
@@ -204,7 +234,7 @@ pub fn is_variable_encoding(encoding: &str) -> bool {
 
 /// The variable stored in the group at `path` with the given encoding.
 pub fn variable_encoding(
-    store: &ZarrStore,
+    layout: &Layout,
     path: &str,
     encoding: &str,
 ) -> Result<Option<VarEncoding>, Box<dyn std::error::Error>> {
@@ -220,12 +250,11 @@ pub fn variable_encoding(
             }
         }
         "csr_matrix" | "csc_matrix" => {
-            let group = zarrs::group::Group::open(store.clone(), &format!("/{path}"))?;
-            let shape = group
-                .attributes()
-                .get("shape")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|dims| dims.iter().map(serde_json::Value::as_u64).collect())
+            let shape = layout
+                .sparse_shapes
+                .get(path)
+                .cloned()
+                .flatten()
                 .ok_or_else(|| format!("sparse matrix '{path}' has no valid `shape` attribute"))?;
             VarEncoding::Sparse(SparseMatrix {
                 major_axis: if encoding == "csr_matrix" { 0 } else { 1 },
@@ -236,6 +265,51 @@ pub fn variable_encoding(
             })
         }
         _ => return Ok(None),
+    }))
+}
+
+/// The one-variable table that `array_path=` reads for an AnnData encoded
+/// variable (a sparse matrix, a categorical or a nullable column), or `None` if
+/// `path` is not one, or lies inside another. Its dimensions are named as in
+/// its table but read as integer positions, as for any one array read alone:
+/// one variable has no index to take names from.
+pub fn variable_group(
+    store: &ZarrStore,
+    layout: &Layout,
+    path: &str,
+) -> Result<Option<DimGroup>, Box<dyn std::error::Error>> {
+    let is_variable = |g: &str| {
+        layout
+            .encoding_of(g)
+            .is_some_and(|e| is_variable_encoding(&e))
+    };
+    let inside_another = self_and_ancestors(node_of(path))
+        .iter()
+        .any(|g| !g.is_empty() && is_variable(g));
+    if path.is_empty() || !is_variable(path) || inside_another {
+        return Ok(None);
+    }
+    let encoding = layout.encoding_of(path).unwrap_or_default();
+    let Some(var_encoding) = variable_encoding(layout, path, &encoding)? else {
+        return Ok(None);
+    };
+    let (shape, chunk_shape) = match &var_encoding {
+        VarEncoding::Categorical { codes: values, .. } | VarEncoding::Nullable { values, .. } => {
+            let arr = open_array(store, values)?;
+            (arr.shape().to_vec(), first_chunk_shape(&arr)?)
+        }
+        VarEncoding::Sparse(matrix) => (matrix.shape.clone(), matrix.shape.clone()),
+    };
+    let dims = axis_names(path, shape.len(), |g| layout.encoding_of(g))
+        .unwrap_or_else(|| (0..shape.len()).map(|i| format!("dim_{i}")).collect());
+    Ok(Some(DimGroup {
+        dims,
+        shape,
+        chunk_shape,
+        data_var_names: vec![path.to_string()],
+        coords: Vec::new(),
+        encodings: HashMap::from([(path.to_string(), var_encoding)]),
+        unreadable: Vec::new(),
     }))
 }
 

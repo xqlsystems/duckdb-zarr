@@ -233,8 +233,13 @@ FROM read_zarr_metadata('test/fixtures/anndata/pbmc_like.zarr')
 ORDER BY name;
 ```
 
-`array_path :=` cannot select an encoded group, for example `'X'` when `X` is
-sparse. Read its table instead.
+`array_path :=` also selects an encoded column on its own, decoded: a sparse
+matrix, a categorical or a nullable column. Like one array, its dimension
+columns hold integer positions. For example, `array_path := 'X'` gives the
+stored entries of a sparse `X` as `obs`, `var` and `value`, and
+`read_zarr_metadata(store, array_path := 'X')` lists the arrays it is made of.
+`group_path :=` cannot name an encoded column, because it is not a group of
+tables.
 
 ## Limits
 
@@ -244,5 +249,13 @@ sparse. Read its table instead.
 - The extension does not read `uns`, awkward arrays, or MuData stores.
 - A sparse matrix with duplicate entries for one position gives one row with
   the last value. scipy adds duplicate entries.
+- Sparse matrices with the same dimensions and no dense array beside them
+  share a table only if all are CSR or all are CSC. A table that mixes the two
+  has no `table_name` in `read_zarr_groups`; read each matrix with
+  `array_path :=`.
+- If two columns of one data frame differ only in case, or one has the name
+  of its axis, they keep their paths as names (`"obs/obs"`), because DuckDB
+  column names ignore case. A path that still collides gets a number
+  (`"obs/Obs_1"`).
 - Remote stores need consolidated metadata to list arrays. Without it, only
   `array_path :=` works.

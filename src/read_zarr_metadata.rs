@@ -74,7 +74,20 @@ impl VTab for ReadZarrMetaVTab {
             return Err("use either group_path= or array_path=, not both".into());
         }
         if let Some(requested) = requested_array {
-            array_names = vec![select_array_name(&array_names, &requested)?];
+            // An AnnData encoded variable lists the arrays it is made of.
+            let prefix = format!("{}/", requested.trim().trim_matches('/'));
+            let encoded = !array_names.iter().any(|n| format!("{n}/") == prefix)
+                && array_names.iter().any(|n| n.starts_with(&prefix))
+                && anndata::layout(&store, &array_names).is_some_and(|layout| {
+                    layout
+                        .encoding_of(prefix.trim_end_matches('/'))
+                        .is_some_and(|e| anndata::is_variable_encoding(&e))
+                });
+            if encoded {
+                array_names.retain(|n| n.starts_with(&prefix));
+            } else {
+                array_names = vec![select_array_name(&array_names, &requested)?];
+            }
         }
         // group_path= lists the arrays of that node's tables, not of its
         // subgroups. In an AnnData store that is the node read_zarr reads each
@@ -84,7 +97,7 @@ impl VTab for ReadZarrMetaVTab {
         let layout = anndata::layout(&store, &array_names);
         if let Some(node) = requested_group {
             tree::ensure_group_exists(&store_path, &array_names, &node)?;
-            anndata::check_not_folded(&store_path, layout.as_ref(), &node)?;
+            anndata::check_group_path(&store_path, layout.as_ref(), &node)?;
             match &layout {
                 Some(layout) => array_names.retain(|name| layout.node_of_array(name) == node),
                 None => array_names.retain(|name| tree::node_of(name) == node),
