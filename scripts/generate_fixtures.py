@@ -85,6 +85,7 @@ def write_zarr(ds: xr.Dataset, name: str, encoding: dict | None = None) -> None:
 # otherwise it is rebuilt. Without this, a copy left over from an older checkout
 # makes the SQL tests fail on value differences that are hard to trace.
 ANNDATA_FIXTURE_VERSION = "5"
+AXIS_NAMED_FIXTURE_VERSION = "1"
 RAGGED_FIXTURE_VERSION = "2"
 DATATREE_FIXTURE_VERSION = "1"
 MANY_TABLES_FIXTURE_VERSION = "1"
@@ -778,7 +779,7 @@ def main() -> None:
     #   * empty rows 7, 8 and 19, so X/indptr repeats offsets;
     #   * a missing string at var/gene_symbol[6], stored in a separate mask;
     #   * a missing category at obs/cell_type[4], stored as code -1.
-    # It also has the elements test/sql/anndata_tables.test reads as tables
+    # It also has the elements test/sql/anndata.test reads as tables
     # (design decision 9):
     #   * layers spliced and unspliced: CSR matrices that store different
     #     entries, so their table is the union of both;
@@ -877,6 +878,27 @@ def main() -> None:
             adata.write_zarr(dest)
         _check_anndata_layout(dest)
         mark_fixture(dest, ANNDATA_FIXTURE_VERSION)
+        print(f"  wrote {dest}")
+
+    # ── anndata/axis_named_columns (real anndata writer) ─────────────────────
+    # Tests: an obs column named `obs`, like the obs dimension, which the obs
+    # table names by its store path (`obs/obs`) so that it does not collide with
+    # the dimension column (test/sql/anndata.test).
+    print("anndata/axis_named_columns (real anndata writer)...")
+    dest = ANNDATA_FIXTURES / "axis_named_columns.zarr"
+    if fixture_is_current(dest, AXIS_NAMED_FIXTURE_VERSION):
+        print(f"  (cached) {dest}")
+    else:
+        import anndata as ad
+        import pandas as pd
+        if dest.exists():
+            _rmtree(dest)
+        obs = pd.DataFrame({"obs": np.arange(3, dtype=np.int64) * 10},
+                           index=["c0", "c1", "c2"])
+        with ad.settings.override(zarr_write_format=3):
+            ad.AnnData(X=np.ones((3, 2), dtype=np.float32), obs=obs,
+                       var=pd.DataFrame(index=["g0", "g1"])).write_zarr(dest)
+        mark_fixture(dest, AXIS_NAMED_FIXTURE_VERSION)
         print(f"  wrote {dest}")
 
     # ── unsupported_dtype (hand-written metadata) ────────────────────────────

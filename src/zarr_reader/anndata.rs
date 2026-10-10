@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 
 use super::meta::ZarrStore;
-use super::tree::{basename, join, node_of, self_and_ancestors};
+use super::tree::{basename, display_group, join, node_of, self_and_ancestors};
 use super::types::{SparseMatrix, VarEncoding};
 
 /// The dimension of AnnData's rows (cells): `n_obs` long.
@@ -71,6 +71,47 @@ impl Layout {
     pub fn encoding_of(&self, group: &str) -> Option<String> {
         self.encodings.get(group).cloned()
     }
+
+    /// The node whose tables hold the array at `path`: the node of the variable
+    /// it belongs to, which is the outermost encoded group around it
+    /// (categorical, nullable, sparse) or else the array itself.
+    pub fn node_of_array(&self, path: &str) -> String {
+        let variable = self_and_ancestors(node_of(path))
+            .into_iter()
+            .rev()
+            .find(|g| {
+                !g.is_empty()
+                    && self
+                        .encoding_of(g)
+                        .is_some_and(|e| is_variable_encoding(&e))
+            })
+            .unwrap_or_else(|| path.to_string());
+        logical_node(node_of(&variable), |g| self.encoding_of(g))
+    }
+}
+
+/// In an AnnData store, `group_path=` naming the `obs`, `var` or `raw/var`
+/// data frame is an error that points at the group its columns belong to.
+pub fn check_not_folded(
+    store_path: &str,
+    layout: Option<&Layout>,
+    node: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(layout) = layout else {
+        return Ok(());
+    };
+    let parent = logical_node(node, |g| layout.encoding_of(g));
+    if parent == node {
+        return Ok(());
+    }
+    let axis = if node == "raw/var" { RAW_VAR } else { node };
+    Err(format!(
+        "'{store_path}': in an AnnData store, the columns of '{}' are in the group '{}': \
+         read_zarr('{store_path}', group_path := '{parent}', dims := ['{axis}'])",
+        display_group(node),
+        display_group(&parent)
+    )
+    .into())
 }
 
 /// The layout of an AnnData store, or `None` for a store whose root is not an

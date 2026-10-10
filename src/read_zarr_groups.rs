@@ -101,7 +101,13 @@ impl VTab for ReadZarrGroupsVTab {
             let store_tree = match &requested_group {
                 Some(node) => {
                     tree::ensure_group_exists(&store_path, &array_names, node)?;
-                    StoreTree::load_for_node(&store, &array_names, node)?
+                    let store_tree = StoreTree::load_for_node(&store, &array_names, node)?;
+                    crate::zarr_reader::anndata::check_not_folded(
+                        &store_path,
+                        store_tree.layout.as_ref(),
+                        node,
+                    )?;
+                    store_tree
                 }
                 None => StoreTree::load(&store, &array_names, None)?,
             };

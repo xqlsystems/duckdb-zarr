@@ -67,6 +67,39 @@ SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', group_path := 'o
 ----
 in an AnnData store, the columns of '/obs' are in the group '/'
 
+# The other table functions follow the same rule.
+statement error
+SELECT * FROM read_zarr_groups('test/fixtures/anndata/pbmc_like.zarr', group_path := 'obs');
+----
+in an AnnData store, the columns of '/obs' are in the group '/'
+
+statement error
+SELECT * FROM read_zarr_metadata('test/fixtures/anndata/pbmc_like.zarr', group_path := 'obs');
+----
+in an AnnData store, the columns of '/obs' are in the group '/'
+
+# read_zarr_metadata(group_path := '/') lists the arrays of the root's tables:
+# X's arrays and the obs and var columns, with the arrays of encoded columns.
+query I
+SELECT string_agg(name, ' ' ORDER BY name) FROM read_zarr_metadata('test/fixtures/anndata/pbmc_like.zarr', group_path := '/')
+WHERE name IN ('X/data', 'obs/n_genes', 'obs/cell_type/codes', 'var/gene_symbol/mask', 'obsm/X_umap', 'layers/spliced/data');
+----
+X/data obs/cell_type/codes obs/n_genes var/gene_symbol/mask
+
+query I
+SELECT COUNT(*) FROM read_zarr_metadata('test/fixtures/anndata/pbmc_like.zarr', group_path := 'obsm');
+----
+1
+
+# An obs column named like the obs dimension keeps its store path as its name,
+# so it does not collide with the dimension column of cell names.
+query TI
+SELECT obs, "obs/obs" FROM read_zarr('test/fixtures/anndata/axis_named_columns.zarr', dims := ['obs']) ORDER BY obs;
+----
+c0	0
+c1	10
+c2	20
+
 # ── obs and var: one row per cell or gene, encodings decoded ──────────────────
 query TTTI
 SELECT obs, cell_type, donor, batch

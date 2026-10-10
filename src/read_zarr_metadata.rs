@@ -75,10 +75,23 @@ impl VTab for ReadZarrMetaVTab {
         if let Some(requested) = requested_array {
             array_names = vec![select_array_name(&array_names, &requested)?];
         }
-        // group_path= lists the arrays directly in that group, not in its subgroups.
+        // group_path= lists the arrays of that node's tables, not of its
+        // subgroups. In an AnnData store that is the node read_zarr reads each
+        // array's variable from: the obs and var columns are in the root, and the
+        // arrays of an encoded group (X/data, obs/cell_type/codes) go with it.
         if let Some(node) = requested_group {
             crate::zarr_reader::tree::ensure_group_exists(&store_path, &array_names, &node)?;
-            array_names.retain(|name| crate::zarr_reader::tree::node_of(name) == node);
+            match crate::zarr_reader::anndata::layout(&store, &array_names) {
+                Some(layout) => {
+                    crate::zarr_reader::anndata::check_not_folded(
+                        &store_path,
+                        Some(&layout),
+                        &node,
+                    )?;
+                    array_names.retain(|name| layout.node_of_array(name) == node);
+                }
+                None => array_names.retain(|name| crate::zarr_reader::tree::node_of(name) == node),
+            }
         }
 
         // Open every array once. One with a data type or codec that zarrs cannot

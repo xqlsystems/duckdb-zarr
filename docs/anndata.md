@@ -36,6 +36,11 @@ can filter and join any table by name. Both axes of `obsp` show cell names, and
 both axes of `varp` show gene names. The `<k>_component` column of an `obsm`
 table is the component number, from 0.
 
+If a data frame has a column with the same name as its axis, for example an
+`obs` column called `obs`, that column keeps its path in the store as its
+name, `"obs/obs"`. Otherwise it would have the same name as the column of cell
+names.
+
 The extension decodes AnnData's encodings:
 
 - A categorical column with string categories reads as a DuckDB `ENUM` of its
@@ -218,7 +223,9 @@ dimensions. Its dimensions are `dim_0`, `dim_1`, and so on. For example,
 `dim_0` and `value`, and the categories are not applied.
 
 `read_zarr_metadata` lists every array. The `array_path_dims` column gives the
-dimension names that `array_path :=` uses for each array.
+dimension names that `array_path :=` uses for each array. With `group_path :=`,
+it lists the arrays of that group's tables: `group_path := '/'` gives the
+arrays of `X` and of the `obs` and `var` columns.
 
 ```sql
 SELECT name, dtype, shape, array_path_dims

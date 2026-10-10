@@ -48,8 +48,9 @@ pub struct StoreTree {
     /// dimension) is registered in its node; so is an AnnData data frame's
     /// index, under its axis (`obs`, `var`).
     pub coords: HashMap<(String, String), (String, u64)>,
-    /// Whether the store is an AnnData object (decision 9).
-    pub is_anndata: bool,
+    /// The AnnData layout, for a store whose root is an AnnData object
+    /// (decision 9); `None` for other stores.
+    pub layout: Option<anndata::Layout>,
     /// Arrays zarrs cannot open and whose metadata document cannot be read
     /// either. They are left out of every table; `read_zarr_metadata` lists
     /// them.
@@ -170,10 +171,7 @@ impl StoreTree {
                 .any(|g| is_variable_group(g))
         };
 
-        let mut tree = StoreTree {
-            is_anndata: layout.is_some(),
-            ..Default::default()
-        };
+        let mut tree = StoreTree::default();
         for name in array_names {
             if !wanted(name)
                 || inside_variable(name)
@@ -270,6 +268,7 @@ impl StoreTree {
         if let Some(layout) = &layout {
             tree.register_anndata_indexes(layout);
         }
+        tree.layout = layout;
         Ok(tree)
     }
 
@@ -345,9 +344,9 @@ impl StoreTree {
     /// `chunk_shape` is the largest chunk length in each dimension, the grid
     /// `read_zarr` plans work units on (decision 6). Two entries with the same
     /// dims mean arrays that share dimension names but not a shape; `read_zarr`
-    /// cannot read those dims as one table. A node that is not aligned with its ancestors is reported in
-    /// [`NodeGroups::misaligned`] rather than as an error, so that
-    /// `read_zarr_groups` can still list the rest of the store.
+    /// cannot read those dims as one table. A node that is not aligned with its
+    /// ancestors is reported in [`NodeGroups::misaligned`] rather than as an
+    /// error, so that `read_zarr_groups` can still list the rest of the store.
     pub fn dim_groups(&self, node: &str) -> NodeGroups {
         let mut misaligned = self.check_alignment(node).err();
         let facts: Vec<ArrayFacts> = self
@@ -541,9 +540,13 @@ fn is_sparse(var: &NodeVar) -> bool {
     matches!(var.encoding, Some(VarEncoding::Sparse(_)))
 }
 
-/// A dimension coordinate: a 1-D array whose only dimension has its name.
+/// A dimension coordinate: a 1-D array whose only dimension has its name,
+/// stored directly in its node's group. A column of an AnnData data frame that
+/// is folded into its parent node (`obs/obs` in the root) is not one: the
+/// frame's index is the coordinate, and the column stays a data column.
 fn is_dim_coord(var: &NodeVar) -> bool {
     var.encoding.is_none()
+        && node_of(&var.path) == var.node
         && var.shape.len() == 1
         && var
             .dims

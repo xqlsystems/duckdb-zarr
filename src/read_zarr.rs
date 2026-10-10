@@ -6,6 +6,7 @@ use duckdb::core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab, Value};
 use zarrs::array::ArraySubset;
 
+use crate::zarr_reader::anndata;
 use crate::zarr_reader::meta::{
     build_column_defs, build_work_units, dim_group_for_array, extract_file_system,
     first_chunk_shape, load_coord_array, open_array, open_store, select_array_name, ZarrArray,
@@ -181,6 +182,7 @@ impl VTab for ReadZarrVTab {
         let shown = tree::display_group(&node);
         tree::ensure_group_exists(&store_path, &array_names, &node)?;
         let store_tree = StoreTree::load_for_node(&store, &array_names, &node)?;
+        anndata::check_not_folded(&store_path, store_tree.layout.as_ref(), &node)?;
         let node_groups = store_tree.dim_groups(&node);
         if let Some(msg) = node_groups.misaligned {
             return Err(msg.into());
@@ -190,21 +192,6 @@ impl VTab for ReadZarrVTab {
         if dim_groups.is_empty() {
             // AnnData's obs and var columns are read from the root group, and
             // raw/var's from raw (decision 9).
-            if store_tree.is_anndata && matches!(node.as_str(), "obs" | "var" | "raw/var") {
-                let parent = tree::node_of(&node);
-                let axis = if node == "raw/var" {
-                    "raw_var"
-                } else {
-                    node.as_str()
-                };
-                return Err(format!(
-                    "'{store_path}': in an AnnData store, the columns of '{shown}' are in the \
-                     group '{}': read_zarr('{store_path}', group_path := '{parent}', dims := \
-                     ['{axis}'])",
-                    tree::display_group(parent)
-                )
-                .into());
-            }
             let mut msg = format!("'{store_path}': no data variables in group '{shown}'");
             if !node_groups.unnamed.is_empty() {
                 msg.push_str(&format!(
@@ -481,15 +468,22 @@ fn finish_bind(
     let single_data_var = columns.iter().filter(|c| !c.is_coord).count() == 1;
     for col in &columns {
         let duckdb_type = col.on_disk_dtype.to_duckdb_type(&col.encoding);
+        // A data column named like one of the table's dimensions (an AnnData
+        // obs column called `obs`) would collide with the dimension column, so
+        // it keeps its store path (`obs/obs`), as array_path= names it.
+        let collides = matches!(names, ColumnNames::Basename)
+            && !col.is_coord
+            && group.dims.iter().any(|d| d == tree::basename(&col.name));
         let name = match names {
-            ColumnNames::Basename => tree::basename(&col.name),
-            ColumnNames::ArrayPath => col.name.as_str(),
+            ColumnNames::Basename if !collides => tree::basename(&col.name),
+            _ => col.name.as_str(),
         };
-        let display_name = if !col.is_coord && single_data_var && needs_value_alias(name) {
-            "value"
-        } else {
-            name
-        };
+        let display_name =
+            if !col.is_coord && !collides && single_data_var && needs_value_alias(name) {
+                "value"
+            } else {
+                name
+            };
         bind.add_result_column(display_name, duckdb_type);
     }
 
