@@ -12,7 +12,7 @@ use crate::zarr_reader::meta::{
     first_chunk_shape, load_coord_array, open_array, open_store, select_array_name, ZarrArray,
     ZarrStore,
 };
-use crate::zarr_reader::sparse::{decode_block, plan_blocks, SparseBlock, SparseInput};
+use crate::zarr_reader::sparse::{decode_block, plan_blocks, MajorRange, SparseBlock, SparseInput};
 use crate::zarr_reader::tree::{self, StoreTree};
 use crate::zarr_reader::types::{
     ColumnDef, CoordArray, DimGroup, FixedValues, MaskedValues, SharedColumnValues, StringValues,
@@ -22,6 +22,10 @@ use crate::zarr_reader::types::{
 // ---------------------------------------------------------------------------
 // BindData — shared, immutable, produced once per query.
 // ---------------------------------------------------------------------------
+
+/// Decoded major ranges of sparse matrices, by (variable, range start), with
+/// the number of work units that have yet to use each.
+type RangeCache = HashMap<(String, u64), (Arc<MajorRange>, u64)>;
 
 pub struct ReadZarrBind {
     pub group_shape: Vec<u64>,
@@ -43,6 +47,12 @@ pub struct ReadZarrBind {
     /// For a table of sparse matrices only: the axis that `indptr` indexes
     /// (0 for CSR, 1 for CSC), the same for every matrix of the table.
     pub sparse_major_axis: usize,
+    /// For sparse matrices in a dense table: decoded ranges of a matrix's major
+    /// axis, shared by the work units across each range so that its entries
+    /// are read once, not once per chunk of the minor axis. Keyed by variable
+    /// and range start; the count is how many work units have yet to use the
+    /// range, and the entry is dropped after the last one.
+    pub sparse_ranges: Mutex<RangeCache>,
     pub work_units: Vec<WorkUnit>,
     pub next_unit: AtomicUsize,
 }
@@ -551,7 +561,17 @@ fn finish_bind(
         None
     };
 
-    let work_units = build_work_units(group);
+    let mut work_units = build_work_units(group);
+    // Work units run roughly in order, and the decoded range of a sparse matrix
+    // is kept until every unit across it has run (`sparse_ranges`). Order the
+    // units along the matrix's major axis first, so that only a few ranges are
+    // in memory at a time. build_work_units already does this for CSR.
+    if sparse_blocks.is_none() {
+        if let Some(input) = sparse.values().find(|i| i.matrix.major_axis == 1) {
+            let major = input.matrix.major_axis;
+            work_units.sort_by_key(|wu| (wu.chunk_indices[major], wu.chunk_indices[1 - major]));
+        }
+    }
 
     Ok(ReadZarrBind {
         group_shape: group.shape.clone(),
@@ -564,6 +584,7 @@ fn finish_bind(
         sparse,
         sparse_blocks,
         sparse_major_axis,
+        sparse_ranges: Mutex::new(HashMap::new()),
         work_units,
         next_unit: AtomicUsize::new(0),
     })
@@ -615,7 +636,8 @@ fn decode_work_unit(
                 .zip(&bind.group_chunk_shape)
                 .map(|(i, c)| i * c)
                 .collect();
-            let bytes = input.dense_chunk(&origin, &bind.group_chunk_shape, &bind.group_shape)?;
+            let range = sparse_range(bind, &col.name, input, &origin)?;
+            let bytes = input.dense_chunk(&range, &origin, &bind.group_chunk_shape);
             let values =
                 FixedValues::new(bytes, input.dtype.clone(), col.encoding.clone(), None)
                     .ok_or_else(|| format!("sparse matrix '{}' is not fixed-width", col.name))?;
@@ -694,6 +716,45 @@ fn decode_work_unit(
     }
 
     Ok(chunk_values)
+}
+
+/// The decoded major range of sparse matrix `name` that the dense chunk at
+/// `origin` lies in, from `bind.sparse_ranges` or else read now and kept for
+/// the other work units across the same range.
+fn sparse_range(
+    bind: &ReadZarrBind,
+    name: &str,
+    input: &SparseInput,
+    origin: &[u64],
+) -> Result<Arc<MajorRange>, Box<dyn std::error::Error>> {
+    let major = input.matrix.major_axis;
+    let minor = 1 - major;
+    let m0 = origin[major];
+    let m1 = (m0 + bind.group_chunk_shape[major]).min(bind.group_shape[major]);
+    let uses = bind.group_shape[minor].div_ceil(bind.group_chunk_shape[minor]);
+    let key = (name.to_string(), m0);
+    // Count one use of the cached range; drop it after the last.
+    let take = |cache: &mut RangeCache| {
+        let (range, left) = cache.get_mut(&key)?;
+        let range = range.clone();
+        *left -= 1;
+        if *left == 0 {
+            cache.remove(&key);
+        }
+        Some(range)
+    };
+    if let Some(range) = take(&mut bind.sparse_ranges.lock().unwrap()) {
+        return Ok(range);
+    }
+    let range = Arc::new(input.major_range(m0, m1)?);
+    if uses > 1 {
+        let mut cache = bind.sparse_ranges.lock().unwrap();
+        // Another thread may have read the same range meanwhile.
+        if take(&mut cache).is_none() {
+            cache.insert(key, (range.clone(), uses - 1));
+        }
+    }
+    Ok(range)
 }
 
 fn compute_chunk_rows(wu: &WorkUnit, shape: &[u64], chunk_shape: &[u64]) -> usize {

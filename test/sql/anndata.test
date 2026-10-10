@@ -28,7 +28,7 @@
 #   layers/unspliced csr_matrix, -(i + j + 1) where (i + j) % 2 == 0 (80 entries)
 #   obsm/X_umap      dense 2-D float32, values 0..39
 #   obsp/connectivities  csc_matrix 20x20, (i, (i + 1) % 20) = i + 0.5
-#   varp/corr        dense 8x8 float64, values 0..63
+#   varp/corr        dense 8x8 float64, values 0..63, chunks (3, 3)
 #   varp/corr_csc    csc_matrix, corr where corr % 4 == 0
 #
 # The `dtype` strings are how zarrs prints a data type: "<v3 name> / <v2 name>",

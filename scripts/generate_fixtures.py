@@ -84,7 +84,7 @@ def write_zarr(ds: xr.Dataset, name: str, encoding: dict | None = None) -> None:
 # only when the `<name>.zarr.version` file next to it holds the same version;
 # otherwise it is rebuilt. Without this, a copy left over from an older checkout
 # makes the SQL tests fail on value differences that are hard to trace.
-ANNDATA_FIXTURE_VERSION = "5"
+ANNDATA_FIXTURE_VERSION = "6"
 AXIS_NAMED_FIXTURE_VERSION = "1"
 RAGGED_FIXTURE_VERSION = "2"
 DATATREE_FIXTURE_VERSION = "1"
@@ -784,7 +784,7 @@ def main() -> None:
     #   * layers spliced and unspliced: CSR matrices that store different
     #     entries, so their table is the union of both;
     #   * obsp/connectivities: a CSC matrix (indptr runs over columns);
-    #   * varp: a dense array and a CSC matrix of the same shape, so the CSC
+    #   * varp: a dense array chunked (3, 3) and a CSC matrix of the same shape, so the CSC
     #     matrix is read densely beside it;
     #   * obs/batch: a categorical with integer categories.
     # anndata is imported inside this block so that a missing or broken anndata
@@ -876,6 +876,17 @@ def main() -> None:
             adata.obs["donor"] = pd.array([f"donor_{i:02d}" for i in range(n_obs)], dtype="string")
             adata.strings_to_categoricals = lambda *args, **kwargs: None
             adata.write_zarr(dest)
+        # Rechunk the dense varp/corr as (3, 3), so the CSC corr_csc beside it is
+        # densified across several chunks of each axis: work units share one
+        # decoded column range of the CSC matrix (design decision 9).
+        g = zarr.open_group(str(dest), mode="a", use_consolidated=False)
+        corr_attrs = dict(g["varp/corr"].attrs)
+        del g["varp/corr"]
+        rechunked = g["varp"].create_array("corr", shape=corr.shape, chunks=(3, 3),
+                                           dtype=corr.dtype)
+        rechunked[:] = corr
+        rechunked.attrs.update(corr_attrs)
+        zarr.consolidate_metadata(str(dest))
         _check_anndata_layout(dest)
         mark_fixture(dest, ANNDATA_FIXTURE_VERSION)
         print(f"  wrote {dest}")

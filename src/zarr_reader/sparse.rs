@@ -13,6 +13,15 @@ use super::types::{SparseMatrix, ZarrDtype};
 /// Minor indices of a run of stored entries, and their values if requested.
 type Entries = (Vec<u64>, Option<Vec<u8>>);
 
+/// The decoded stored entries of one range of a sparse matrix's major axis.
+#[derive(Debug)]
+pub struct MajorRange {
+    m0: u64,
+    m1: u64,
+    indices: Vec<u64>,
+    data: Vec<u8>,
+}
+
 /// One sparse matrix, opened at bind time with its whole `indptr` in memory.
 pub struct SparseInput {
     pub matrix: SparseMatrix,
@@ -99,29 +108,35 @@ impl SparseInput {
         Ok((indices, data))
     }
 
-    /// The matrix's values in one chunk of a dense table, laid out as a full
-    /// chunk of `chunk_shape` in C order (the layout zarrs returns for a dense
-    /// chunk, padding included). Cells the matrix does not store are 0.
-    pub fn dense_chunk(
-        &self,
-        origin: &[u64],
-        chunk_shape: &[u64],
-        shape: &[u64],
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    /// The stored entries of the major range `m0..m1`, decoded once so that
+    /// every dense chunk across that range can be cut from them
+    /// ([`Self::dense_chunk`]).
+    pub fn major_range(&self, m0: u64, m1: u64) -> Result<MajorRange, Box<dyn std::error::Error>> {
+        let (indices, data) = self.entries(m0, m1, true)?;
+        Ok(MajorRange {
+            m0,
+            m1,
+            indices,
+            data: data.expect("requested data"),
+        })
+    }
+
+    /// One dense chunk of the matrix: `chunk_shape` elements laid out like
+    /// `retrieve_chunk` (padded past the edge), 0 where nothing is stored.
+    /// `range` must cover the chunk's major range ([`Self::major_range`]).
+    pub fn dense_chunk(&self, range: &MajorRange, origin: &[u64], chunk_shape: &[u64]) -> Vec<u8> {
         let size = self.elem_size();
         let mut out = vec![0u8; (chunk_shape[0] * chunk_shape[1]) as usize * size];
         let major = self.matrix.major_axis;
         let minor = 1 - major;
         let m0 = origin[major];
-        let m1 = (m0 + chunk_shape[major]).min(shape[major]);
+        debug_assert_eq!(m0, range.m0, "major range does not start at the chunk");
         let (lo, hi) = (origin[minor], origin[minor] + chunk_shape[minor]);
-        let (indices, data) = self.entries(m0, m1, true)?;
-        let data = data.expect("requested data");
-        let base = self.indptr[m0 as usize];
-        for m in m0..m1 {
+        let base = self.indptr[range.m0 as usize];
+        for m in range.m0..range.m1 {
             let (start, end) = (self.indptr[m as usize], self.indptr[m as usize + 1]);
             for pos in (start - base)..(end - base) {
-                let j = indices[pos as usize];
+                let j = range.indices[pos as usize];
                 if j < lo || j >= hi {
                     continue;
                 }
@@ -130,10 +145,10 @@ impl SparseInput {
                 local[minor] = j - lo;
                 let flat = (local[0] * chunk_shape[1] + local[1]) as usize;
                 let src = pos as usize * size;
-                out[flat * size..(flat + 1) * size].copy_from_slice(&data[src..src + size]);
+                out[flat * size..(flat + 1) * size].copy_from_slice(&range.data[src..src + size]);
             }
         }
-        Ok(out)
+        out
     }
 }
 
@@ -384,10 +399,15 @@ mod tests {
         let store: ZarrStore = Arc::new(inner);
         let a = SparseInput::open(&store, "a", &a).unwrap();
         // Rows 2..4, columns 3..6 (column 5 is padding past the edge).
-        let chunk = a.dense_chunk(&[2, 3], &[2, 3], &[4, 5]).unwrap();
+        let rows = a.major_range(2, 4).unwrap();
+        let chunk = a.dense_chunk(&rows, &[2, 3], &[2, 3]);
         assert_eq!(floats(&chunk), vec![0., 3., 0., 0., 0., 0.]);
-        let chunk = a.dense_chunk(&[0, 0], &[2, 3], &[4, 5]).unwrap();
+        // One decoded range serves every chunk across it.
+        let rows = a.major_range(0, 2).unwrap();
+        let chunk = a.dense_chunk(&rows, &[0, 0], &[2, 3]);
         assert_eq!(floats(&chunk), vec![1., 0., 0., 0., 0., 0.]);
+        let chunk = a.dense_chunk(&rows, &[0, 3], &[2, 3]);
+        assert_eq!(floats(&chunk), vec![2., 0., 0., 0., 0., 0.]);
     }
 
     #[test]
