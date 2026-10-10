@@ -232,12 +232,14 @@ SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/multi_dim_group.zarr', di
 no dimension group matches
 
 # ── air_temperature_gradient ─────────────────────────────────────────────────
-# Mismatched chunk shapes within one dim group → bind error.
+# Tair is chunked [1, 4, 6] and dTdx, dTdy [2, 4, 6] over the same dims. One
+# table reads all three (decision 6); test/sql/ragged_chunks.test checks values.
 
-statement error
-SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/air_temperature_gradient.zarr') LIMIT 1;
+query IIII
+SELECT COUNT(*), COUNT(Tair), COUNT(dTdx), COUNT(DISTINCT time)
+FROM read_zarr('test/fixtures/xarray_tutorial/air_temperature_gradient.zarr');
 ----
-chunk shape mismatch
+96	96	96	4
 
 # ── big_endian ────────────────────────────────────────────────────────────────
 # Big-endian bytes codec: zarrs normalises to native; memcpy must be correct.

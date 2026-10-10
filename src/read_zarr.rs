@@ -1,15 +1,17 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use duckdb::core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab, Value};
+use zarrs::array::ArraySubset;
 
 use crate::zarr_reader::meta::{
     build_column_defs, build_work_units, dim_group_for_array, dimension_names, extract_file_system,
-    infer_dim_groups, load_coord_array, open_array, open_store, select_array_name, ZarrArray,
+    first_chunk_shape, load_coord_array, open_array, open_store, select_array_name, ZarrArray,
     ZarrStore,
 };
+use crate::zarr_reader::tree::{self, StoreTree};
 use crate::zarr_reader::types::{
     ColumnDef, CoordArray, DimGroup, FixedValues, SharedColumnValues, StringValues, WorkUnit,
     ZarrDtype,
@@ -26,6 +28,9 @@ pub struct ReadZarrBind {
     pub coord_arrays: HashMap<String, CoordArray>,
     /// Pre-opened data-variable arrays; avoids O(n_chunks × n_vars) metadata reads.
     pub arrays: HashMap<String, ZarrArray>,
+    /// Data variables whose chunk shape differs from `group_chunk_shape`. They
+    /// are read as an array subset per work unit instead of one chunk.
+    pub subset_reads: HashSet<String>,
     pub work_units: Vec<WorkUnit>,
     pub next_unit: AtomicUsize,
 }
@@ -50,7 +55,7 @@ pub struct LocalState {
     /// Index of the current work unit being streamed out row-by-row.
     pub current_unit_idx: usize,
     /// Decoded values for the current work unit, one entry per data variable.
-    pub current_chunk_values: HashMap<String, SharedColumnValues>,
+    pub current_chunk_values: HashMap<String, UnitValues>,
     /// Row cursor within the current chunk (how many rows have been emitted).
     pub row_cursor: usize,
     /// Total rows in the current chunk.
@@ -93,6 +98,14 @@ impl VTab for ReadZarrVTab {
             return Err("use either array_path= or \"array\"=, not both".into());
         }
         let requested_array = array_path.or(array_alias);
+        let requested_group = tree::group_param(bind)?;
+        if requested_group.is_some() && requested_array.is_some() {
+            return Err(
+                "use either group_path= or array_path=, not both; array_path= is relative to \
+                 the store root"
+                    .into(),
+            );
+        }
 
         // Mirrors xarray.open_zarr's decode_times=: on by default, opt out to see
         // the raw CF offsets instead of TIMESTAMPs.
@@ -126,7 +139,7 @@ impl VTab for ReadZarrVTab {
                     .into());
                 }
             }
-            return finish_bind(bind, store, &group, decode_times);
+            return finish_bind(bind, store, &group, decode_times, ColumnNames::ArrayPath);
         }
 
         let array_names = crate::zarr_reader::meta::list_array_names(&store_path, &store)?;
@@ -134,32 +147,89 @@ impl VTab for ReadZarrVTab {
             return Err(format!("no Zarr arrays found in '{store_path}'").into());
         }
 
-        let (dim_groups, _coord_names) = infer_dim_groups(&store, &array_names)?;
+        // One node (Zarr group) of the store, the root unless group_path= says
+        // otherwise, as in xarray.open_zarr (design decision 8).
+        let node = requested_group.unwrap_or_default();
+        let shown = tree::display_group(&node);
+        tree::ensure_group_exists(&store_path, &array_names, &node)?;
+        let store_tree = StoreTree::load_for_node(&store, &array_names, &node)?;
+        let node_groups = store_tree.dim_groups(&node);
+        if let Some(msg) = node_groups.misaligned {
+            return Err(msg.into());
+        }
+        let dim_groups = &node_groups.groups;
 
         if dim_groups.is_empty() {
-            return Err(format!("no data variables found in '{store_path}'").into());
+            let mut msg = format!("'{store_path}': no data variables in group '{shown}'");
+            if !node_groups.unnamed.is_empty() {
+                msg.push_str(&format!(
+                    "; these arrays declare no dimension names: {:?}. Read one with \
+                     array_path=, which names its dimensions dim_0, dim_1 and so on",
+                    node_groups.unnamed
+                ));
+            }
+            msg.push_str(&format!(
+                ". Use group_path= to read another group; read_zarr_groups('{store_path}') lists \
+                 the tables in every group"
+            ));
+            return Err(msg.into());
         }
 
-        let group = match requested_dims {
-            Some(ref dims) => dim_groups.iter().find(|g| g.dims == *dims).ok_or_else(|| {
-                format!(
-                    "'{store_path}': no dimension group matches dims={dims:?}; available: {:?}",
-                    dim_groups.iter().map(|g| &g.dims).collect::<Vec<_>>()
-                )
-            })?,
+        let available = || {
+            let mut dims: Vec<&Vec<String>> = dim_groups.iter().map(|g| &g.dims).collect();
+            dims.dedup();
+            dims
+        };
+        let wanted: &[String] = match &requested_dims {
+            Some(dims) => dims,
             None => {
-                if dim_groups.len() > 1 {
+                let distinct = available();
+                if distinct.len() > 1 {
                     return Err(format!(
-                        "'{store_path}' contains multiple dimension groups ({}) {:?}; use dims= to select a compatible group or array_path= to select one array",
-                        dim_groups.len(),
-                        dim_groups.iter().map(|g| &g.dims).collect::<Vec<_>>()
-                    ).into());
+                        "'{store_path}': group '{shown}' contains multiple dimension groups ({}) \
+                         {distinct:?}; use dims= to select a compatible group or array_path= to \
+                         select one array",
+                        distinct.len()
+                    )
+                    .into());
                 }
-                &dim_groups[0]
+                &dim_groups[0].dims
+            }
+        };
+        let matching: Vec<&DimGroup> = dim_groups.iter().filter(|g| g.dims == wanted).collect();
+        let group = match matching.as_slice() {
+            [] => {
+                return Err(format!(
+                    "'{store_path}': no dimension group matches dims={wanted:?} in group \
+                     '{shown}'; available: {:?}",
+                    available()
+                )
+                .into())
+            }
+            [group] => *group,
+            [a, b, ..] => {
+                return Err(format!(
+                    "array shape mismatch in dim group {wanted:?}: {:?} {:?} vs {:?} {:?}; \
+                     use array_path= to select one array",
+                    a.data_var_names, a.shape, b.data_var_names, b.shape
+                )
+                .into());
             }
         };
 
-        finish_bind(bind, store, group, decode_times)
+        // Leaving an array out would return the table without it and no sign
+        // that it is missing.
+        if !group.unreadable.is_empty() {
+            let names: Vec<&str> = group.unreadable.iter().map(|(p, _)| p.as_str()).collect();
+            let (first, err) = &group.unreadable[0];
+            return Err(format!(
+                "'{store_path}': zarrs cannot open {names:?}, which belong to the table \
+                 {wanted:?} in group '{shown}' ('{first}': {err}); read the other arrays one \
+                 at a time with array_path="
+            )
+            .into());
+        }
+        finish_bind(bind, store, group, decode_times, ColumnNames::Basename)
     }
 
     fn supports_pushdown() -> bool {
@@ -264,7 +334,7 @@ impl VTab for ReadZarrVTab {
     }
 
     fn named_parameters() -> Option<Vec<(String, duckdb::core::LogicalTypeHandle)>> {
-        Some(vec![
+        let mut params = vec![
             (
                 "dims".to_string(),
                 LogicalTypeHandle::list(&LogicalTypeId::Varchar.into()),
@@ -272,7 +342,9 @@ impl VTab for ReadZarrVTab {
             ("array".to_string(), LogicalTypeId::Varchar.into()),
             ("array_path".to_string(), LogicalTypeId::Varchar.into()),
             ("decode_times".to_string(), LogicalTypeId::Boolean.into()),
-        ])
+        ];
+        params.extend(crate::zarr_reader::tree::group_named_parameters());
+        Some(params)
     }
 }
 
@@ -298,11 +370,21 @@ fn parse_dims_param(value: Value) -> Result<Vec<String>, Box<dyn std::error::Err
     Ok(items.iter().map(|item| item.to_string()).collect())
 }
 
+/// How data-variable columns are named.
+#[derive(Clone, Copy, PartialEq)]
+enum ColumnNames {
+    /// The variable's name within its group, as in xarray (`foo`, not `a/b/foo`).
+    Basename,
+    /// One array selected by `array_path=`: its store-relative path.
+    ArrayPath,
+}
+
 fn finish_bind(
     bind: &BindInfo,
     store: ZarrStore,
     group: &DimGroup,
     decode_times: bool,
+    names: ColumnNames,
 ) -> Result<ReadZarrBind, Box<dyn std::error::Error>> {
     // Load coord arrays.
     let mut coord_arrays: HashMap<String, CoordArray> = HashMap::new();
@@ -317,26 +399,35 @@ fn finish_bind(
 
     let columns = build_column_defs(&store, group, &coord_arrays, decode_times)?;
 
-    // Register output columns with DuckDB. When a single array is selected by
-    // array_path, its name is a numeric level (`0`) or a nested store-relative
-    // path (`labels/nuclei/0`); surface that value column as `value` so callers
-    // don't have to double-quote it. Decoding still keys off `col.name`.
+    // Register output columns with DuckDB. A group read names each data column
+    // after the variable's name within the group. When a single array's name is a
+    // numeric level (`0`) or, for array_path=, a nested store-relative path
+    // (`labels/nuclei/0`), surface that value column as `value` so callers don't
+    // have to double-quote it. Decoding still keys off `col.name`.
     let single_data_var = columns.iter().filter(|c| !c.is_coord).count() == 1;
     for col in &columns {
         let duckdb_type = col.on_disk_dtype.to_duckdb_type(&col.encoding);
-        let display_name = if single_data_var && !col.is_coord && needs_value_alias(&col.name) {
+        let name = match names {
+            ColumnNames::Basename => tree::basename(&col.name),
+            ColumnNames::ArrayPath => col.name.as_str(),
+        };
+        let display_name = if !col.is_coord && single_data_var && needs_value_alias(name) {
             "value"
         } else {
-            col.name.as_str()
+            name
         };
         bind.add_result_column(display_name, duckdb_type);
     }
 
     // Pre-open data variable arrays once at bind time.
     let mut arrays: HashMap<String, ZarrArray> = HashMap::new();
+    let mut subset_reads = HashSet::new();
     for col in &columns {
         if !col.is_coord {
             let arr = open_array(&store, &col.name)?;
+            if first_chunk_shape(&arr)? != group.chunk_shape {
+                subset_reads.insert(col.name.clone());
+            }
             arrays.insert(col.name.clone(), arr);
         }
     }
@@ -349,17 +440,40 @@ fn finish_bind(
         columns,
         coord_arrays,
         arrays,
+        subset_reads,
         work_units,
         next_unit: AtomicUsize::new(0),
     })
+}
+
+/// One data variable's decoded values for a work unit.
+pub struct UnitValues {
+    pub values: SharedColumnValues,
+    /// `true` when the values are one whole chunk as `retrieve_chunk` returns
+    /// it: laid out over the full chunk shape, padded past the array's edge.
+    /// `false` for an array subset, laid out over the work unit's clipped
+    /// region only.
+    pub padded: bool,
+}
+
+/// The region of the array that work unit `wu` covers, clipped to `shape`.
+fn unit_region(wu: &WorkUnit, shape: &[u64], chunk_shape: &[u64]) -> ArraySubset {
+    let ranges: Vec<std::ops::Range<u64>> = (0..shape.len())
+        .map(|k| {
+            let start = wu.chunk_indices[k] * chunk_shape[k];
+            start..(start + chunk_shape[k]).min(shape[k])
+        })
+        .collect();
+    ArraySubset::new_with_ranges(&ranges)
 }
 
 fn decode_work_unit(
     bind: &ReadZarrBind,
     wu: &WorkUnit,
     projected: &HashMap<usize, usize>,
-) -> Result<HashMap<String, SharedColumnValues>, Box<dyn std::error::Error>> {
+) -> Result<HashMap<String, UnitValues>, Box<dyn std::error::Error>> {
     let mut chunk_values = HashMap::new();
+    let region = unit_region(wu, &bind.group_shape, &bind.group_chunk_shape);
 
     for (col_idx, col) in bind.columns.iter().enumerate() {
         if col.is_coord {
@@ -372,14 +486,26 @@ fn decode_work_unit(
             .arrays
             .get(&col.name)
             .ok_or_else(|| format!("array '{}' not found in bind cache", col.name))?;
+        // An array chunked like the plan reads one chunk. An array chunked
+        // differently reads the work unit's region, which may span several of
+        // its chunks or part of one (decision 6).
+        let padded = !bind.subset_reads.contains(&col.name);
         let data: SharedColumnValues = if col.on_disk_dtype == ZarrDtype::String {
-            // retrieve_chunk fills missing (implicit) chunks with the dtype's
+            // Both calls fill missing (implicit) chunks with the dtype's
             // fill_value automatically, same as the fixed-width path below.
-            let strings = arr.retrieve_chunk::<Vec<String>>(&wu.chunk_indices)?;
+            let strings = if padded {
+                arr.retrieve_chunk::<Vec<String>>(&wu.chunk_indices)?
+            } else {
+                arr.retrieve_array_subset::<Vec<String>>(&region)?
+            };
             Arc::new(StringValues { strings })
         } else {
             // ArrayBytes<'static>: zarrs convention for requesting owned decoded bytes.
-            let raw = arr.retrieve_chunk::<zarrs::array::ArrayBytes<'static>>(&wu.chunk_indices)?;
+            let raw = if padded {
+                arr.retrieve_chunk::<zarrs::array::ArrayBytes<'static>>(&wu.chunk_indices)?
+            } else {
+                arr.retrieve_array_subset::<zarrs::array::ArrayBytes<'static>>(&region)?
+            };
             let bytes: Vec<u8> = raw
                 .into_fixed()
                 .map_err(|_| format!("variable-length dtype not supported for '{}'", col.name))?
@@ -394,7 +520,13 @@ fn decode_work_unit(
                 .ok_or_else(|| format!("no fixed-width dtype for '{}'", col.name))?,
             )
         };
-        chunk_values.insert(col.name.clone(), data);
+        chunk_values.insert(
+            col.name.clone(),
+            UnitValues {
+                values: data,
+                padded,
+            },
+        );
     }
 
     Ok(chunk_values)
@@ -423,7 +555,7 @@ fn fill_chunk_slice(
     wu: &WorkUnit,
     group_shape: &[u64],
     group_chunk_shape: &[u64],
-    chunk_values: &HashMap<String, SharedColumnValues>,
+    chunk_values: &HashMap<String, UnitValues>,
     output: &mut DataChunkHandle,
     vector_base: usize,
     chunk_row_start: usize,
@@ -495,16 +627,17 @@ fn fill_chunk_slice(
                     }
                 }
             } else {
-                // Data variable: use zarrs_flat to index into the physical byte buffer.
-                chunk_values
-                    .get(&col_def.name)
-                    .unwrap_or_else(|| {
-                        unreachable!(
-                            "projected data variable '{}' missing from chunk_values",
-                            col_def.name
-                        )
-                    })
-                    .write_element(&mut vector, zarrs_flat, dst);
+                // Data variable: a whole chunk is indexed through the padded
+                // (zarrs) strides; an array subset holds only the clipped region,
+                // in row order.
+                let unit = chunk_values.get(&col_def.name).unwrap_or_else(|| {
+                    unreachable!(
+                        "projected data variable '{}' missing from chunk_values",
+                        col_def.name
+                    )
+                });
+                let idx = if unit.padded { zarrs_flat } else { flat_row };
+                unit.values.write_element(&mut vector, idx, dst);
             }
         }
     }

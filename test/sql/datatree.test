@@ -1,0 +1,179 @@
+# name: test/sql/datatree.test
+# description: nested Zarr groups (xarray.DataTree.to_zarr) read one group at a time (design decision 8)
+# group: [zarr]
+
+require zarr
+
+# Store layout (scripts/generate_fixtures.py):
+#   /                    x = [10, 20, 30], bar(x)
+#   /simulation/coarse   y = [0, 1],          foo(x, y)
+#   /simulation/fine     y = [0, .5, 1, 1.5], foo(x, y)
+#   /misaligned          baz(x) with 2 values: not aligned with the root's x
+
+# ── The root group is the default ─────────────────────────────────────────────
+
+query IR
+SELECT x, bar FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr') ORDER BY x;
+----
+10	1.500000
+20	2.500000
+30	3.500000
+
+# The replacement scan reads the root too.
+query I
+SELECT COUNT(*) FROM 'test/fixtures/xarray_tutorial/datatree.zarr';
+----
+3
+
+# ── group= selects one node ───────────────────────────────────────────────────
+
+# Both leaves have foo(x, y) with different lengths of y. Each is its own table,
+# and each inherits x from the root. Columns are named as in the group: foo,
+# not simulation/fine/foo.
+query IRR
+SELECT x, y, foo
+FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', group_path := 'simulation/fine')
+WHERE x = 20
+ORDER BY y;
+----
+20	0.000000	104.000000
+20	0.500000	105.000000
+20	1.000000	106.000000
+20	1.500000	107.000000
+
+query III
+SELECT COUNT(*), COUNT(DISTINCT x), COUNT(DISTINCT y)
+FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', group_path := 'simulation/coarse');
+----
+6	3	2
+
+# Leading and trailing slashes are ignored, and '/' is the root.
+query I
+SELECT SUM(foo)
+FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', group_path := '/simulation/coarse/', dims := ['x', 'y']);
+----
+15
+
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', group_path := '/');
+----
+3
+
+# "group" is xarray's name for the parameter. GROUP is a DuckDB keyword, so the
+# quotes are required.
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', "group" := 'simulation/fine');
+----
+12
+
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', "group" := 'a', group_path := 'b');
+----
+use either group_path= or "group"=
+
+# A group with no arrays of its own.
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', group_path := 'simulation');
+----
+no data variables in group '/simulation'
+
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', group_path := 'nope');
+----
+group '/nope' not found
+
+# array_path= is store-relative, so it does not combine with group=.
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', group_path := 'simulation/fine', array_path := 'foo');
+----
+use either group_path= or array_path=
+
+# A group whose x is shorter than the root's x cannot be read, as in xarray.
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', group_path := 'misaligned');
+----
+group '/misaligned' is not aligned with its parent '/'
+
+# array_path= still reads its one array without any alignment check.
+query I
+SELECT SUM(value) FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', array_path := 'misaligned/baz');
+----
+15
+
+# ── read_zarr_groups is the catalog ───────────────────────────────────────────
+
+# One row per table in every group, with the schema and table name it maps to.
+# The misaligned group's table has no name because read_zarr cannot read it.
+query TTTTTT
+SELECT group_path, schema_name, table_name, dims, data_vars, coord_vars
+FROM read_zarr_groups('test/fixtures/xarray_tutorial/datatree.zarr')
+ORDER BY group_path;
+----
+/	main	x	["x"]	["bar"]	["x"]
+/misaligned	misaligned	NULL	["x"]	["misaligned/baz"]	[]
+/simulation/coarse	simulation/coarse	x_y	["x","y"]	["simulation/coarse/foo"]	["x","simulation/coarse/y"]
+/simulation/fine	simulation/fine	x_y	["x","y"]	["simulation/fine/foo"]	["x","simulation/fine/y"]
+
+query TT
+SELECT table_name, shape
+FROM read_zarr_groups('test/fixtures/xarray_tutorial/datatree.zarr', group_path := 'simulation/fine');
+----
+x_y	[3,4]
+
+# ── read_zarr_metadata group= lists the arrays of one group ────────────────────
+
+query TT
+SELECT name, role
+FROM read_zarr_metadata('test/fixtures/xarray_tutorial/datatree.zarr', group_path := 'simulation/fine')
+ORDER BY name;
+----
+simulation/fine/foo	data
+simulation/fine/y	coord
+
+# ── Mounting the catalog by hand ──────────────────────────────────────────────
+# The recipe in docs/design.md, decision 8: one schema per group, one view per
+# read_zarr_groups row that has a table name.
+
+statement ok
+ATTACH ':memory:' AS sim;
+
+statement ok
+CREATE SCHEMA sim."simulation/fine";
+
+statement ok
+CREATE VIEW sim."simulation/fine".x_y AS
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', group_path := 'simulation/fine', dims := ['x', 'y']);
+
+statement ok
+CREATE VIEW sim.main.x AS
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', group_path := '', dims := ['x']);
+
+query IRR
+SELECT f.x, r.bar, SUM(f.foo)
+FROM sim."simulation/fine".x_y AS f
+JOIN sim.main.x AS r USING (x)
+GROUP BY ALL
+ORDER BY f.x;
+----
+10	1.500000	406.000000
+20	2.500000	422.000000
+30	3.500000	438.000000
+
+# ── a group_path that does not exist is an error in every function ───────────
+statement error
+SELECT * FROM read_zarr_groups('test/fixtures/xarray_tutorial/datatree.zarr', group_path := 'simulaton');
+----
+group '/simulaton' not found
+
+statement error
+SELECT * FROM read_zarr_metadata('test/fixtures/xarray_tutorial/datatree.zarr', group_path := 'simulaton');
+----
+group '/simulaton' not found
+
+# ── more tables than one output chunk holds ──────────────────────────────────
+# many_tables.zarr has 2100 one-array tables; DuckDB vectors hold 2048 rows.
+query III
+SELECT COUNT(*), COUNT(DISTINCT table_name), MAX(table_name = 'd2099')::INT
+FROM read_zarr_groups('test/fixtures/xarray_tutorial/many_tables.zarr');
+----
+2100	2100	1

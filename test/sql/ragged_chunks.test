@@ -1,0 +1,81 @@
+# name: test/sql/ragged_chunks.test
+# description: boundary chunks smaller than the nominal chunk shape (strings and numbers)
+# group: [zarr]
+#
+# zarrs pads the element buffer of a boundary chunk to the full chunk shape, with fill
+# values past the edge of the array. The scan must skip that padding, for strings as
+# well as numbers (docs/design.md, Variable-length strings). Fixture: `ragged_chunks`
+# in scripts/generate_fixtures.py.
+#
+#   s, v  (r=5, c=3) chunks (2, 2)  ragged in both dims; s is a string array
+#   t     (i=10)     chunks (4,)    chunks of 4, 4, 2; string
+#   x27   (n=27)     chunks (10,)   chunks of 10, 10, 7; float32 (the shape of a CSR X/data)
+#   u     (i=10)     chunks (3,)    float32 3*i, in the table of t (chunks 4)
+#   p     (a=5, b=3) chunks (3, 2)  float32 a*10 + b
+#   q     (a=5, b=3) chunks (2, 1)  int32 a*100 + b
+#   qs    (a=5, b=3) chunks (2, 2)  string 'q<a><b>'
+#
+# One table can hold arrays with different chunk shapes (docs/design.md,
+# decision 6). Work units follow the largest chunk length in each dimension, and
+# arrays chunked otherwise are read as array subsets, which may span several of
+# their chunks or cut one.
+
+require zarr
+
+# 2-D, ragged in both dims: all 15 cells of s and v match the generator
+# (s = 's<r><c>', v = r*10 + c).
+query II
+SELECT COUNT(*),
+       COUNT(*) FILTER (WHERE s != 's' || r::VARCHAR || c::VARCHAR OR v != r * 10 + c)
+FROM read_zarr('test/fixtures/xarray_tutorial/ragged_chunks.zarr', dims := ['r', 'c']);
+----
+15	0
+
+# 1-D ragged string array; the last chunk holds 2 of 4 elements. A top-level array
+# keeps its name as the column name. Arrays under a group, and numeric names, are
+# exposed as `value`.
+query II
+SELECT COUNT(*), COUNT(*) FILTER (WHERE t != 't' || i::VARCHAR)
+FROM read_zarr('test/fixtures/xarray_tutorial/ragged_chunks.zarr', array_path := 't');
+----
+10	0
+
+# 1-D ragged float32; the last chunk holds 7 of 10 elements.
+query IIR
+SELECT COUNT(*), COUNT(*) FILTER (WHERE x27 != n * 2), SUM(x27)
+FROM read_zarr('test/fixtures/xarray_tutorial/ragged_chunks.zarr', array_path := 'x27');
+----
+27	0	702.000000
+
+# ── different chunk shapes in one table ──────────────────────────────────────
+# read_zarr_groups shows the grid work units follow: the largest chunk length
+# in each dimension.
+query II
+SELECT dims, chunk_shape FROM read_zarr_groups('test/fixtures/xarray_tutorial/ragged_chunks.zarr')
+WHERE dims IN ('["i"]', '["a","b"]') ORDER BY dims;
+----
+["a","b"]	[3,2]
+["i"]	[4]
+
+# t (chunks 4) and u (chunks 3): boundaries that don't nest; t is a string.
+query II
+SELECT COUNT(*), COUNT(*) FILTER (WHERE t != 't' || i::VARCHAR OR u != 3 * i)
+FROM read_zarr('test/fixtures/xarray_tutorial/ragged_chunks.zarr', dims := ['i']);
+----
+10	0
+
+# p is chunked like the plan; q and qs are read as subsets. Every cell matches.
+query II
+SELECT COUNT(*),
+       COUNT(*) FILTER (WHERE p != a * 10 + b OR q != a * 100 + b
+                        OR qs != 'q' || a::VARCHAR || b::VARCHAR)
+FROM read_zarr('test/fixtures/xarray_tutorial/ragged_chunks.zarr', dims := ['a', 'b']);
+----
+15	0
+
+# Projection of a subset-read array alone, and a filter on it.
+query I
+SELECT SUM(q) FROM read_zarr('test/fixtures/xarray_tutorial/ragged_chunks.zarr', dims := ['a', 'b'])
+WHERE a >= 3;
+----
+2106

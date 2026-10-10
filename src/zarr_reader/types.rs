@@ -4,7 +4,7 @@ use duckdb::core::{FlatVector, LogicalTypeHandle, LogicalTypeId};
 
 use super::cftime::CfTimeEncoding;
 
-/// On-disk Zarr numeric dtype as reported by zarrs `DataType::to_string()`.
+/// On-disk Zarr dtype as reported by zarrs `DataType::to_string()`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ZarrDtype {
     Bool,
@@ -140,6 +140,10 @@ pub struct DimGroup {
     pub chunk_shape: Vec<u64>,
     pub data_var_names: Vec<String>,
     pub coord_var_names: Vec<String>,
+    /// Arrays of this table that zarrs cannot open (unsupported data type or
+    /// codec), with the error. `read_zarr` fails on such a table rather than
+    /// return it without them.
+    pub unreadable: Vec<(String, String)>,
 }
 
 /// Decoded element values for one array segment (strategy interface).

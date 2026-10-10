@@ -79,6 +79,30 @@ def write_zarr(ds: xr.Dataset, name: str, encoding: dict | None = None) -> None:
     print(f"  wrote {dest}")
 
 
+# Bump a version when you change what its fixture contains. A fixture is reused
+# only when the `<name>.zarr.version` file next to it holds the same version;
+# otherwise it is rebuilt. Without this, a copy left over from an older checkout
+# makes the SQL tests fail on value differences that are hard to trace.
+RAGGED_FIXTURE_VERSION = "2"
+DATATREE_FIXTURE_VERSION = "1"
+MANY_TABLES_FIXTURE_VERSION = "1"
+UNSUPPORTED_FIXTURE_VERSION = "1"
+UNREADABLE_FIXTURE_VERSION = "1"
+
+
+def _version_marker(dest: pathlib.Path) -> pathlib.Path:
+    return dest.with_name(dest.name + ".version")
+
+
+def fixture_is_current(dest: pathlib.Path, version: str, sentinel: str = "zarr.json") -> bool:
+    marker = _version_marker(dest)
+    return (dest / sentinel).exists() and marker.exists() and marker.read_text().strip() == version
+
+
+def mark_fixture(dest: pathlib.Path, version: str) -> None:
+    _version_marker(dest).write_text(version + "\n")
+
+
 def ensure_attr(ds: xr.Dataset, var: str, key: str, value) -> xr.Dataset:
     """Add key=value to da.attrs; restores attrs xarray moved to encoding."""
     da = ds[var].copy()
@@ -378,7 +402,7 @@ def main() -> None:
         xr.Dataset({"gene_symbol": gene_symbol_da}).to_zarr(
             dest, zarr_format=2, consolidated=False)
         print(f"  wrote {dest}")
-    
+
     # ── cf_time (synthetic) ──────────────────────────────────────────────────
     # Tests: CF time decoding to DuckDB TIMESTAMP.
     #   (time, lat)        — int64 "hours since 1900-01-01 00:00:00", the
@@ -700,6 +724,181 @@ def main() -> None:
             _rmtree(dest)
         http_ds.to_zarr(dest, zarr_format=3, consolidated=False)
         zarr.consolidate_metadata(str(dest))
+        print(f"  wrote {dest}")
+
+    # ── unsupported_dtype (hand-written metadata) ────────────────────────────
+    # Tests: read_zarr_metadata lists an array zarrs cannot open (unknown dtype)
+    # as role='unsupported' instead of failing the whole call, while the good
+    # array beside it is still listed normally. `good` declares no dimension
+    # names, as in a store written by plain zarr-python (test/sql/unnamed_arrays.test).
+    print("unsupported_dtype (synthetic)...")
+    dest = FIXTURES / "unsupported_dtype.zarr"
+    if fixture_is_current(dest, UNSUPPORTED_FIXTURE_VERSION):
+        print(f"  (cached) {dest}")
+    else:
+        import json
+        if dest.exists():
+            _rmtree(dest)
+
+        def _array_json(data_type, fill_value):
+            return {
+                "zarr_format": 3, "node_type": "array", "shape": [4],
+                "data_type": data_type,
+                "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [4]}},
+                "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+                "fill_value": fill_value,
+                "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}],
+                "attributes": {},
+            }
+
+        for rel, doc in {
+            "": {"zarr_format": 3, "node_type": "group", "attributes": {}},
+            "good": _array_json("float32", 0.0),
+            "bad": _array_json("not_a_real_dtype", 0),
+        }.items():
+            d = dest / rel
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "zarr.json").write_text(json.dumps(doc))
+        mark_fixture(dest, UNSUPPORTED_FIXTURE_VERSION)
+        print(f"  wrote {dest}")
+
+    # ── unreadable_in_table (hand-written metadata) ──────────────────────────
+    # Tests: an array zarrs cannot open but whose metadata names its dimensions.
+    # `bad(x)` shares the x table with `good(x)`, so reading that table fails and
+    # names `bad`; the y table (`other(y)`) still reads (test/sql/unnamed_arrays.test).
+    print("unreadable_in_table (synthetic)...")
+    dest = FIXTURES / "unreadable_in_table.zarr"
+    if fixture_is_current(dest, UNREADABLE_FIXTURE_VERSION):
+        print(f"  (cached) {dest}")
+    else:
+        import json
+        if dest.exists():
+            _rmtree(dest)
+
+        def _named_array_json(data_type, fill_value, dim, n):
+            return {
+                "zarr_format": 3, "node_type": "array", "shape": [n],
+                "data_type": data_type,
+                "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [n]}},
+                "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+                "fill_value": fill_value,
+                "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}],
+                "attributes": {}, "dimension_names": [dim],
+            }
+
+        for rel, doc in {
+            "": {"zarr_format": 3, "node_type": "group", "attributes": {}},
+            "good": _named_array_json("float32", 0.0, "x", 4),
+            "bad": _named_array_json("not_a_real_dtype", 0, "x", 4),
+            "other": _named_array_json("float32", 1.5, "y", 3),
+        }.items():
+            d = dest / rel
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "zarr.json").write_text(json.dumps(doc))
+        mark_fixture(dest, UNREADABLE_FIXTURE_VERSION)
+        print(f"  wrote {dest}")
+
+    # ── ragged_chunks (synthetic) ────────────────────────────────────────────
+    # Tests: boundary chunks whose extent is smaller than the nominal chunk shape —
+    # every other fixture is a single chunk. zarrs pads a boundary chunk's element
+    # buffer to the full nominal shape (design.md §Variable-length strings), for
+    # strings as much as numbers, and the reader's offset math must skip the padding.
+    #   s, v  (r=5, c=3), chunks (2, 2): ragged in BOTH dims; s is a string array
+    #   t     (i=10),     chunks (4,):   ragged 1-D string array (4, 4, 2)
+    #   x27   (n=27),     chunks (10,):  ragged 1-D float32, the shape of a CSR X/data
+    # Arrays of one table with different chunk shapes (decision 6). The table is
+    # planned on the largest chunk length per dim; the others are read as subsets:
+    #   u     (i=10),     chunks (3,):   beside t (chunks 4), boundaries that don't nest
+    #   p     (a=5, b=3), chunks (3, 2): float32, a*10 + b; chunked like the plan
+    #   q     (a=5, b=3), chunks (2, 1): int32, a*100 + b
+    #   qs    (a=5, b=3), chunks (2, 2): string, 'q<a><b>'
+    print("ragged_chunks (synthetic)...")
+    dest = FIXTURES / "ragged_chunks.zarr"
+    if fixture_is_current(dest, RAGGED_FIXTURE_VERSION):
+        print(f"  (cached) {dest}")
+    else:
+        if dest.exists():
+            _rmtree(dest)
+        rr, cc = np.meshgrid(np.arange(5), np.arange(3), indexing="ij")
+        aa, bb = rr, cc
+        ds_ragged = xr.Dataset({
+            "s": xr.DataArray(
+                np.array([[f"s{r}{c}" for c in range(3)] for r in range(5)], dtype=object),
+                dims=["r", "c"]),
+            "v": xr.DataArray((rr * 10 + cc).astype("float32"), dims=["r", "c"]),
+            "t": xr.DataArray(np.array([f"t{i}" for i in range(10)], dtype=object), dims=["i"]),
+            "x27": xr.DataArray((np.arange(27) * 2).astype("float32"), dims=["n"]),
+            "u": xr.DataArray((np.arange(10) * 3).astype("float32"), dims=["i"]),
+            "p": xr.DataArray((aa * 10 + bb).astype("float32"), dims=["a", "b"]),
+            "q": xr.DataArray((aa * 100 + bb).astype("int32"), dims=["a", "b"]),
+            "qs": xr.DataArray(
+                np.array([[f"q{a}{b}" for b in range(3)] for a in range(5)], dtype=object),
+                dims=["a", "b"]),
+        })
+        ds_ragged.to_zarr(
+            dest, zarr_format=3, consolidated=False,
+            encoding={"s": {"chunks": (2, 2)}, "v": {"chunks": (2, 2)},
+                      "t": {"chunks": (4,)}, "x27": {"chunks": (10,)}, "u": {"chunks": (3,)},
+                      "p": {"chunks": (3, 2)}, "q": {"chunks": (2, 1)}, "qs": {"chunks": (2, 2)}})
+        mark_fixture(dest, RAGGED_FIXTURE_VERSION)
+        print(f"  wrote {dest}")
+
+    # ── many_tables (hand-written metadata) ──────────────────────────────────
+    # Tests: read_zarr_groups returns more rows than one DuckDB vector (2048)
+    # holds. 2100 arrays v<i>, each over its own dimension d<i>, are 2100 tables.
+    # Metadata only: no chunk is written, so every value is the fill value.
+    print("many_tables (synthetic)...")
+    dest = FIXTURES / "many_tables.zarr"
+    if fixture_is_current(dest, MANY_TABLES_FIXTURE_VERSION):
+        print(f"  (cached) {dest}")
+    else:
+        import json
+        if dest.exists():
+            _rmtree(dest)
+        dest.mkdir(parents=True)
+        (dest / "zarr.json").write_text(
+            json.dumps({"zarr_format": 3, "node_type": "group", "attributes": {}}))
+        for i in range(2100):
+            d = dest / f"v{i}"
+            d.mkdir()
+            (d / "zarr.json").write_text(json.dumps({
+                "zarr_format": 3, "node_type": "array", "shape": [1], "data_type": "int8",
+                "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [1]}},
+                "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+                "fill_value": 0, "codecs": [{"name": "bytes"}], "attributes": {},
+                "dimension_names": [f"d{i}"],
+            }))
+        mark_fixture(dest, MANY_TABLES_FIXTURE_VERSION)
+        print(f"  wrote {dest}")
+
+    # ── datatree (xarray.DataTree.to_zarr) ───────────────────────────────────
+    # Tests: nested groups as one table set per group (design decision 8,
+    # test/sql/datatree.test). The two leaf groups both hold foo(x, y) with
+    # different lengths of y, which flattening every group into one pool cannot
+    # read. Both inherit the root's x coordinate.
+    print("datatree (xarray.DataTree.to_zarr)...")
+    dest = FIXTURES / "datatree.zarr"
+    if fixture_is_current(dest, DATATREE_FIXTURE_VERSION):
+        print(f"  (cached) {dest}")
+    else:
+        if dest.exists():
+            _rmtree(dest)
+        x = np.array([10, 20, 30], dtype="int64")
+        dt = xr.DataTree.from_dict({
+            "/": xr.Dataset({"bar": ("x", np.array([1.5, 2.5, 3.5]))}, coords={"x": x}),
+            "/simulation/coarse": xr.Dataset(
+                {"foo": (("x", "y"), np.arange(6, dtype="float64").reshape(3, 2))},
+                coords={"y": np.array([0.0, 1.0])}),
+            "/simulation/fine": xr.Dataset(
+                {"foo": (("x", "y"), np.arange(12, dtype="float64").reshape(3, 4) + 100)},
+                coords={"y": np.array([0.0, 0.5, 1.0, 1.5])}),
+        })
+        dt.to_zarr(dest, zarr_format=3, consolidated=False)
+        # A group that DataTree would refuse: its x is shorter than the root's.
+        # Written with plain Dataset.to_zarr, which does not check.
+        xr.Dataset({"baz": ("x", np.array([7, 8], dtype="int32"))}).to_zarr(
+            dest, group="misaligned", mode="a", zarr_format=3, consolidated=False)
+        mark_fixture(dest, DATATREE_FIXTURE_VERSION)
         print(f"  wrote {dest}")
 
     # ── anndata (real, non-synthetic) ────────────────────────────────────────

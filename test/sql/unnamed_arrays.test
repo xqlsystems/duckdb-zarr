@@ -1,0 +1,69 @@
+# name: test/sql/unnamed_arrays.test
+# description: arrays that declare no dimension names, and arrays zarrs cannot open
+# group: [zarr]
+#
+# Fixture: unsupported_dtype.zarr in scripts/generate_fixtures.py. `good` is a
+# float32 array of 4 zeros with no dimension_names (as plain zarr-python writes
+# it). `bad` has a data type zarrs does not know. See docs/design.md, decision 7.
+
+require zarr
+
+# read_zarr_metadata lists `bad` as unsupported instead of failing the call.
+query III
+SELECT name, dtype, role FROM read_zarr_metadata('test/fixtures/xarray_tutorial/unsupported_dtype.zarr') ORDER BY name;
+----
+bad	unsupported	unsupported
+good	float32 / <f4	data
+
+query I
+SELECT attrs LIKE '%not_a_real_dtype%' FROM read_zarr_metadata('test/fixtures/xarray_tutorial/unsupported_dtype.zarr') WHERE name = 'bad';
+----
+true
+
+# `dims` shows only declared names. `array_path_dims` shows the names that
+# read_zarr(store, array_path := name) binds.
+query II
+SELECT dims, array_path_dims FROM read_zarr_metadata('test/fixtures/xarray_tutorial/unsupported_dtype.zarr') WHERE name = 'good';
+----
+[]	["dim_0"]
+
+# array_path= names an unnamed dimension dim_0 and reads it as an integer index.
+query III
+SELECT COUNT(*), MIN(dim_0), MAX(dim_0) FROM read_zarr('test/fixtures/xarray_tutorial/unsupported_dtype.zarr', array_path := 'good');
+----
+4	0	3
+
+query I
+SELECT SUM(good) FROM read_zarr('test/fixtures/xarray_tutorial/unsupported_dtype.zarr', array_path := 'good');
+----
+0.0
+
+# A group read leaves unnamed arrays out, so this store's root has no data. The
+# error names the array and suggests array_path= (decision 8).
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/unsupported_dtype.zarr');
+----
+these arrays declare no dimension names: ["bad", "good"]. Read one with array_path=
+
+# ── an array zarrs cannot open, in a table ───────────────────────────────────
+# unreadable_in_table.zarr: good(x) float32, bad(x) with an unknown data type,
+# other(y) float32. bad belongs to the x table; reading that table fails and
+# names it, instead of returning the table without it.
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/unreadable_in_table.zarr', dims := ['x']);
+----
+zarrs cannot open ["bad"], which belong to the table ["x"]
+
+# The y table does not hold bad and still reads.
+query II
+SELECT COUNT(*), MAX(y) FROM read_zarr('test/fixtures/xarray_tutorial/unreadable_in_table.zarr', dims := ['y']);
+----
+3	2
+
+# read_zarr_groups lists both tables; the x table has no name because it cannot
+# be read as one table.
+query TT
+SELECT dims, table_name FROM read_zarr_groups('test/fixtures/xarray_tutorial/unreadable_in_table.zarr') ORDER BY dims;
+----
+["x"]	NULL
+["y"]	y
