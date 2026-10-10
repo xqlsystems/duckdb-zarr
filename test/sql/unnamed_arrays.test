@@ -43,4 +43,27 @@ SELECT SUM(good) FROM read_zarr('test/fixtures/xarray_tutorial/unsupported_dtype
 statement error
 SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/unsupported_dtype.zarr');
 ----
-these arrays declare no dimension names: ["good"]. Read one with array_path=
+these arrays declare no dimension names: ["bad", "good"]. Read one with array_path=
+
+# ── an array zarrs cannot open, in a table ───────────────────────────────────
+# unreadable_in_table.zarr: good(x) float32, bad(x) with an unknown data type,
+# other(y) float32. bad belongs to the x table; reading that table fails and
+# names it, instead of returning the table without it.
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/unreadable_in_table.zarr', dims := ['x']);
+----
+zarrs cannot open ["bad"], which belong to the table ["x"]
+
+# The y table does not hold bad and still reads.
+query II
+SELECT COUNT(*), MAX(y) FROM read_zarr('test/fixtures/xarray_tutorial/unreadable_in_table.zarr', dims := ['y']);
+----
+3	2
+
+# read_zarr_groups lists both tables; the x table has no name because it cannot
+# be read as one table.
+query TT
+SELECT dims, table_name FROM read_zarr_groups('test/fixtures/xarray_tutorial/unreadable_in_table.zarr') ORDER BY dims;
+----
+["x"]	NULL
+["y"]	y

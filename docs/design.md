@@ -516,7 +516,9 @@ A Zarr store can nest groups, as an `xarray.DataTree` written with `DataTree.to_
 - `table_name` is `NULL` when `read_zarr(store, group_path := g, dims := d)` would fail for that row: the node is not aligned with its ancestors, or the node has arrays with the same dims but different shapes (multiscale levels). Such rows are still listed, one per shape, and stay readable with `array_path=`. It is also `NULL` for groups whose names collide after case folding, which `read_zarr` can still read with `dims :=`.
 - A `group_path=` that names no group is an error in `read_zarr`, `read_zarr_groups` and `read_zarr_metadata`, not an empty result.
 - Alignment follows xarray's check: a node's dimension lengths must match its parent's arrays, and an inherited coordinate must match the length of the dimension it labels. Only arrays with dimension names count. `array_path=` reads skip the check.
-- Arrays with no dimension names, and arrays zarrs cannot open, are left out of a node's tables. `read_zarr_metadata` still lists them.
+- Arrays with no dimension names are left out of a node's tables; `read_zarr_metadata` still lists them. An array zarrs cannot open (unsupported data type or codec) is placed in its table from its raw metadata document (`raw_array_layout`). Reading that table fails and names the array, and its `table_name` is `NULL`, so a column never goes missing without notice; the node's other tables still read.
+- `read_zarr_groups` emits its rows in pages of one DuckDB vector, since a store can have more tables than one vector holds.
+- The CF rules that keep auxiliary coordinates and bounds variables out of tables (`cf_auxiliary_vars` in `meta.rs`) are the same ones that give them their `role` in `read_zarr_metadata`.
 - Columns of a group read are named after the variable within its node (`foo`), as in xarray, not after its store path.
 
 The mounting recipe, generated from the catalog (`'sim.zarr'` and `sim` are the store and the alias):

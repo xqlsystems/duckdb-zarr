@@ -380,6 +380,39 @@ pub fn select_array_name(
         })
 }
 
+/// The shape and declared dimension names of an array, read from its metadata
+/// document without opening it. For an array zarrs cannot open (unknown codec
+/// or data type), so that it can still be placed in its table. `None` when the
+/// document cannot be read or has no shape.
+pub fn raw_array_layout(store: &ZarrStore, name: &str) -> Option<(Vec<u64>, Option<Vec<String>>)> {
+    let get = |key: String| -> Option<serde_json::Value> {
+        let bytes = store.get(&StoreKey::new(key).ok()?).ok()??;
+        serde_json::from_slice(&bytes).ok()
+    };
+    let shape = |doc: &serde_json::Value| -> Option<Vec<u64>> {
+        doc.get("shape")?
+            .as_array()?
+            .iter()
+            .map(|v| v.as_u64())
+            .collect()
+    };
+    let names = |v: Option<&serde_json::Value>| -> Option<Vec<String>> {
+        v?.as_array()?
+            .iter()
+            .map(|d| d.as_str().map(str::to_string))
+            .collect()
+    };
+    if let Some(doc) = get(format!("{name}/zarr.json")) {
+        let dims = names(doc.get("dimension_names"))
+            .or_else(|| names(doc.get("attributes")?.get("_ARRAY_DIMENSIONS")));
+        return Some((shape(&doc)?, dims));
+    }
+    let doc = get(format!("{name}/.zarray"))?;
+    let attrs = get(format!("{name}/.zattrs"));
+    let dims = names(attrs.as_ref().and_then(|a| a.get("_ARRAY_DIMENSIONS")));
+    Some((shape(&doc)?, dims))
+}
+
 /// The element shape of an array's first chunk (empty for a 0-d array). With a
 /// regular chunk grid this is the chunk shape of every chunk.
 pub fn first_chunk_shape(arr: &ZarrArray) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
@@ -429,6 +462,7 @@ pub fn dim_group_for_array(
         chunk_shape,
         data_var_names: vec![array_name.to_string()],
         coord_var_names,
+        unreadable: Vec::new(),
     })
 }
 
@@ -727,60 +761,41 @@ fn parse_zarr_fill_sentinel(array: &ZarrArray, dtype: &ZarrDtype) -> Option<Fill
     }
 }
 
-/// Collect the store-relative paths of non-dimension coordinates named in the
-/// `coordinates` attrs of `array_names`. A name in the attribute is relative to
-/// the group of the array that holds the attribute.
-pub fn collect_auxiliary_coords(store: &ZarrStore, array_names: &[String]) -> HashSet<String> {
+/// One array's path, attributes and shape, as [`cf_auxiliary_vars`] reads them.
+pub type ArrayFacts<'a> = (
+    &'a str,
+    &'a serde_json::Map<String, serde_json::Value>,
+    &'a [u64],
+);
+
+/// The CF variables among `arrays` that describe other variables instead of
+/// holding data: auxiliary coordinates named in a `coordinates` attribute (CF
+/// §5), and bounds variables named in a `bounds` attribute or, failing that,
+/// named `*_bnds` / `*_bounds` with shape (N, 2) (CF §7.1). Names in those
+/// attributes are relative to the array's group. Returns `(aux, bounds)` as
+/// store-relative paths. `read_zarr` leaves both out of its tables, and
+/// `read_zarr_metadata` gives them their own `role`.
+pub fn cf_auxiliary_vars(arrays: &[ArrayFacts]) -> (HashSet<String>, HashSet<String>) {
     let mut aux = HashSet::new();
-    for name in array_names {
-        if let Ok(arr) = open_array(store, name) {
-            if let Some(serde_json::Value::String(coords_str)) = arr.attributes().get("coordinates")
-            {
-                for token in coords_str.split_whitespace() {
-                    aux.insert(tree::join(tree::node_of(name), token));
-                }
-            }
-        }
-    }
-    aux
-}
-
-/// Determine whether a variable is a CF bounds variable to suppress.
-/// Criteria: another array has a `bounds` attr pointing to this name,
-/// OR this name matches `<dim>_bnds` / `<dim>_bounds` with shape (N, 2).
-pub fn collect_bounds_vars(
-    store: &ZarrStore,
-    array_names: &[String],
-    aux_coords: &HashSet<String>,
-) -> HashSet<String> {
     let mut bounds = HashSet::new();
-
-    // Attr-based: bounds = "name" on a coord array.
-    for name in array_names {
-        if let Ok(arr) = open_array(store, name) {
-            if let Some(serde_json::Value::String(b)) = arr.attributes().get("bounds") {
-                bounds.insert(tree::join(tree::node_of(name), b));
+    for (name, attrs, _) in arrays {
+        let node = tree::node_of(name);
+        if let Some(serde_json::Value::String(coords)) = attrs.get("coordinates") {
+            for token in coords.split_whitespace() {
+                aux.insert(tree::join(node, token));
             }
         }
-    }
-
-    // Name-pattern fallback: *_bnds / *_bounds with shape (N, 2).
-    for name in array_names {
-        if aux_coords.contains(name) || bounds.contains(name) {
-            continue;
+        if let Some(serde_json::Value::String(b)) = attrs.get("bounds") {
+            bounds.insert(tree::join(node, b));
         }
+    }
+    for (name, _, shape) in arrays {
         let is_pattern = name.ends_with("_bnds") || name.ends_with("_bounds");
-        if !is_pattern {
-            continue;
-        }
-        if let Ok(arr) = open_array(store, name) {
-            let shape = arr.shape();
-            if shape.len() == 2 && shape[1] == 2 {
-                bounds.insert(name.clone());
-            }
+        if is_pattern && shape.len() == 2 && shape[1] == 2 && !aux.contains(*name) {
+            bounds.insert(name.to_string());
         }
     }
-    bounds
+    (aux, bounds)
 }
 
 /// Pre-load a coordinate array's raw bytes at bind time.

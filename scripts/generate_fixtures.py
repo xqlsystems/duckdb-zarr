@@ -85,7 +85,9 @@ def write_zarr(ds: xr.Dataset, name: str, encoding: dict | None = None) -> None:
 # makes the SQL tests fail on value differences that are hard to trace.
 RAGGED_FIXTURE_VERSION = "2"
 DATATREE_FIXTURE_VERSION = "1"
+MANY_TABLES_FIXTURE_VERSION = "1"
 UNSUPPORTED_FIXTURE_VERSION = "1"
+UNREADABLE_FIXTURE_VERSION = "1"
 
 
 def _version_marker(dest: pathlib.Path) -> pathlib.Path:
@@ -760,6 +762,42 @@ def main() -> None:
         mark_fixture(dest, UNSUPPORTED_FIXTURE_VERSION)
         print(f"  wrote {dest}")
 
+    # ── unreadable_in_table (hand-written metadata) ──────────────────────────
+    # Tests: an array zarrs cannot open but whose metadata names its dimensions.
+    # `bad(x)` shares the x table with `good(x)`, so reading that table fails and
+    # names `bad`; the y table (`other(y)`) still reads (test/sql/unnamed_arrays.test).
+    print("unreadable_in_table (synthetic)...")
+    dest = FIXTURES / "unreadable_in_table.zarr"
+    if fixture_is_current(dest, UNREADABLE_FIXTURE_VERSION):
+        print(f"  (cached) {dest}")
+    else:
+        import json
+        if dest.exists():
+            _rmtree(dest)
+
+        def _named_array_json(data_type, fill_value, dim, n):
+            return {
+                "zarr_format": 3, "node_type": "array", "shape": [n],
+                "data_type": data_type,
+                "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [n]}},
+                "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+                "fill_value": fill_value,
+                "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}],
+                "attributes": {}, "dimension_names": [dim],
+            }
+
+        for rel, doc in {
+            "": {"zarr_format": 3, "node_type": "group", "attributes": {}},
+            "good": _named_array_json("float32", 0.0, "x", 4),
+            "bad": _named_array_json("not_a_real_dtype", 0, "x", 4),
+            "other": _named_array_json("float32", 1.5, "y", 3),
+        }.items():
+            d = dest / rel
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "zarr.json").write_text(json.dumps(doc))
+        mark_fixture(dest, UNREADABLE_FIXTURE_VERSION)
+        print(f"  wrote {dest}")
+
     # ── ragged_chunks (synthetic) ────────────────────────────────────────────
     # Tests: boundary chunks whose extent is smaller than the nominal chunk shape —
     # every other fixture is a single chunk. zarrs pads a boundary chunk's element
@@ -803,6 +841,34 @@ def main() -> None:
                       "t": {"chunks": (4,)}, "x27": {"chunks": (10,)}, "u": {"chunks": (3,)},
                       "p": {"chunks": (3, 2)}, "q": {"chunks": (2, 1)}, "qs": {"chunks": (2, 2)}})
         mark_fixture(dest, RAGGED_FIXTURE_VERSION)
+        print(f"  wrote {dest}")
+
+    # ── many_tables (hand-written metadata) ──────────────────────────────────
+    # Tests: read_zarr_groups returns more rows than one DuckDB vector (2048)
+    # holds. 2100 arrays v<i>, each over its own dimension d<i>, are 2100 tables.
+    # Metadata only: no chunk is written, so every value is the fill value.
+    print("many_tables (synthetic)...")
+    dest = FIXTURES / "many_tables.zarr"
+    if fixture_is_current(dest, MANY_TABLES_FIXTURE_VERSION):
+        print(f"  (cached) {dest}")
+    else:
+        import json
+        if dest.exists():
+            _rmtree(dest)
+        dest.mkdir(parents=True)
+        (dest / "zarr.json").write_text(
+            json.dumps({"zarr_format": 3, "node_type": "group", "attributes": {}}))
+        for i in range(2100):
+            d = dest / f"v{i}"
+            d.mkdir()
+            (d / "zarr.json").write_text(json.dumps({
+                "zarr_format": 3, "node_type": "array", "shape": [1], "data_type": "int8",
+                "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [1]}},
+                "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+                "fill_value": 0, "codecs": [{"name": "bytes"}], "attributes": {},
+                "dimension_names": [f"d{i}"],
+            }))
+        mark_fixture(dest, MANY_TABLES_FIXTURE_VERSION)
         print(f"  wrote {dest}")
 
     # ── datatree (xarray.DataTree.to_zarr) ───────────────────────────────────

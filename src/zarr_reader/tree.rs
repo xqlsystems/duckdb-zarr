@@ -10,7 +10,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::meta::{
-    declared_dims, first_chunk_shape, is_unsupported_array_error, open_array, ZarrStore,
+    cf_auxiliary_vars, declared_dims, first_chunk_shape, is_unsupported_array_error, open_array,
+    raw_array_layout, ArrayFacts, ZarrStore,
 };
 use super::types::DimGroup;
 
@@ -24,14 +25,19 @@ pub struct NodeVar {
     pub shape: Vec<u64>,
     pub chunk_shape: Vec<u64>,
     pub attrs: serde_json::Map<String, serde_json::Value>,
+    /// Why zarrs cannot open the array (unsupported data type or codec), if it
+    /// cannot. Its shape and names then come from the raw metadata document,
+    /// so that the table it belongs to can say it is missing.
+    pub unreadable: Option<String>,
 }
 
 /// The arrays of the nodes that were loaded, keyed by store-relative path.
 #[derive(Debug, Default)]
 pub struct StoreTree {
     pub vars: BTreeMap<String, NodeVar>,
-    /// Arrays zarrs cannot open (unsupported data type or codec). They are left
-    /// out of every table; `read_zarr_metadata` lists them.
+    /// Arrays zarrs cannot open and whose metadata document cannot be read
+    /// either. They are left out of every table; `read_zarr_metadata` lists
+    /// them.
     pub unsupported: Vec<String>,
 }
 
@@ -122,8 +128,9 @@ pub fn default_table_name(dims: &[String]) -> String {
 
 impl StoreTree {
     /// Open the arrays in `nodes` (all arrays when `None`) and record their
-    /// metadata. Arrays zarrs cannot open are recorded in `unsupported`; any
-    /// other open error fails.
+    /// metadata. An array zarrs cannot open is recorded with its error
+    /// ([`NodeVar::unreadable`]), or in `unsupported` if even its metadata
+    /// document cannot be read; any other open error fails.
     pub fn load(
         store: &ZarrStore,
         array_names: &[String],
@@ -137,7 +144,22 @@ impl StoreTree {
             let arr = match open_array(store, name) {
                 Ok(arr) => arr,
                 Err(err) if is_unsupported_array_error(err.as_ref()) => {
-                    tree.unsupported.push(name.clone());
+                    match raw_array_layout(store, name) {
+                        Some((shape, dims)) => {
+                            tree.vars.insert(
+                                name.clone(),
+                                NodeVar {
+                                    path: name.clone(),
+                                    dims,
+                                    chunk_shape: shape.clone(),
+                                    shape,
+                                    attrs: Default::default(),
+                                    unreadable: Some(err.to_string()),
+                                },
+                            );
+                        }
+                        None => tree.unsupported.push(name.clone()),
+                    }
                     continue;
                 }
                 Err(err) => return Err(err),
@@ -152,6 +174,7 @@ impl StoreTree {
                     shape,
                     chunk_shape,
                     attrs: arr.attributes().clone(),
+                    unreadable: None,
                 },
             );
         }
@@ -188,32 +211,17 @@ impl StoreTree {
     /// `read_zarr_groups` can still list the rest of the store.
     pub fn dim_groups(&self, node: &str) -> NodeGroups {
         let mut misaligned = self.check_alignment(node).err();
-        // Names in `coordinates` and `bounds` attributes are relative to the node.
-        let mut aux_coords = HashSet::new();
-        let mut bounds = HashSet::new();
-        for var in self.vars_in(node) {
-            if let Some(serde_json::Value::String(coords)) = var.attrs.get("coordinates") {
-                for token in coords.split_whitespace() {
-                    aux_coords.insert(join(node, token));
-                }
-            }
-            if let Some(serde_json::Value::String(b)) = var.attrs.get("bounds") {
-                bounds.insert(join(node, b));
-            }
-        }
+        let facts: Vec<ArrayFacts> = self
+            .vars_in(node)
+            .map(|v| (v.path.as_str(), &v.attrs, v.shape.as_slice()))
+            .collect();
+        let (aux_coords, bounds) = cf_auxiliary_vars(&facts);
 
         type GroupKey = (Vec<String>, Vec<u64>);
         let mut groups: HashMap<GroupKey, DimGroup> = HashMap::new();
         let mut unnamed = Vec::new();
         for var in self.vars_in(node) {
-            let name = basename(&var.path);
-            let is_bounds_pattern = (name.ends_with("_bnds") || name.ends_with("_bounds"))
-                && var.shape.len() == 2
-                && var.shape[1] == 2;
-            if var.shape.is_empty()
-                || bounds.contains(&var.path)
-                || aux_coords.contains(&var.path)
-                || is_bounds_pattern
+            if var.shape.is_empty() || bounds.contains(&var.path) || aux_coords.contains(&var.path)
             {
                 continue;
             }
@@ -226,10 +234,7 @@ impl StoreTree {
             }
             let key = (dims.clone(), var.shape.clone());
             if let Some(group) = groups.get_mut(&key) {
-                group.data_var_names.push(var.path.clone());
-                for (plan, &c) in group.chunk_shape.iter_mut().zip(&var.chunk_shape) {
-                    *plan = (*plan).max(c);
-                }
+                add_to_group(group, var);
                 continue;
             }
             let mut coord_var_names = Vec::new();
@@ -242,16 +247,22 @@ impl StoreTree {
                     }
                 }
             }
-            groups.insert(
-                key,
-                DimGroup {
-                    dims: dims.clone(),
-                    shape: var.shape.clone(),
-                    chunk_shape: var.chunk_shape.clone(),
-                    data_var_names: vec![var.path.clone()],
-                    coord_var_names,
-                },
-            );
+            let mut group = DimGroup {
+                dims: dims.clone(),
+                shape: var.shape.clone(),
+                chunk_shape: Vec::new(),
+                data_var_names: Vec::new(),
+                coord_var_names,
+                unreadable: Vec::new(),
+            };
+            add_to_group(&mut group, var);
+            groups.insert(key, group);
+        }
+        // A table of unreadable arrays only has no chunk grid to plan on.
+        for group in groups.values_mut() {
+            if group.chunk_shape.is_empty() {
+                group.chunk_shape = group.shape.clone();
+            }
         }
 
         let mut groups: Vec<DimGroup> = groups.into_values().collect();
@@ -338,6 +349,24 @@ pub struct NodeGroups {
     /// fails with this message; `read_zarr_groups` gives the node's rows no table
     /// name.
     pub misaligned: Option<String>,
+}
+
+/// Add `var` to its table: as a data variable whose chunks widen the plan
+/// grid (decision 6), or, if zarrs cannot open it, to the table's unreadable
+/// arrays.
+fn add_to_group(group: &mut DimGroup, var: &NodeVar) {
+    if let Some(err) = &var.unreadable {
+        group.unreadable.push((var.path.clone(), err.clone()));
+        return;
+    }
+    group.data_var_names.push(var.path.clone());
+    if group.chunk_shape.is_empty() {
+        group.chunk_shape = var.chunk_shape.clone();
+    } else {
+        for (plan, &c) in group.chunk_shape.iter_mut().zip(&var.chunk_shape) {
+            *plan = (*plan).max(c);
+        }
+    }
 }
 
 /// A dimension coordinate: a 1-D array whose only dimension has its name.
@@ -427,6 +456,7 @@ mod tests {
             chunk_shape: vec![len; dims.len()],
             data_var_names: vec![],
             coord_var_names: vec![],
+            unreadable: vec![],
         };
         let names = table_names(&[group(&["x"], 2), group(&["y"], 3), group(&["y"], 4)]);
         assert_eq!(names, vec![Some("x".to_string()), None, None]);

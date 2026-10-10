@@ -169,3 +169,11 @@ statement error
 SELECT * FROM read_zarr_metadata('test/fixtures/xarray_tutorial/datatree.zarr', group_path := 'simulaton');
 ----
 group '/simulaton' not found
+
+# ── more tables than one output chunk holds ──────────────────────────────────
+# many_tables.zarr has 2100 one-array tables; DuckDB vectors hold 2048 rows.
+query III
+SELECT COUNT(*), COUNT(DISTINCT table_name), MAX(table_name = 'd2099')::INT
+FROM read_zarr_groups('test/fixtures/xarray_tutorial/many_tables.zarr');
+----
+2100	2100	1

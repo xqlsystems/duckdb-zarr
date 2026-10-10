@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use duckdb::core::LogicalTypeId;
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
@@ -31,7 +31,9 @@ unsafe impl Send for ReadZarrGroupsBind {}
 unsafe impl Sync for ReadZarrGroupsBind {}
 
 pub struct ReadZarrGroupsInit {
-    done: AtomicBool,
+    /// The first row the next call emits. A DataTree store can have more
+    /// tables than one output chunk holds, so rows go out in pages.
+    next: AtomicUsize,
 }
 
 unsafe impl Send for ReadZarrGroupsInit {}
@@ -113,7 +115,8 @@ impl VTab for ReadZarrGroupsVTab {
                 let aligned = node_groups.misaligned.is_none();
                 let names = tree::table_names(&node_groups.groups);
                 for (g, name) in node_groups.groups.iter().zip(names) {
-                    rows.push(row(&node, name.filter(|_| aligned), g));
+                    let readable = aligned && g.unreadable.is_empty();
+                    rows.push(row(&node, name.filter(|_| readable), g));
                 }
             }
         }
@@ -123,7 +126,7 @@ impl VTab for ReadZarrGroupsVTab {
 
     fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
         Ok(ReadZarrGroupsInit {
-            done: AtomicBool::new(false),
+            next: AtomicUsize::new(0),
         })
     }
 
@@ -134,16 +137,14 @@ impl VTab for ReadZarrGroupsVTab {
         let bind = func.get_bind_data();
         let init = func.get_init_data();
 
-        if init.done.swap(true, Ordering::Relaxed) {
+        let vector_size = unsafe { duckdb::ffi::duckdb_vector_size() as usize };
+        let start = init.next.fetch_add(vector_size, Ordering::Relaxed);
+        if start >= bind.rows.len() {
             output.set_len(0);
             return Ok(());
         }
-
-        let n = bind.rows.len();
-        if n == 0 {
-            output.set_len(0);
-            return Ok(());
-        }
+        let end = (start + vector_size).min(bind.rows.len());
+        let n = end - start;
 
         let v_group = output.flat_vector(0);
         let v_schema = output.flat_vector(1);
@@ -154,7 +155,7 @@ impl VTab for ReadZarrGroupsVTab {
         let v_dvars = output.flat_vector(6);
         let v_cvars = output.flat_vector(7);
 
-        for (i, row) in bind.rows.iter().enumerate() {
+        for (i, row) in bind.rows[start..end].iter().enumerate() {
             use duckdb::core::Inserter;
             v_group.insert(i, row.group_path.as_str());
             v_schema.insert(i, row.schema_name.as_str());

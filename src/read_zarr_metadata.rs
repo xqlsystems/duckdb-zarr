@@ -4,9 +4,9 @@ use duckdb::core::LogicalTypeId;
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
 
 use crate::zarr_reader::meta::{
-    array_path_dims, collect_auxiliary_coords, collect_bounds_vars,
-    dimension_names as get_dim_names, extract_file_system, is_unsupported_array_error,
-    list_array_names, open_array, open_store, select_array_name,
+    array_path_dims, cf_auxiliary_vars, dimension_names as get_dim_names, extract_file_system,
+    is_unsupported_array_error, list_array_names, open_array, open_store, select_array_name,
+    ArrayFacts,
 };
 
 /// One metadata row per array.
@@ -81,30 +81,45 @@ impl VTab for ReadZarrMetaVTab {
             array_names.retain(|name| crate::zarr_reader::tree::node_of(name) == node);
         }
 
-        let aux_coords = collect_auxiliary_coords(&store, &array_names);
-        let bounds_vars = collect_bounds_vars(&store, &array_names, &aux_coords);
+        // Open every array once. One with a data type or codec that zarrs cannot
+        // open must not hide the rest of the store, so it is listed as
+        // "unsupported"; any other error (I/O, auth, missing metadata) fails.
+        let mut opened = Vec::with_capacity(array_names.len());
+        for name in &array_names {
+            match open_array(&store, name) {
+                Ok(arr) => opened.push((name, Ok(arr))),
+                Err(err) if is_unsupported_array_error(err.as_ref()) => {
+                    opened.push((name, Err(err.to_string())))
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        let facts: Vec<ArrayFacts> = opened
+            .iter()
+            .filter_map(|(name, arr)| {
+                let arr = arr.as_ref().ok()?;
+                Some((name.as_str(), arr.attributes(), arr.shape()))
+            })
+            .collect();
+        let (aux_coords, bounds_vars) = cf_auxiliary_vars(&facts);
 
         let mut rows = Vec::new();
-        for name in &array_names {
-            // One array with a data type or codec that zarrs cannot open must not hide
-            // the rest of the store, so list it as "unsupported" and continue. Any
-            // other error (I/O, auth, missing metadata) still fails the call.
-            let arr = match open_array(&store, name) {
+        for &(name, ref arr) in &opened {
+            let arr = match arr {
                 Ok(arr) => arr,
-                Err(err) if is_unsupported_array_error(err.as_ref()) => {
+                Err(err) => {
                     rows.push(MetaRow {
-                        name: name.clone(),
+                        name: name.to_string(),
                         dims: "[]".to_string(),
                         dtype: "unsupported".to_string(),
                         shape: "[]".to_string(),
                         chunk_shape: "[]".to_string(),
-                        attrs: serde_json::json!({ "error": err.to_string() }).to_string(),
+                        attrs: serde_json::json!({ "error": err }).to_string(),
                         role: "unsupported".to_string(),
                         array_path_dims: "[]".to_string(),
                     });
                     continue;
                 }
-                Err(err) => return Err(err),
             };
             let shape = arr.shape().to_vec();
             // chunk_grid_shape() returns number-of-chunks per dim, NOT element shape.
@@ -118,8 +133,8 @@ impl VTab for ReadZarrMetaVTab {
                 Vec::new()
             };
 
-            let dims = get_dim_names(&arr, name).unwrap_or_default();
-            let bound_dims = array_path_dims(&store, &arr, name);
+            let dims = get_dim_names(arr, name).unwrap_or_default();
+            let bound_dims = array_path_dims(&store, arr, name);
             let dtype_str = arr.data_type().to_string();
             let attrs = arr.attributes().clone();
 

@@ -17,6 +17,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Arrays with different chunk shapes share a table** (design decision 6). `read_zarr` plans work units on the largest chunk length in each dimension and reads arrays chunked otherwise as array subsets. This used to fail at bind with `chunk shape mismatch`, which blocked the `obs` table of any large AnnData store and reanalysis stores such as `air_temperature_gradient`. `read_zarr_groups.chunk_shape` shows the plan grid.
 - `read_zarr_metadata` no longer fails when zarrs cannot open one array because of its data type or codecs. That array is listed with `role = 'unsupported'` and the error text in `attrs`. Other errors still fail the call.
 
+- `read_zarr` fails on a table that holds an array zarrs cannot open, naming it, instead of returning the table without that column. The group's other tables still read, and `read_zarr_groups` gives such a table a `NULL` `table_name`.
+
 ### Added
 - **`group_path=` named parameter** on `read_zarr`, `read_zarr_groups` and `read_zarr_metadata`, with the meaning of xarray's `group=`: `read_zarr('sim.zarr', group_path := 'simulation/fine')`. Leading and trailing slashes are ignored, and a group that does not exist is an error. `"group" :=` is an alias; the quotes are required because `GROUP` is a DuckDB keyword.
 - **Arrays without dimension names** (#40): `read_zarr(store, array_path := name)` now reads an array that declares no dimension names, as in every store written by AnnData or plain zarr-python. Its dimensions are named `dim_0`, `dim_1`, and so on. Group reads leave such arrays out (see Changed), because placeholder names could join unrelated arrays.

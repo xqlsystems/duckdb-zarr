@@ -217,6 +217,18 @@ impl VTab for ReadZarrVTab {
             }
         };
 
+        // Leaving an array out would return the table without it and no sign
+        // that it is missing.
+        if !group.unreadable.is_empty() {
+            let names: Vec<&str> = group.unreadable.iter().map(|(p, _)| p.as_str()).collect();
+            let (first, err) = &group.unreadable[0];
+            return Err(format!(
+                "'{store_path}': zarrs cannot open {names:?}, which belong to the table \
+                 {wanted:?} in group '{shown}' ('{first}': {err}); read the other arrays one \
+                 at a time with array_path="
+            )
+            .into());
+        }
         finish_bind(bind, store, group, decode_times, ColumnNames::Basename)
     }
 
