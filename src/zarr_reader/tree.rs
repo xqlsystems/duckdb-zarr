@@ -436,6 +436,14 @@ impl StoreTree {
         }
 
         let mut groups: Vec<DimGroup> = groups.into_values().collect();
+        // An AnnData data frame lists its columns in `column-order`.
+        if let Some(layout) = &self.layout {
+            for group in &mut groups {
+                group
+                    .data_var_names
+                    .sort_by_cached_key(|path| layout.column_rank(path));
+            }
+        }
         groups.sort_by(|a, b| {
             a.dims
                 .cmp(&b.dims)

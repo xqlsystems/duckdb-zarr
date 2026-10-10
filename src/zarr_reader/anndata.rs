@@ -65,6 +65,9 @@ pub struct Layout {
     /// For each `dataframe` group, the name of its index column (its `_index`
     /// attribute; usually `_index`).
     pub indexes: HashMap<String, String>,
+    /// For each `dataframe` group, its columns in order (its `column-order`
+    /// attribute), so that tables list them as `adata.obs` does.
+    pub column_orders: HashMap<String, Vec<String>>,
 }
 
 impl Layout {
@@ -75,6 +78,17 @@ impl Layout {
     /// The node whose tables hold the array at `path`: the node of the variable
     /// it belongs to, which is the outermost encoded group around it
     /// (categorical, nullable, sparse) or else the array itself.
+    /// Where a variable sorts among the columns of its table: by its data
+    /// frame's `column-order`, then by path for anything the order does not
+    /// list (which keeps other variables in path order).
+    pub fn column_rank(&self, path: &str) -> (usize, String) {
+        let rank = self
+            .column_orders
+            .get(node_of(path))
+            .and_then(|order| order.iter().position(|c| c == basename(path)));
+        (rank.unwrap_or(usize::MAX), path.to_string())
+    }
+
     pub fn node_of_array(&self, path: &str) -> String {
         let variable = self_and_ancestors(node_of(path))
             .into_iter()
@@ -134,6 +148,13 @@ pub fn layout(store: &ZarrStore, array_names: &[String]) -> Option<Layout> {
             if encoding == "dataframe" {
                 if let Some(index) = attr_str(&attrs, "_index") {
                     layout.indexes.insert(group.clone(), index);
+                }
+                if let Some(serde_json::Value::Array(columns)) = attrs.get("column-order") {
+                    let columns = columns
+                        .iter()
+                        .filter_map(|c| c.as_str().map(str::to_string))
+                        .collect();
+                    layout.column_orders.insert(group.clone(), columns);
                 }
             }
             layout.encodings.insert(group, encoding);

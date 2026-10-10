@@ -47,13 +47,20 @@ SELECT group_path, table_name, dims, data_vars
 FROM read_zarr_groups('test/fixtures/anndata/pbmc_like.zarr')
 ORDER BY group_path, table_name;
 ----
-/	obs	["obs"]	["obs/batch","obs/cell_type","obs/donor","obs/n_genes"]
+/	obs	["obs"]	["obs/cell_type","obs/n_genes","obs/batch","obs/donor"]
 /	obs_var	["obs","var"]	["X"]
-/	var	["var"]	["var/gene_symbol","var/mean_expr"]
+/	var	["var"]	["var/mean_expr","var/gene_symbol"]
 /layers	obs_var	["obs","var"]	["layers/spliced","layers/unspliced"]
 /obsm	obs_X_umap_component	["obs","X_umap_component"]	["obsm/X_umap"]
 /obsp	obs_i_obs_j	["obs_i","obs_j"]	["obsp/connectivities"]
 /varp	var_i_var_j	["var_i","var_j"]	["varp/corr","varp/corr_csc"]
+
+# Columns come in the data frame's `column-order`, as in adata.obs.
+query T
+SELECT string_agg(column_name, ' ')
+FROM (DESCRIBE SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', dims := ['obs']));
+----
+obs cell_type n_genes batch donor
 
 # The root has three tables, so a read of it must say which.
 statement error
