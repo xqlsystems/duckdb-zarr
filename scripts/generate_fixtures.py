@@ -84,6 +84,7 @@ def write_zarr(ds: xr.Dataset, name: str, encoding: dict | None = None) -> None:
 # otherwise it is rebuilt. Without this, a copy left over from an older checkout
 # makes the SQL tests fail on value differences that are hard to trace.
 RAGGED_FIXTURE_VERSION = "1"
+DATATREE_FIXTURE_VERSION = "1"
 UNSUPPORTED_FIXTURE_VERSION = "1"
 
 
@@ -788,6 +789,36 @@ def main() -> None:
             encoding={"s": {"chunks": (2, 2)}, "v": {"chunks": (2, 2)},
                       "t": {"chunks": (4,)}, "x27": {"chunks": (10,)}})
         mark_fixture(dest, RAGGED_FIXTURE_VERSION)
+        print(f"  wrote {dest}")
+
+    # ── datatree (xarray.DataTree.to_zarr) ───────────────────────────────────
+    # Tests: nested groups as one table set per group (design decision 8,
+    # test/sql/datatree.test). The two leaf groups both hold foo(x, y) with
+    # different lengths of y, which flattening every group into one pool cannot
+    # read. Both inherit the root's x coordinate.
+    print("datatree (xarray.DataTree.to_zarr)...")
+    dest = FIXTURES / "datatree.zarr"
+    if fixture_is_current(dest, DATATREE_FIXTURE_VERSION):
+        print(f"  (cached) {dest}")
+    else:
+        if dest.exists():
+            _rmtree(dest)
+        x = np.array([10, 20, 30], dtype="int64")
+        dt = xr.DataTree.from_dict({
+            "/": xr.Dataset({"bar": ("x", np.array([1.5, 2.5, 3.5]))}, coords={"x": x}),
+            "/simulation/coarse": xr.Dataset(
+                {"foo": (("x", "y"), np.arange(6, dtype="float64").reshape(3, 2))},
+                coords={"y": np.array([0.0, 1.0])}),
+            "/simulation/fine": xr.Dataset(
+                {"foo": (("x", "y"), np.arange(12, dtype="float64").reshape(3, 4) + 100)},
+                coords={"y": np.array([0.0, 0.5, 1.0, 1.5])}),
+        })
+        dt.to_zarr(dest, zarr_format=3, consolidated=False)
+        # A group that DataTree would refuse: its x is shorter than the root's.
+        # Written with plain Dataset.to_zarr, which does not check.
+        xr.Dataset({"baz": ("x", np.array([7, 8], dtype="int32"))}).to_zarr(
+            dest, group="misaligned", mode="a", zarr_format=3, consolidated=False)
+        mark_fixture(dest, DATATREE_FIXTURE_VERSION)
         print(f"  wrote {dest}")
 
     # ── anndata (real, non-synthetic) ────────────────────────────────────────

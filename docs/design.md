@@ -13,7 +13,7 @@ A design for `duckdb-zarr` — a Rust DuckDB extension that lets users query Zar
 ## Non-goals (for the first cut)
 
 - Writes. Read-only.
-- Automatic relational joins across nested groups. Arrays are discovered recursively and can be selected by store-relative path, but each `read_zarr` scan still operates on one compatible dimension group or one explicitly selected array.
+- Automatic relational joins across nested groups. Each Zarr group is a node with its own tables (decision 8), and each `read_zarr` scan reads one dimension group of one node, or one array selected by store-relative path.
 - Replacing xarray. Users who need lazy array operations should keep using xarray; we just want a SQL handle on the same data.
 - Custom codecs beyond what `zarrs` already supports.
 - WebAssembly as a distributed platform. The extension compiles for `wasm32-unknown-emscripten` and loads in duckdb-wasm (`make wasm_mvp`): every store is read through DuckDB's own FileSystem (`DuckDbStore`) because `zarrs_http` depends on `reqwest::blocking`, and `zarrs`' rayon work runs on a one-thread pool built at extension init. The wasm platforms stay in `excluded_platforms` until CI builds and tests them. Local (non-URL) store paths are not supported on wasm: array listing for local stores walks the host filesystem.
@@ -36,7 +36,7 @@ The pinned `duckdb` crate (`=1.10504.0`) exposes the `VTab` trait (bind/init/fun
 
 **(a) Replacement-scan registration** — `Connection::register_replacement_scan` does **not** exist in duckdb-rs. However, `libduckdb-sys` (the underlying C FFI layer that ships with the crate) exposes `duckdb_add_replacement_scan`, `duckdb_replacement_scan_set_function_name`, `duckdb_replacement_scan_add_parameter`, and `duckdb_replacement_scan_set_error`. Replacement scan for `.zarr` path interception lands behind a thin `unsafe` FFI wrapper calling these symbols directly. This unblocks the v0.2 work.
 
-**(b) ATTACH / storage-extension hooks** — `duckdb_register_storage_extension` is **absent** from `libduckdb-sys`. ATTACH as a proper storage engine is not achievable via the C extension API at this version. The v0.3 ATTACH milestone must use a different mechanism — most likely a macro-style shim (a SQL `ATTACH` wrapper that mounts each dimension group as a named view). This weakens the ATTACH UX slightly (no native `FROM zarr.temperature`) but keeps the rest of the design intact.
+**(b) ATTACH / storage-extension hooks** — `duckdb_register_storage_extension` is **absent** from `libduckdb-sys`. ATTACH as a proper storage engine is not achievable via the C extension API at this version. The v0.3 ATTACH milestone must use a different mechanism — most likely a macro-style shim (a SQL `ATTACH` wrapper that mounts each dimension group as a named view). This weakens the ATTACH UX slightly (no native `FROM zarr.temperature`) but keeps the rest of the design intact. **Update 2026-09-29:** the shim was spiked and rejected because it leaks the database instance; see decision 8, Mounting.
 
 **(c) Dictionary-vector construction** — `duckdb_create_dictionary_vector` is **absent**. Coordinate columns are emitted as flat `FlatVector` values gathered from the cached coord array; the dictionary-encoding optimization is off the table. Correctness is unchanged; memory use per scan is higher for high-cardinality coord columns (rare in practice — time and lat/lon coords repeat heavily within a chunk but the duplication is at the chunk-buffer level, not the SQL vector level).
 
@@ -71,7 +71,7 @@ We split the store into **one table per distinct dimension set**. The ERA5 examp
 - a surface table over `(time, lat, lon)` with one column per surface variable
 - an atmosphere table over `(time, level, lat, lon)` with one column per pressure-level variable
 
-Tables get a default name derived from the sorted dim names (`t_lat_lon`, `level_t_lat_lon`); users can override via the `ATTACH` syntax below. `read_zarr_metadata` enumerates them so users can discover groupings before issuing the scan.
+Tables get a default name from their dimensions joined in order (`time_lat_lon`, `time_level_lat_lon`, or `scalar` for none), the same rule xarray-sql uses (decision 8); users can override via the `ATTACH` syntax below. `read_zarr_metadata` enumerates them so users can discover groupings before issuing the scan.
 
 ## SQL surface
 
@@ -115,6 +115,9 @@ SELECT * FROM read_zarr(
 -- Pick one array, including a nested OME-Zarr level
 SELECT * FROM read_zarr('image.ome.zarr', array_path := 'labels/nuclei/0');
 
+-- Pick a node of a nested store (decision 8); the root is the default
+SELECT * FROM read_zarr('sim.zarr', group_path := 'simulation/fine', dims := ['x', 'y']);
+
 ```
 
 Named arguments stay close to xarray's vocabulary (`variables`, `coords`, `chunks`, `dims`). Variables that share the requested dim set become one output column each, joined on coordinate index — exactly the xarray-sql `pivot()` shape. Variables outside that dim set are silently excluded; the user picks them up by querying a different `dims` group.
@@ -134,7 +137,7 @@ FROM era5.atmosphere                -- (time, level, lat, lon)
 GROUP BY level;
 ```
 
-`ATTACH ... (TYPE ZARR)` mounts the store as a DuckDB schema with one view per dimension group. Group names default to a slugified join of the dim names; users can rename with `ALTER VIEW`. This is the recommended UX for ERA5-class stores where you'll be issuing many queries and want stable table names.
+Not implemented, and not possible through the C API at DuckDB 1.5.5 (decision 8, Mounting). The same layout is available by hand: `read_zarr_groups` gives each node's tables and their names (one schema per Zarr group, the root as `main`, table names from the dimensions joined in order, like `time_lat_lon`), and the user creates the views. `era5.surface` above would be `era5.main.time_lat_lon`, renamed with `ALTER VIEW` if wanted. This is the recommended UX for ERA5-class stores where you'll be issuing many queries and want stable table names.
 
 ### 4. `read_zarr_metadata` and `read_zarr_groups`
 
@@ -145,10 +148,10 @@ SELECT * FROM read_zarr_metadata('store.zarr');
 -- name | dims | dtype | shape | chunk_shape | attrs | role | array_path_dims
 
 SELECT * FROM read_zarr_groups('store.zarr');
--- group_name | dims | n_variables | variables | n_rows
+-- group_path | schema_name | table_name | dims | shape | chunk_shape | data_vars | coord_vars
 ```
 
-Both are read-no-chunks. `read_zarr_metadata` enumerates arrays for inspection and tooling; `read_zarr_groups` shows what `ATTACH` would mount and is what the multi-group error message points users at.
+Both are read-no-chunks. `read_zarr_metadata` enumerates arrays for inspection and tooling; `read_zarr_groups` lists the tables of every group, with the schema and table name each maps to (decision 8). It is what the multi-group error message points users at, and the input to the mounting recipe in decision 8. Both accept `group_path :=` to look at one node.
 
 ## Architecture
 
@@ -485,7 +488,7 @@ Within a dim group, two data variables might be chunked differently — e.g. `te
 
 AnnData and plain zarr-python write neither `dimension_names` nor `_ARRAY_DIMENSIONS` ([issue #40](https://github.com/xqlsystems/duckdb-zarr/issues/40)), so `dimension_names()` rejected every array in such a store at bind, including a single-array `array_path=` read.
 
-> **Decision:** When `array_path=` selects one array that declares no dimension names (and has no OME `multiscales.axes`), name its dimensions `dim_0..dim_{ndim-1}` (`synthesize_dim_names` in `meta.rs`). Whole-store enumeration (`read_zarr(store)`, the replacement scan, `read_zarr_groups` without `array_path=`) does not do this and still fails, with an error that suggests `array_path=`.
+> **Decision:** When `array_path=` selects one array that declares no dimension names (and has no OME `multiscales.axes`), name its dimensions `dim_0..dim_{ndim-1}` (`synthesize_dim_names` in `meta.rs`). Whole-store enumeration (`read_zarr(store)`, the replacement scan, `read_zarr_groups` without `array_path=`) does not do this. Since decision 8 it leaves such arrays out of every table, and a group with no other data fails with an error that names them and suggests `array_path=`.
 >
 > **Why only for `array_path=`:** a placeholder name carries no meaning. If enumeration gave placeholder names to every unnamed array, two unrelated arrays of the same length would both get `dim_0`, land in the same dim group, and be joined row by row. That returns wrong data with no error. With `array_path=` the user picks exactly one array, so nothing can be misaligned. For the same reason, a synthesized name never binds a coordinate array, even if a sibling array is called `dim_0`.
 
@@ -493,6 +496,45 @@ Two changes to `read_zarr_metadata` support this:
 
 - The `array_path_dims` column holds the names that `read_zarr(store, array_path := name)` binds, from the same function (`array_path_dims`) that the bind uses. The `dims` column is unchanged and still shows only declared names, so `[]` for an unnamed array. A separate column keeps each column's meaning the same in every call.
 - An array that zarrs cannot open because of its data type, codecs, storage transformers or an unknown extension field is listed with `role = 'unsupported'`, `dtype = 'unsupported'` and the error text in `attrs`, and the call continues (`is_unsupported_array_error`). Other open errors (I/O, auth, missing metadata, an invalid fill value) still fail the call, because hiding them would make a broken store look partly empty.
+
+### 8. Nested stores: one DuckDB schema per group, tables named like xarray-sql
+
+A Zarr store can nest groups, as an `xarray.DataTree` written with `DataTree.to_zarr()` does. Each group is a node with its own dimensions: `simulation/coarse` and `simulation/fine` can both have `foo(x, y)` with different lengths of `x`. Before this decision the reader listed arrays from every nested group into one pool and grouped them by dimension names alone (`infer_dim_groups`). That fails with a shape mismatch in the example above and silently merges the two nodes when the lengths agree. xarray-sql plans DataTree support too ([xarray-sql #82](https://github.com/xqlsystems/xarray-sql/issues/82)), and the two projects should give the same store the same tables.
+
+> **Decision:**
+>
+> - **Scope dimensions per node.** A dimension group is identified by `(node path, dims)`, not `dims` alone. Arrays in different groups never share a table.
+> - **Read the root node by default.** `read_zarr(store)` reads the root group only, like `xarray.open_zarr(store)`. A new `group_path :=` parameter selects another node, with the same meaning as xarray's `group=`: `read_zarr(store, group_path := 'simulation/fine', dims := ['x', 'y'])`. `"group" :=` is an alias; the quotes are required because `GROUP` is a DuckDB keyword, the same reason `array_path` has the quoted alias `"array"`. This is a breaking change for anyone who reads a nested store today without `array_path=`.
+> - **Inherit coordinates like xarray.** A node's tables include coordinate arrays from its ancestors for dimensions the node shares with them, as `DataTree` does. As in xarray, a child whose shared dimension has a different length from its parent's is an error.
+> - **Name tables like xarray-sql.** The default name of a dimension group is `"_".join(dims)` in dimension order, or `scalar` for none (`xarray_sql.df.default_table_name`). Overrides are keyed by the dimension tuple. Two groups in one node that would get names equal after case folding are an error, because DuckDB identifiers ignore case (`xarray_sql.df.resolve_table_names`).
+> - **Map a store to a database with one schema per node.** Store → database, node path → schema, dimension group → table. The root node is schema `main`, and a nested path is one quoted schema name: `sim."simulation/fine".x_y`. This mirrors a DataFusion `CatalogProvider` (catalog → schema → table), which is the shape xarray-sql #82 favors.
+> - **Publish the mapping through `read_zarr_groups`; let users mount it.** `read_zarr_groups` gains `group_path`, `schema_name` and `table_name` columns, so each row states the node, the schema, the dimensions and the name. That is the whole contract with xarray-sql. The extension does not create the schemas and views itself (see Mounting below). A user mounts a store with `ATTACH ':memory:' AS sim`, then one `CREATE SCHEMA` per node and one `CREATE VIEW ... AS SELECT * FROM read_zarr(store, group_path := ..., dims := [...])` per row.
+>
+> **Why not keep flattening:** flattening only works when no two nodes reuse a dimension name, and DataTree stores reuse them by design (multiscale levels, ensembles, AnnData's `obs` and `var` against `X`). Scoping per node is the xarray data model; matching it is what lets xarray-sql and this extension agree.
+
+**Implementation notes** (`src/zarr_reader/tree.rs`):
+
+- `group_path` is the node path as `DataTree` writes it (`/`, `/simulation/fine`); `group_path :=` accepts it with or without slashes. `schema_name` is `main` for the root and the path without the leading slash otherwise, so a one-level group needs no quoting (`sim.simulation.…`). A top-level Zarr group named `main` would collide with the root's schema; mount it under another name.
+- `table_name` is `NULL` exactly when `read_zarr(store, group_path := g, dims := d)` would fail for that row: the node is not aligned with its ancestors, or the node has arrays with the same dims but different shapes or chunk shapes (multiscale levels). Such rows are still listed, one per layout, and stay readable with `array_path=`.
+- Alignment follows xarray's check: a node's dimension lengths must match its parent's arrays, and an inherited coordinate must match the length of the dimension it labels. Only arrays with dimension names count. `array_path=` reads skip the check.
+- Arrays with no dimension names, and arrays zarrs cannot open, are left out of a node's tables. `read_zarr_metadata` still lists them.
+- Columns of a group read are named after the variable within its node (`foo`), as in xarray, not after its store path.
+
+The mounting recipe, generated from the catalog (`'sim.zarr'` and `sim` are the store and the alias):
+
+```sql
+ATTACH ':memory:' AS sim;
+SELECT string_agg(format(
+         'CREATE SCHEMA IF NOT EXISTS sim."{}"; CREATE VIEW sim."{}"."{}" AS SELECT * FROM read_zarr(''sim.zarr'', group_path := ''{}'', dims := {});',
+         schema_name, schema_name, table_name, group_path, replace(dims, '"', '''')), chr(10))
+FROM read_zarr_groups('sim.zarr')
+WHERE table_name IS NOT NULL;
+-- then run the statements it prints
+```
+
+**Mounting: why there is no `zarr_attach`.** A procedure such as `CALL zarr_attach('sim.zarr', 'sim')` that creates the schemas and views was spiked on 2026-09-29 (branch `spike-zarr-attach`) and rejected. The C API at DuckDB 1.5.5 has no storage-extension hook and no way to run SQL on the calling connection, so the procedure needs a second connection. The extension can get a database handle only while it loads: `get_database` returns a wrapper that DuckDB frees when loading ends (`extension_load.cpp`). So the connection must be opened at load and kept. The DDL itself worked: views mounted, a quoted `"demo/nested"` schema worked, and it ran inside `BEGIN ... COMMIT` and was visible to other connections. But the kept connection holds a strong reference to the database instance, and the function catalog that holds the connection belongs to that instance, so the instance is never freed. After `close()`, the database file stays locked against other processes, and reopening it in the same process hangs. This affects everyone who loads the extension, not only users of the procedure. A control build without the side connection released the file normally. Revisit if the C API gains storage extensions, a way to run SQL on a client context, or a callback when a database closes.
+
+**AnnData under this model.** An AnnData store maps onto the tree: `obs` and `var` are nodes, `X`, `layers` and `obsm` share their axes. Two pieces stay AnnData-specific and come after this decision: naming the axes (AnnData writes no dimension names; anndata's own `read_lazy` names an `obs`/`var` data frame's dimension after its `_index` attribute), and decoding group-encoded variables (`categorical`, `nullable-*`, `csr_matrix`/`csc_matrix`) into single columns.
 
 ## Why this is worth building
 

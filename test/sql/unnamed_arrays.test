@@ -37,3 +37,10 @@ query I
 SELECT SUM(good) FROM read_zarr('test/fixtures/xarray_tutorial/unsupported_dtype.zarr', array_path := 'good');
 ----
 0.0
+
+# A group read leaves unnamed arrays out, so this store's root has no data. The
+# error names the array and suggests array_path= (decision 8).
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/unsupported_dtype.zarr');
+----
+these arrays declare no dimension names: ["good"]. Read one with array_path=

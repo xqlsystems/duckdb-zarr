@@ -7,9 +7,9 @@ use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab, Value};
 
 use crate::zarr_reader::meta::{
     build_column_defs, build_work_units, dim_group_for_array, dimension_names, extract_file_system,
-    infer_dim_groups, load_coord_array, open_array, open_store, select_array_name, ZarrArray,
-    ZarrStore,
+    load_coord_array, open_array, open_store, select_array_name, ZarrArray, ZarrStore,
 };
+use crate::zarr_reader::tree::{self, StoreTree};
 use crate::zarr_reader::types::{
     ColumnDef, CoordArray, DimGroup, FixedValues, SharedColumnValues, StringValues, WorkUnit,
     ZarrDtype,
@@ -93,6 +93,14 @@ impl VTab for ReadZarrVTab {
             return Err("use either array_path= or \"array\"=, not both".into());
         }
         let requested_array = array_path.or(array_alias);
+        let requested_group = tree::group_param(bind)?;
+        if requested_group.is_some() && requested_array.is_some() {
+            return Err(
+                "use either group_path= or array_path=, not both; array_path= is relative to \
+                 the store root"
+                    .into(),
+            );
+        }
 
         // Mirrors xarray.open_zarr's decode_times=: on by default, opt out to see
         // the raw CF offsets instead of TIMESTAMPs.
@@ -126,7 +134,7 @@ impl VTab for ReadZarrVTab {
                     .into());
                 }
             }
-            return finish_bind(bind, store, &group, decode_times);
+            return finish_bind(bind, store, &group, decode_times, ColumnNames::ArrayPath);
         }
 
         let array_names = crate::zarr_reader::meta::list_array_names(&store_path, &store)?;
@@ -134,32 +142,98 @@ impl VTab for ReadZarrVTab {
             return Err(format!("no Zarr arrays found in '{store_path}'").into());
         }
 
-        let (dim_groups, _coord_names) = infer_dim_groups(&store, &array_names)?;
+        // One node (Zarr group) of the store, the root unless group_path= says
+        // otherwise, as in xarray.open_zarr (design decision 8).
+        let node = requested_group.unwrap_or_default();
+        let shown = tree::display_group(&node);
+        let store_tree = StoreTree::load_for_node(&store, &array_names, &node)?;
+        let node_prefix = format!("{node}/");
+        if !node.is_empty()
+            && !array_names
+                .iter()
+                .any(|name| name.starts_with(&node_prefix))
+        {
+            return Err(format!(
+                "'{store_path}': group '{shown}' not found; run read_zarr_groups('{store_path}') \
+                 to list the groups"
+            )
+            .into());
+        }
+        let node_groups = store_tree.dim_groups(&node);
+        if let Some(msg) = node_groups.misaligned {
+            return Err(msg.into());
+        }
+        let dim_groups = &node_groups.groups;
 
         if dim_groups.is_empty() {
-            return Err(format!("no data variables found in '{store_path}'").into());
+            let mut msg = format!("'{store_path}': no data variables in group '{shown}'");
+            if !node_groups.unnamed.is_empty() {
+                msg.push_str(&format!(
+                    "; these arrays declare no dimension names: {:?}. Read one with \
+                     array_path=, which names its dimensions dim_0, dim_1 and so on",
+                    node_groups.unnamed
+                ));
+            }
+            msg.push_str(&format!(
+                ". Use group_path= to read another group; read_zarr_groups('{store_path}') lists \
+                 the tables in every group"
+            ));
+            return Err(msg.into());
         }
 
-        let group = match requested_dims {
-            Some(ref dims) => dim_groups.iter().find(|g| g.dims == *dims).ok_or_else(|| {
-                format!(
-                    "'{store_path}': no dimension group matches dims={dims:?}; available: {:?}",
-                    dim_groups.iter().map(|g| &g.dims).collect::<Vec<_>>()
-                )
-            })?,
+        let available = || {
+            let mut dims: Vec<&Vec<String>> = dim_groups.iter().map(|g| &g.dims).collect();
+            dims.dedup();
+            dims
+        };
+        let wanted: &[String] = match &requested_dims {
+            Some(dims) => dims,
             None => {
-                if dim_groups.len() > 1 {
+                let distinct = available();
+                if distinct.len() > 1 {
                     return Err(format!(
-                        "'{store_path}' contains multiple dimension groups ({}) {:?}; use dims= to select a compatible group or array_path= to select one array",
-                        dim_groups.len(),
-                        dim_groups.iter().map(|g| &g.dims).collect::<Vec<_>>()
-                    ).into());
+                        "'{store_path}': group '{shown}' contains multiple dimension groups ({}) \
+                         {distinct:?}; use dims= to select a compatible group or array_path= to \
+                         select one array",
+                        distinct.len()
+                    )
+                    .into());
                 }
-                &dim_groups[0]
+                &dim_groups[0].dims
+            }
+        };
+        let matching: Vec<&DimGroup> = dim_groups.iter().filter(|g| g.dims == wanted).collect();
+        let group = match matching.as_slice() {
+            [] => {
+                return Err(format!(
+                    "'{store_path}': no dimension group matches dims={wanted:?} in group \
+                     '{shown}'; available: {:?}",
+                    available()
+                )
+                .into())
+            }
+            [group] => *group,
+            [a, b, ..] => {
+                let field = if a.shape != b.shape {
+                    "array shape"
+                } else {
+                    "chunk shape"
+                };
+                let (ours, theirs) = if a.shape != b.shape {
+                    (&a.shape, &b.shape)
+                } else {
+                    (&a.chunk_shape, &b.chunk_shape)
+                };
+                return Err(format!(
+                    "{field} mismatch in dim group {wanted:?}: {:?} {ours:?} vs {:?} {theirs:?}; \
+                     use array_path= to select one array",
+                    a.data_var_names, b.data_var_names
+                )
+                .into());
             }
         };
 
-        finish_bind(bind, store, group, decode_times)
+        finish_bind(bind, store, group, decode_times, ColumnNames::Basename)
     }
 
     fn supports_pushdown() -> bool {
@@ -264,7 +338,7 @@ impl VTab for ReadZarrVTab {
     }
 
     fn named_parameters() -> Option<Vec<(String, duckdb::core::LogicalTypeHandle)>> {
-        Some(vec![
+        let mut params = vec![
             (
                 "dims".to_string(),
                 LogicalTypeHandle::list(&LogicalTypeId::Varchar.into()),
@@ -272,7 +346,9 @@ impl VTab for ReadZarrVTab {
             ("array".to_string(), LogicalTypeId::Varchar.into()),
             ("array_path".to_string(), LogicalTypeId::Varchar.into()),
             ("decode_times".to_string(), LogicalTypeId::Boolean.into()),
-        ])
+        ];
+        params.extend(crate::zarr_reader::tree::group_named_parameters());
+        Some(params)
     }
 }
 
@@ -298,11 +374,21 @@ fn parse_dims_param(value: Value) -> Result<Vec<String>, Box<dyn std::error::Err
     Ok(items.iter().map(|item| item.to_string()).collect())
 }
 
+/// How data-variable columns are named.
+#[derive(Clone, Copy, PartialEq)]
+enum ColumnNames {
+    /// The variable's name within its group, as in xarray (`foo`, not `a/b/foo`).
+    Basename,
+    /// One array selected by `array_path=`: its store-relative path.
+    ArrayPath,
+}
+
 fn finish_bind(
     bind: &BindInfo,
     store: ZarrStore,
     group: &DimGroup,
     decode_times: bool,
+    names: ColumnNames,
 ) -> Result<ReadZarrBind, Box<dyn std::error::Error>> {
     // Load coord arrays.
     let mut coord_arrays: HashMap<String, CoordArray> = HashMap::new();
@@ -317,17 +403,22 @@ fn finish_bind(
 
     let columns = build_column_defs(&store, group, &coord_arrays, decode_times)?;
 
-    // Register output columns with DuckDB. When a single array is selected by
-    // array_path, its name is a numeric level (`0`) or a nested store-relative
-    // path (`labels/nuclei/0`); surface that value column as `value` so callers
-    // don't have to double-quote it. Decoding still keys off `col.name`.
+    // Register output columns with DuckDB. A group read names each data column
+    // after the variable's name within the group. When a single array's name is a
+    // numeric level (`0`) or, for array_path=, a nested store-relative path
+    // (`labels/nuclei/0`), surface that value column as `value` so callers don't
+    // have to double-quote it. Decoding still keys off `col.name`.
     let single_data_var = columns.iter().filter(|c| !c.is_coord).count() == 1;
     for col in &columns {
         let duckdb_type = col.on_disk_dtype.to_duckdb_type(&col.encoding);
-        let display_name = if single_data_var && !col.is_coord && needs_value_alias(&col.name) {
+        let name = match names {
+            ColumnNames::Basename => tree::basename(&col.name),
+            ColumnNames::ArrayPath => col.name.as_str(),
+        };
+        let display_name = if !col.is_coord && single_data_var && needs_value_alias(name) {
             "value"
         } else {
-            col.name.as_str()
+            name
         };
         bind.add_result_column(display_name, duckdb_type);
     }

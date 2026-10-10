@@ -67,8 +67,17 @@ impl VTab for ReadZarrMetaVTab {
         if array_path.is_some() && array_alias.is_some() {
             return Err("use either array_path= or \"array\"=, not both".into());
         }
-        if let Some(requested) = array_path.or(array_alias) {
+        let requested_group = crate::zarr_reader::tree::group_param(bind)?;
+        let requested_array = array_path.or(array_alias);
+        if requested_group.is_some() && requested_array.is_some() {
+            return Err("use either group_path= or array_path=, not both".into());
+        }
+        if let Some(requested) = requested_array {
             array_names = vec![select_array_name(&array_names, &requested)?];
+        }
+        // group_path= lists the arrays directly in that group, not in its subgroups.
+        if let Some(node) = requested_group {
+            array_names.retain(|name| crate::zarr_reader::tree::node_of(name) == node);
         }
 
         let aux_coords = collect_auxiliary_coords(&store, &array_names);
@@ -197,9 +206,11 @@ impl VTab for ReadZarrMetaVTab {
     }
 
     fn named_parameters() -> Option<Vec<(String, duckdb::core::LogicalTypeHandle)>> {
-        Some(vec![
+        let mut params = vec![
             ("array".to_string(), LogicalTypeId::Varchar.into()),
             ("array_path".to_string(), LogicalTypeId::Varchar.into()),
-        ])
+        ];
+        params.extend(crate::zarr_reader::tree::group_named_parameters());
+        Some(params)
     }
 }
