@@ -1,12 +1,12 @@
 import * as duckdb from "@duckdb/duckdb-wasm";
-import duckdbWasm from "@duckdb/duckdb-wasm/dist/duckdb-mvp.wasm?url";
-import duckdbWorker from "@duckdb/duckdb-wasm/dist/duckdb-browser-mvp.worker.js?url";
+import duckdbWasm from "@duckdb/duckdb-wasm/dist/duckdb-eh.wasm?url";
+import duckdbWorker from "@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js?url";
 import { Deck, MapView } from "@deck.gl/core";
 import { ScatterplotLayer } from "@deck.gl/layers";
 
-// Public GPCP precipitation store (time, latitude, longitude).
-const DEFAULT_URL =
-  "https://ncsa.osn.xsede.org/Pangeo/pangeo-forge/gpcp-feedstock/gpcp.zarr";
+// Small sample store served from public/data (see scripts/make_sample.py); same
+// origin, so no CORS. Any CORS-enabled public store with consolidated metadata works.
+const DEFAULT_URL = new URL("data/air.zarr", location.href).href;
 const EXTENSION_URL = new URL("zarr.duckdb_extension.wasm", location.href).href;
 
 const $ = (id) => document.getElementById(id);
@@ -16,11 +16,10 @@ const setStatus = (msg, isError = false) => {
 };
 
 $("url").value = new URLSearchParams(location.search).get("url") ?? DEFAULT_URL;
-$("sql").value = `-- One day of GPCP precipitation; lon/lat are coordinate columns.
-SELECT longitude AS lon, latitude AS lat, precip AS value
-FROM read_zarr('{url}', dims=['time','latitude','longitude'])
-WHERE time >= TIMESTAMP '2020-01-01' AND time < TIMESTAMP '2020-01-02'
-  AND precip IS NOT NULL`;
+$("sql").value = `-- NCEP air temperature (K) at one time step; lon/lat are coordinate columns.
+SELECT lon, lat, air AS value
+FROM read_zarr('{url}')
+WHERE time = TIMESTAMP '2013-01-01 12:00:00'`;
 
 const db = await (async () => {
   const worker = new Worker(duckdbWorker);
@@ -70,6 +69,8 @@ async function run() {
       layers: [
         new ScatterplotLayer({
           id: "zarr",
+          pickable: true,
+          wrapLongitude: true, // datasets with 0-360 longitudes
           data: { length: table.numRows },
           getPosition: (_, { index }) => [lon[index], lat[index]],
           getFillColor: (_, { index }) => {
