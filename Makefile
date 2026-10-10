@@ -9,7 +9,7 @@ EXTENSION_NAME=zarr
 USE_UNSTABLE_C_API=1
 
 # Target DuckDB version
-TARGET_DUCKDB_VERSION=v1.5.5
+TARGET_DUCKDB_VERSION=v1.5.6
 
 # The sqllogictest runner (pip `duckdb`) must match the build pin exactly:
 # USE_UNSTABLE_C_API=1 makes the loader reject an extension built for a
