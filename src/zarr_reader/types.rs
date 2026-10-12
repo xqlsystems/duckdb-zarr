@@ -150,6 +150,13 @@ pub struct DimGroup {
 pub trait ColumnValues: std::fmt::Debug + Send + Sync {
     /// Write the element at row-major index `src_idx` into slot `dst` of `vector`.
     fn write_element(&self, vector: &mut FlatVector<'_>, src_idx: usize, dst: usize);
+
+    /// Comparable numeric value of element `idx` after CF decoding (TIMESTAMPs are
+    /// microseconds since the epoch). `None` for NULL elements and for dtypes with
+    /// no numeric order (strings), which therefore never match a range bound.
+    fn key_at(&self, _idx: usize) -> Option<f64> {
+        None
+    }
 }
 
 /// Shared handle to decoded values; cheap to clone.
@@ -198,6 +205,17 @@ impl ColumnValues for FixedValues {
             self.elem_size,
             dst,
         );
+    }
+
+    fn key_at(&self, idx: usize) -> Option<f64> {
+        crate::zarr_reader::scan::element_key(
+            &self.bytes,
+            &self.dtype,
+            &self.encoding,
+            &self.sentinel,
+            idx,
+            self.elem_size,
+        )
     }
 }
 

@@ -5,10 +5,11 @@ use std::sync::{Arc, Mutex};
 use duckdb::core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab, Value};
 
+use crate::zarr_reader::bounds::{chunks_with_kept, index_mask, parse_endpoint, RawBound};
 use crate::zarr_reader::meta::{
-    build_column_defs, build_work_units, dim_group_for_array, dimension_names, extract_file_system,
-    infer_dim_groups, load_coord_array, open_array, open_store, select_array_name, ZarrArray,
-    ZarrStore,
+    build_column_defs, build_work_units_in, dim_group_for_array, dimension_names,
+    extract_file_system, infer_dim_groups, load_coord_array, open_array, open_store,
+    select_array_name, ZarrArray, ZarrStore,
 };
 use crate::zarr_reader::types::{
     ColumnDef, CoordArray, DimGroup, FixedValues, SharedColumnValues, StringValues, WorkUnit,
@@ -27,6 +28,8 @@ pub struct ReadZarrBind {
     /// Pre-opened data-variable arrays; avoids O(n_chunks × n_vars) metadata reads.
     pub arrays: HashMap<String, ZarrArray>,
     pub work_units: Vec<WorkUnit>,
+    /// Per dimension: which coordinate indices survive `bounds=` (`None` = unrestricted).
+    pub index_masks: Vec<Option<Vec<bool>>>,
     pub next_unit: AtomicUsize,
 }
 
@@ -101,6 +104,12 @@ impl VTab for ReadZarrVTab {
             .map(|value| value.is_null() || value.to_bool())
             .unwrap_or(true);
 
+        let bounds: Vec<RawBound> = bind
+            .get_named_parameter("bounds")
+            .map(parse_bounds_param)
+            .transpose()?
+            .unwrap_or_default();
+
         let fs = unsafe { extract_file_system(bind) };
         let store = open_store(&store_path, Some(fs))?;
         if let Some(requested) = requested_array {
@@ -126,7 +135,7 @@ impl VTab for ReadZarrVTab {
                     .into());
                 }
             }
-            return finish_bind(bind, store, &group, decode_times);
+            return finish_bind(bind, store, &group, decode_times, &bounds);
         }
 
         let array_names = crate::zarr_reader::meta::list_array_names(&store_path, &store)?;
@@ -159,7 +168,7 @@ impl VTab for ReadZarrVTab {
             }
         };
 
-        finish_bind(bind, store, group, decode_times)
+        finish_bind(bind, store, group, decode_times, &bounds)
     }
 
     fn supports_pushdown() -> bool {
@@ -228,21 +237,17 @@ impl VTab for ReadZarrVTab {
             }
 
             let wu = &bind.work_units[state.current_unit_idx];
-            let remaining_in_chunk = state.chunk_rows - state.row_cursor;
-            let can_write = (vector_size - rows_written).min(remaining_in_chunk);
-
-            if can_write == 0 {
-                break;
-            }
+            let can_write = vector_size - rows_written;
 
             // fill_output_chunk writes into output starting at rows_written.
             // It reads from the chunk starting at row_cursor.
-            let written = fill_chunk_slice(
+            let (consumed, written) = fill_chunk_slice(
                 &bind.columns,
                 &bind.coord_arrays,
                 wu,
                 &bind.group_shape,
                 &bind.group_chunk_shape,
+                &bind.index_masks,
                 &state.current_chunk_values,
                 output,
                 rows_written,
@@ -251,7 +256,7 @@ impl VTab for ReadZarrVTab {
                 projected,
             );
 
-            state.row_cursor += written;
+            state.row_cursor += consumed;
             rows_written += written;
         }
 
@@ -272,6 +277,10 @@ impl VTab for ReadZarrVTab {
             ("array".to_string(), LogicalTypeId::Varchar.into()),
             ("array_path".to_string(), LogicalTypeId::Varchar.into()),
             ("decode_times".to_string(), LogicalTypeId::Boolean.into()),
+            (
+                "bounds".to_string(),
+                LogicalTypeHandle::list(&LogicalTypeHandle::list(&LogicalTypeId::Varchar.into())),
+            ),
         ])
     }
 }
@@ -298,11 +307,33 @@ fn parse_dims_param(value: Value) -> Result<Vec<String>, Box<dyn std::error::Err
     Ok(items.iter().map(|item| item.to_string()).collect())
 }
 
+/// Parse `bounds := [[dim, lo, hi], ...]`; a NULL `lo`/`hi` leaves that side open.
+fn parse_bounds_param(value: Value) -> Result<Vec<RawBound>, Box<dyn std::error::Error>> {
+    const USAGE: &str = "bounds must be a list of [dim, lo, hi] entries, e.g. bounds=[['time','2022-07-01','2022-07-02'],['latitude',30,60]]";
+    let entries = value.to_list().ok_or(USAGE)?;
+    entries
+        .iter()
+        .map(|entry| {
+            let parts = entry.to_list().ok_or(USAGE)?;
+            if parts.len() != 3 || parts[0].is_null() {
+                return Err(USAGE.into());
+            }
+            let endpoint = |v: &Value| (!v.is_null()).then(|| v.to_string());
+            Ok(RawBound {
+                dim: parts[0].to_string(),
+                lo: endpoint(&parts[1]),
+                hi: endpoint(&parts[2]),
+            })
+        })
+        .collect()
+}
+
 fn finish_bind(
     bind: &BindInfo,
     store: ZarrStore,
     group: &DimGroup,
     decode_times: bool,
+    bounds: &[RawBound],
 ) -> Result<ReadZarrBind, Box<dyn std::error::Error>> {
     // Load coord arrays.
     let mut coord_arrays: HashMap<String, CoordArray> = HashMap::new();
@@ -341,7 +372,41 @@ fn finish_bind(
         }
     }
 
-    let work_units = build_work_units(group);
+    // Resolve bounds= into per-index masks, then keep only chunks that can hold a kept row.
+    let mut index_masks: Vec<Option<Vec<bool>>> = vec![None; group.dims.len()];
+    for b in bounds {
+        let k = group.dims.iter().position(|d| *d == b.dim).ok_or_else(|| {
+            format!(
+                "bounds: no dimension '{}'; dimensions are {:?}",
+                b.dim, group.dims
+            )
+        })?;
+        if index_masks[k].is_some() {
+            return Err(format!("bounds: dimension '{}' listed more than once", b.dim).into());
+        }
+        let ca = coord_arrays.get(&b.dim).ok_or_else(|| {
+            format!(
+                "bounds: dimension '{}' has no coordinate array to compare against",
+                b.dim
+            )
+        })?;
+        let lo =
+            b.lo.as_deref()
+                .map(|t| parse_endpoint(t, &ca.encoding, &b.dim))
+                .transpose()?;
+        let hi =
+            b.hi.as_deref()
+                .map(|t| parse_endpoint(t, &ca.encoding, &b.dim))
+                .transpose()?;
+        index_masks[k] = Some(index_mask(ca, group.shape[k] as usize, lo, hi));
+    }
+    let chunks_per_dim: Vec<Vec<u64>> = (0..group.dims.len())
+        .map(|k| match &index_masks[k] {
+            Some(mask) => chunks_with_kept(mask, group.shape[k], group.chunk_shape[k]),
+            None => (0..group.shape[k].div_ceil(group.chunk_shape[k])).collect(),
+        })
+        .collect();
+    let work_units = build_work_units_in(&chunks_per_dim);
 
     Ok(ReadZarrBind {
         group_shape: group.shape.clone(),
@@ -350,6 +415,7 @@ fn finish_bind(
         coord_arrays,
         arrays,
         work_units,
+        index_masks,
         next_unit: AtomicUsize::new(0),
     })
 }
@@ -415,7 +481,10 @@ fn compute_chunk_rows(wu: &WorkUnit, shape: &[u64], chunk_shape: &[u64]) -> usiz
 ///
 /// `vector_base` = starting row in the DuckDB output vector.
 /// `chunk_row_start` = starting row within the chunk.
-/// `n_rows` = how many rows to write.
+/// `max_rows` = capacity left in the output vector.
+///
+/// Rows whose index is masked out by `bounds=` are skipped. Returns
+/// `(chunk rows consumed, rows written)`; they differ when rows were skipped.
 #[allow(clippy::too_many_arguments)]
 fn fill_chunk_slice(
     col_defs: &[ColumnDef],
@@ -423,13 +492,14 @@ fn fill_chunk_slice(
     wu: &WorkUnit,
     group_shape: &[u64],
     group_chunk_shape: &[u64],
+    index_masks: &[Option<Vec<bool>>],
     chunk_values: &HashMap<String, SharedColumnValues>,
     output: &mut DataChunkHandle,
     vector_base: usize,
     chunk_row_start: usize,
-    n_rows: usize,
+    max_rows: usize,
     projected: &HashMap<usize, usize>,
-) -> usize {
+) -> (usize, usize) {
     let ndim = wu.chunk_indices.len();
 
     // Logical chunk shape: clipped to array bounds for boundary chunks.
@@ -460,6 +530,23 @@ fn fill_chunk_slice(
         zarrs_strides[k] = zarrs_strides[k + 1] * zarrs_shape[k + 1];
     }
 
+    // Pick the chunk rows to emit: stop when the output is full or the chunk ends.
+    let chunk_rows: usize = chunk_shape.iter().product();
+    let mut selected: Vec<usize> = Vec::with_capacity(max_rows.min(chunk_rows));
+    let mut flat_row = chunk_row_start;
+    while flat_row < chunk_rows && selected.len() < max_rows {
+        let keep = index_masks.iter().enumerate().all(|(k, mask)| match mask {
+            Some(mask) => mask[chunk_origin[k] + (flat_row / strides[k]) % chunk_shape[k]],
+            None => true,
+        });
+        if keep {
+            selected.push(flat_row);
+        }
+        flat_row += 1;
+    }
+    let consumed = flat_row - chunk_row_start;
+    let n_rows = selected.len();
+
     for (col_idx, col_def) in col_defs.iter().enumerate() {
         let out_vec_idx = match projected.get(&col_idx) {
             Some(&i) => i,
@@ -468,8 +555,7 @@ fn fill_chunk_slice(
 
         let mut vector = output.flat_vector(out_vec_idx);
 
-        for out_i in 0..n_rows {
-            let flat_row = chunk_row_start + out_i;
+        for (out_i, &flat_row) in selected.iter().enumerate() {
             let dst = vector_base + out_i;
 
             // Map flat logical row → per-dim indices within the logical chunk.
@@ -509,5 +595,5 @@ fn fill_chunk_slice(
         }
     }
 
-    n_rows
+    (consumed, n_rows)
 }

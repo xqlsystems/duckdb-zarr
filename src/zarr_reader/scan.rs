@@ -262,3 +262,62 @@ pub fn fill_element(
         }
     }
 }
+
+/// Comparable numeric value of one element after the same decoding
+/// [`fill_element`] applies, or `None` where `fill_element` would write NULL.
+pub fn element_key(
+    bytes: &[u8],
+    dtype: &ZarrDtype,
+    encoding: &ColumnEncoding,
+    sentinel: &Option<FillSentinel>,
+    idx: usize,
+    elem_size: usize,
+) -> Option<f64> {
+    let src = idx * elem_size;
+    if *dtype == ZarrDtype::Bool {
+        return Some((bytes[src] != 0) as u8 as f64);
+    }
+    match encoding {
+        ColumnEncoding::Plain | ColumnEncoding::PackedInt { .. } => {
+            let numeric = if dtype.is_integer() {
+                let raw = read_int_as_i64_pub(bytes, dtype, src);
+                if matches_int_sentinel(raw, sentinel) {
+                    return None;
+                }
+                if *dtype == ZarrDtype::UInt64 {
+                    raw as u64 as f64
+                } else {
+                    raw as f64
+                }
+            } else {
+                let raw = read_as_f64_pub(bytes, dtype, src);
+                if matches_float_sentinel(raw, sentinel) || raw.is_nan() {
+                    return None;
+                }
+                raw
+            };
+            match encoding {
+                ColumnEncoding::PackedInt {
+                    scale_factor,
+                    add_offset,
+                } => Some(numeric * scale_factor + add_offset),
+                _ => Some(numeric),
+            }
+        }
+        ColumnEncoding::CfTime(cf) => {
+            let decoded = if dtype.is_integer() {
+                let raw = read_int_as_i64_pub(bytes, dtype, src);
+                let overflowed = *dtype == ZarrDtype::UInt64 && raw < 0;
+                (!overflowed && !matches_int_sentinel(raw, sentinel))
+                    .then(|| cf.decode_int(raw))
+                    .flatten()
+            } else {
+                let raw = read_as_f64_pub(bytes, dtype, src);
+                (!matches_float_sentinel(raw, sentinel))
+                    .then(|| cf.decode_float(raw))
+                    .flatten()
+            };
+            decoded.map(|micros| micros as f64)
+        }
+    }
+}

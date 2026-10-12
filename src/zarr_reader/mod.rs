@@ -1,3 +1,4 @@
+pub mod bounds;
 pub mod cftime;
 pub mod consolidated_store;
 pub mod duckdb_store;

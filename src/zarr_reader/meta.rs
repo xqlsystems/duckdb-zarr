@@ -949,32 +949,20 @@ pub fn load_coord_array(
     })
 }
 
-/// Build the list of `WorkUnit`s for one dim group.
-pub fn build_work_units(group: &DimGroup) -> Vec<WorkUnit> {
-    // Number of chunks per dimension.
-    let n_chunks_per_dim: Vec<u64> = group
-        .dims
-        .iter()
-        .enumerate()
-        .map(|(i, _)| group.shape[i].div_ceil(group.chunk_shape[i]))
-        .collect();
-
-    // Total number of chunks.
-    let total: u64 = n_chunks_per_dim.iter().product();
-
-    // Generate all chunk index tuples in C (row-major) order.
-    let ndim = n_chunks_per_dim.len();
-    let mut strides = vec![1u64; ndim];
+/// Build work units for the cartesian product of the given per-dimension chunk
+/// indices, in C (row-major) order. An empty list for any dimension yields no units.
+pub fn build_work_units_in(chunks_per_dim: &[Vec<u64>]) -> Vec<WorkUnit> {
+    let ndim = chunks_per_dim.len();
+    let total: usize = chunks_per_dim.iter().map(Vec::len).product();
+    let mut strides = vec![1usize; ndim];
     for k in (0..ndim.saturating_sub(1)).rev() {
-        strides[k] = strides[k + 1] * n_chunks_per_dim[k + 1];
+        strides[k] = strides[k + 1] * chunks_per_dim[k + 1].len();
     }
-
     (0..total)
-        .map(|i| {
-            let chunk_indices = (0..ndim)
-                .map(|k| (i / strides[k]) % n_chunks_per_dim[k])
-                .collect();
-            WorkUnit { chunk_indices }
+        .map(|i| WorkUnit {
+            chunk_indices: (0..ndim)
+                .map(|k| chunks_per_dim[k][(i / strides[k]) % chunks_per_dim[k].len()])
+                .collect(),
         })
         .collect()
 }

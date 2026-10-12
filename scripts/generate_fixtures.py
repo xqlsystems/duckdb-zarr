@@ -702,6 +702,43 @@ def main() -> None:
         zarr.consolidate_metadata(str(dest))
         print(f"  wrote {dest}")
 
+    # ── bounds_grid (synthetic) ──────────────────────────────────────────────
+    # Tests: read_zarr(bounds=...) chunk pruning and row filtering. Every axis has a
+    # ragged tail or a descending/non-uniform order: time is 6 hourly steps in chunks
+    # of 2 (seams between hours 1|2 and 3|4), lat is 5 descending values in chunks of
+    # 2, lon is 4 values in chunks of 3. value = 100*t + 10*lat_i + lon_i, so every
+    # cell identifies its own indices.
+    print("bounds_grid (synthetic)...")
+    times = np.datetime64("2020-01-01T00:00") + np.arange(6) * np.timedelta64(1, "h")
+    lats = np.array([60.0, 30.0, 0.0, -30.0, -60.0])
+    lons = np.array([0.0, 90.0, 180.0, 270.0])
+    cell = (100 * np.arange(6)[:, None, None]
+            + 10 * np.arange(5)[None, :, None]
+            + np.arange(4)[None, None, :]).astype("float64")
+    bounds_ds = xr.Dataset(
+        {"value": (("time", "lat", "lon"), cell)},
+        coords={"time": times, "lat": lats, "lon": lons},
+    )
+    write_zarr(bounds_ds, "bounds_grid", encoding={
+        "value": {"chunks": [2, 2, 3], "_FillValue": None},
+        "time": {"units": "hours since 2020-01-01", "dtype": "int64"},
+    })
+
+    # ── bounds_grid_poisoned (synthetic) ─────────────────────────────────────
+    # bounds_grid with the value chunk for time hours 2-3 (chunk c/1/0/0) replaced by
+    # garbage. A scan that reads it fails to decode, so a query that succeeds under
+    # bounds= proves the chunk was pruned rather than read and filtered afterwards.
+    print("bounds_grid_poisoned (synthetic)...")
+    dest = FIXTURES / "bounds_grid_poisoned.zarr"
+    if (dest / "zarr.json").exists():
+        print(f"  (cached) {dest}")
+    else:
+        if dest.exists():
+            _rmtree(dest)
+        shutil.copytree(FIXTURES / "bounds_grid.zarr", dest)
+        (dest / "value" / "c" / "1" / "0" / "0").write_bytes(b"not a valid chunk")
+        print(f"  wrote {dest}")
+
     # ── anndata (real, non-synthetic) ────────────────────────────────────────
     # Delegated to scripts/generate_anndata_fixtures.py via PEP 723 inline
     # metadata so heavy deps (anndata/awkward/dask) stay isolated from this venv.
