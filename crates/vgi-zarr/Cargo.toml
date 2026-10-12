@@ -1,0 +1,40 @@
+[package]
+name = "vgi-zarr"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.97"
+publish = false
+description = "read_zarr as a VGI worker (native subprocess + in-browser wasm worker)"
+
+# rlib for the native bin, staticlib for emcc to link into the browser worker
+# module (see wasm/build.sh).
+[lib]
+name = "vgi_zarr"
+crate-type = ["rlib", "staticlib"]
+
+[[bin]]
+name = "vgi-zarr"
+path = "src/main.rs"
+
+[dependencies]
+# Engine-independent reading shared with the DuckDB extension (no duckdb, no arrow).
+zarr-core = { path = "../zarr-core" }
+# Feature-less: the wasm build must not pull tokio/sqlite.
+vgi = { version = "0.43", default-features = false }
+vgi-rpc = { version = "0.31", default-features = false }
+arrow-array = "60"
+arrow-schema = "60"
+zarrs = { version = "0.23", default-features = false }
+rayon = "1.12"
+serde_json = "1"
+log = "0.4"
+env_logger = { version = "0.11", default-features = false }
+
+# Native transport for HttpStore. rustls: no system OpenSSL to find.
+[target.'cfg(not(target_os = "emscripten"))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
