@@ -43,6 +43,8 @@ SELECT dims, shape, data_vars FROM read_zarr_groups('test/fixtures/xarray_tutori
 
 See [docs/design.md](docs/design.md) for the full design and
 [docs/ome-zarr.md](docs/ome-zarr.md) for a small bioimage example.
+[docs/vgi-wasm-demo.md](docs/vgi-wasm-demo.md) covers the experimental
+in-browser demo: the same reader as a VGI worker in Haybarn-wasm.
 
 ## Remote stores
 
