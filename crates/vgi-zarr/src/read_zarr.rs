@@ -3,34 +3,36 @@
 //!
 //! Pruning is conservative (never drops a chunk that could hold a match), and
 //! the SDK then applies the pushed filters to every emitted batch
-//! (`auto_apply_filters`). That second step is required, not an optimisation:
-//! the `vgi` extension (Haybarn 1.5.5) plans no FILTER above a scan with
-//! pushed filters even when `filters_exactly_applied` is false.
+//! (`FilterHandling::Sdk`), before final projection. Pruning is advisory; the
+//! SDK owns exact filtering, so the worker retains filter-only columns too.
 
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex, OnceLock,
+};
 use std::time::Instant;
 
-use arrow_array::Array as _;
-use arrow_array::{
-    new_null_array, ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch,
-    TimestampMicrosecondArray,
-};
-use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow_array::{new_null_array, ArrayRef, Float64Array, Int64Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rayon::prelude::*;
+use vgi::diagnostics::{ExecutionDiagnostics, ScanStats as SourceStats};
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
 use vgi::pushdown::PushdownFilters;
 use vgi::table_function::{TableCardinality, TableFunction, TableProducer};
+use vgi::FilterHandling;
 use vgi_rpc::{Result, RpcError};
 
-use zarr_core::bounds::{chunks_with_kept, index_mask};
+use crate::shard_index_cache::{IndexCachedStore, IndexRange, ShardIndexCache};
+use zarr_core::bounds::chunks_with_kept;
 use zarr_core::meta::{
     build_column_defs, build_work_units_in, dimension_names, infer_dim_groups, list_array_names,
     load_coord_array, open_array, ZarrArray, ZarrStore,
 };
 use zarr_core::types::{
-    ColumnDef, ColumnEncoding, CoordArray, FixedValues, SharedColumnValues, WorkUnit, ZarrDtype,
+    ColumnDef, ColumnEncoding, CoordArray, FixedValues, SharedColumnValues, StringValues, WorkUnit,
+    ZarrDtype,
 };
 use zarrs::array::{
     ArrayBytes, ArrayShardedExt, ArrayShardedReadableExt, ArrayShardedReadableExtCache,
@@ -62,11 +64,13 @@ struct Opened {
     columns: Vec<ColumnDef>,
     coord_arrays: HashMap<String, CoordArray>,
     arrays: HashMap<String, ZarrArray>,
+    index_ranges: HashMap<String, IndexRange>,
+    index_cache: Arc<ShardIndexCache>,
     /// Set when every data variable is sharded with the same subchunk shape:
     /// work units are then subchunks (`chunk_shape` is the subchunk shape) and
     /// each read fetches the shard index once plus one byte range, instead of
     /// a whole shard (a dynamical.org GFS shard is ~440 MB decoded).
-    shard_caches: Option<HashMap<String, ArrayShardedReadableExtCache>>,
+    sharded: bool,
     schema: SchemaRef,
 }
 
@@ -76,17 +80,19 @@ unsafe impl Send for Opened {}
 unsafe impl Sync for Opened {}
 
 type Key = (String, Option<String>, bool);
+type OpenCache = Mutex<Vec<(Key, Arc<Opened>)>>;
 
 /// Opened stores kept (least recently used evicted). Each holds metadata,
-/// coordinate arrays and shard indexes: small next to decoded chunks, but the
+/// coordinate arrays: small next to decoded chunks, but the
 /// browser demo switches between many stores and wasm memory never shrinks.
 const OPEN_STORES: usize = 4;
-/// Shard indexes cached per array before the cache is reset (~1 KB each).
+/// Decoded indexes cached per execution/array before reset. Encoded indexes
+/// have a separate shared byte budget in `ShardIndexCache`.
 const SHARD_INDEXES: usize = 4096;
 
 /// Most recently used last.
-fn cache() -> &'static Mutex<Vec<(Key, Arc<Opened>)>> {
-    static CACHE: OnceLock<Mutex<Vec<(Key, Arc<Opened>)>>> = OnceLock::new();
+fn cache() -> &'static OpenCache {
+    static CACHE: OnceLock<OpenCache> = OnceLock::new();
     CACHE.get_or_init(Default::default)
 }
 
@@ -102,16 +108,6 @@ fn make_store(path: &str) -> std::result::Result<ZarrStore, Box<dyn Error>> {
     Ok(Arc::new(zarrs::filesystem::FilesystemStore::new(path)?))
 }
 
-fn arrow_type(col: &ColumnDef) -> DataType {
-    match (&col.encoding, &col.on_disk_dtype) {
-        (ColumnEncoding::CfTime(_), _) => DataType::Timestamp(TimeUnit::Microsecond, None),
-        (_, ZarrDtype::Bool) => DataType::Boolean,
-        (_, ZarrDtype::String) => DataType::Utf8,
-        (ColumnEncoding::Plain, d) if d.is_integer() => DataType::Int64,
-        _ => DataType::Float64,
-    }
-}
-
 fn open(path: &str, dims: Option<&str>, decode_times: bool) -> Result<Arc<Opened>> {
     let key = (path.to_string(), dims.map(str::to_string), decode_times);
     {
@@ -124,18 +120,17 @@ fn open(path: &str, dims: Option<&str>, decode_times: bool) -> Result<Arc<Opened
         }
     }
     let t0 = Instant::now();
-    let opened = Arc::new(open_uncached(path, dims, decode_times).map_err(err)?);
+    let opened = Arc::new(
+        open_uncached(path, dims, decode_times)
+            .map_err(|e| crate::source::read_error(e.as_ref()))?,
+    );
     log::info!(
         "vgi-zarr: opened {path} in {:?}: dims={:?} shape={:?} read unit={:?}{}",
         t0.elapsed(),
         opened.dims,
         opened.shape,
         opened.chunk_shape,
-        if opened.shard_caches.is_some() {
-            " (subchunk)"
-        } else {
-            ""
-        }
+        if opened.sharded { " (subchunk)" } else { "" }
     );
     let mut c = cache().lock().unwrap();
     c.retain(|(k, _)| *k != key);
@@ -159,18 +154,18 @@ fn open_uncached(
         dims.map(|d| d.split(',').map(|s| s.trim().to_string()).collect());
     let group = match &wanted {
         Some(w) => groups.iter().find(|g| &g.dims == w).ok_or_else(|| {
-            format!(
+            RpcError::value_error(format!(
                 "no dimension group matches dims={w:?}; available: {:?}",
                 groups.iter().map(|g| &g.dims).collect::<Vec<_>>()
-            )
+            ))
         })?,
         None if groups.len() == 1 => &groups[0],
         None => {
-            return Err(format!(
+            return Err(RpcError::value_error(format!(
                 "store has {} dimension groups {:?}; pass dims := 'a,b,c'",
                 groups.len(),
                 groups.iter().map(|g| &g.dims).collect::<Vec<_>>()
-            )
+            ))
             .into())
         }
     };
@@ -196,24 +191,22 @@ fn open_uncached(
                 .map(|s| s.iter().map(|n| n.get()).collect())
         })
         .collect();
-    let (chunk_shape, shard_caches) = match subchunk_shapes.first() {
-        Some(Some(first)) if subchunk_shapes.iter().all(|s| s.as_ref() == Some(first)) => (
-            first.clone(),
-            Some(
-                arrays
-                    .iter()
-                    .map(|(n, a)| (n.clone(), ArrayShardedReadableExtCache::new(a)))
-                    .collect(),
-            ),
-        ),
-        _ => (group.chunk_shape.clone(), None),
+    let (chunk_shape, sharded) = match subchunk_shapes.first() {
+        Some(Some(first)) if subchunk_shapes.iter().all(|s| s.as_ref() == Some(first)) => {
+            (first.clone(), true)
+        }
+        _ => (group.chunk_shape.clone(), false),
     };
     let schema = Arc::new(Schema::new(
         columns
             .iter()
-            .map(|c| Field::new(&c.name, arrow_type(c), true))
+            .map(|c| Field::new(&c.name, crate::arrow_values::data_type(c), true))
             .collect::<Vec<_>>(),
     ));
+    let index_ranges = arrays
+        .iter()
+        .filter_map(|(name, array)| IndexRange::for_array(array).map(|range| (name.clone(), range)))
+        .collect();
     Ok(Opened {
         dims: group.dims.clone(),
         shape: group.shape.clone(),
@@ -221,7 +214,9 @@ fn open_uncached(
         columns,
         coord_arrays,
         arrays,
-        shard_caches,
+        index_ranges,
+        index_cache: Arc::new(ShardIndexCache::default()),
+        sharded,
         schema,
     })
 }
@@ -252,14 +247,9 @@ impl TableFunction for ReadZarr {
         FunctionMetadata {
             description: "Read a Zarr store as a table (one row per grid cell)".to_string(),
             projection_pushdown: true,
-            filter_pushdown: true,
-            // Pruning keeps whole coordinate ranges (widened for floats), so
-            // let the SDK drop non-matching rows before they cross the IPC
-            // boundary. DuckDB still re-applies every filter.
-            auto_apply_filters: true,
-            filters_exactly_applied: false,
             ..Default::default()
         }
+        .with_filter_handling(FilterHandling::Sdk)
     }
 
     fn argument_specs(&self) -> Vec<ArgSpec> {
@@ -282,7 +272,11 @@ impl TableFunction for ReadZarr {
     fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
         let (path, dims, decode_times) = args(&params.arguments).ok()?;
         let o = open(&path, dims.as_deref(), decode_times).ok()?;
-        let n = o.shape.iter().product::<u64>() as i64;
+        let n = o
+            .shape
+            .iter()
+            .try_fold(1_u64, |n, &size| n.checked_mul(size))?;
+        let n = i64::try_from(n).ok()?;
         Some(TableCardinality {
             estimate: Some(n),
             max: Some(n),
@@ -290,10 +284,12 @@ impl TableFunction for ReadZarr {
     }
 
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let diagnostics = ExecutionDiagnostics::new("read_zarr", &params.execution_id);
         let (path, dims, decode_times) = args(&params.arguments)?;
-        let o = open(&path, dims.as_deref(), decode_times)?;
+        let o = open(&path, dims.as_deref(), decode_times)
+            .map_err(|e| diagnostics.annotate_error(e))?;
 
-        let projected: Vec<bool> = match &params.projection_ids {
+        let mut projected: Vec<bool> = match &params.projection_ids {
             Some(ids) => {
                 let mut p = vec![false; o.columns.len()];
                 for &i in ids {
@@ -306,13 +302,14 @@ impl TableFunction for ReadZarr {
             None => vec![true; o.columns.len()],
         };
 
-        for c in o.shard_caches.iter().flat_map(HashMap::values) {
-            if c.len() > SHARD_INDEXES {
-                c.clear();
+        let filters = params.current_pushdown_filters.as_ref();
+        if let Some(filters) = filters {
+            let required = filters.filtered_columns();
+            for (i, col) in o.columns.iter().enumerate() {
+                projected[i] |= required.contains(&col.name);
             }
         }
-        let filters = params.current_pushdown_filters.as_ref();
-        let masks = dim_masks(&o, filters);
+        let masks = dim_masks(&o, filters).map_err(|e| diagnostics.annotate_error(e))?;
         let chunks_per_dim: Vec<Vec<u64>> = (0..o.dims.len())
             .map(|k| match &masks[k] {
                 Some(m) => chunks_with_kept(m, o.shape[k], o.chunk_shape[k]),
@@ -343,7 +340,58 @@ impl TableFunction for ReadZarr {
             worker_ms: 0.0,
         });
 
+        // Reuse metadata and coordinates, but attach per-execution storage so
+        // parallel reads and interleaved scans cannot share byte counters.
+        let bytes_read = Arc::new(AtomicU64::new(0));
+        let store: ZarrStore = if path.starts_with("http://") || path.starts_with("https://") {
+            Arc::new(crate::http_store::HttpStore::with_counter(
+                &path,
+                bytes_read.clone(),
+            ))
+        } else {
+            Arc::new(crate::source::MeteredStore {
+                inner: make_store(&path).map_err(|e| {
+                    diagnostics.annotate_error(crate::source::read_error(e.as_ref()))
+                })?,
+                bytes_read: bytes_read.clone(),
+            })
+        };
+        let arrays: HashMap<String, ZarrArray> = o
+            .arrays
+            .iter()
+            .map(|(name, array)| {
+                let reader: ZarrStore = match o.index_ranges.get(name) {
+                    Some(&index_range) => Arc::new(IndexCachedStore {
+                        inner: store.clone(),
+                        cache: o.index_cache.clone(),
+                        index_range,
+                    }),
+                    None => store.clone(),
+                };
+                (name.clone(), array.with_storage(reader))
+            })
+            .collect();
+        // zarrs caches partial decoders as well as indexes; keep them with this
+        // execution's storage rather than retaining another scan's counters.
+        // IndexCachedStore reuses encoded indexes without retaining readers.
+        let shard_caches = o.sharded.then(|| {
+            arrays
+                .iter()
+                .map(|(name, array)| (name.clone(), ArrayShardedReadableExtCache::new(array)))
+                .collect()
+        });
+        let stats = SourceStats {
+            chunks_skipped: total - units.len() as u64,
+            ..Default::default()
+        };
         Ok(Box::new(Producer {
+            diagnostics,
+            stats,
+            bytes_read,
+            arrays,
+            shard_caches,
+            scan_started: false,
+            finished: false,
             o,
             projected,
             masks,
@@ -356,86 +404,32 @@ impl TableFunction for ReadZarr {
     }
 }
 
-/// Per-dimension keep masks from the pushed filters.
-///
-/// Exact path: evaluate the filters on a batch holding dimension `k`'s
-/// coordinates with every other column NULL. Under three-valued logic a
-/// predicate on another column is NULL there, not false, so a row comes out
-/// `false` only if the predicates on this dimension alone exclude it. That
-/// holds for comparisons, IN and their AND/OR/NOT; it is checked by requiring
-/// every filter to be one of those shapes and an all-NULL row not to be
-/// excluded (which catches `IS NOT NULL` on another column).
-///
-/// Fallback: `get_column_bounds`, which casts literals to i64 — exact for
-/// TIMESTAMP (µs) and integer coords, but it truncates float literals and
-/// applies a ±1 strict-comparison adjustment, so float coords widen by 2.
-fn dim_masks(o: &Opened, filters: Option<&PushdownFilters>) -> Vec<Option<Vec<bool>>> {
-    let Some(f) = filters else {
-        return vec![None; o.dims.len()];
+/// Each batch contains only the known coordinate column. Absent data/other
+/// dimension columns are unknown, not SQL NULL. Only `false` proves exclusion;
+/// `true` still requires the SDK's exact filter on real, decoded rows.
+fn dim_masks(o: &Opened, filters: Option<&PushdownFilters>) -> Result<Vec<Option<Vec<bool>>>> {
+    let Some(filters) = filters else {
+        return Ok(vec![None; o.dims.len()]);
     };
-    let exact = f.filters().iter().all(simple_filter) && !excludes(f, &null_batch(o, 1, None));
     o.dims
         .iter()
         .enumerate()
         .map(|(k, dim)| {
-            if !f.has_filter_for_column(dim) {
-                return None;
+            if !filters.has_filter_for_column(dim) {
+                return Ok(None);
             }
             let n = o.shape[k] as usize;
-            if exact {
-                let batch = null_batch(o, n, Some(k))?;
-                if let Ok(r) = f.evaluate(&batch) {
-                    return Some((0..n).map(|i| !(r.is_valid(i) && !r.value(i))).collect());
-                }
-            }
-            let ca = o.coord_arrays.get(dim)?;
-            let b = f.get_column_bounds(dim)?;
-            let slack = match (&ca.encoding, ca.dtype.is_integer()) {
-                (ColumnEncoding::CfTime(_), _) | (ColumnEncoding::Plain, true) => 0.0,
-                _ => 2.0,
+            let values: ArrayRef = match o.coord_arrays.get(dim) {
+                Some(ca) => crate::arrow_values::to_array(ca.data.as_ref(), 0..n)?,
+                None => Arc::new(Int64Array::from_iter_values(0..n as i64)),
             };
-            let lo = b.min.map(|v| v as f64 - slack);
-            let hi = b.max.map(|v| v as f64 + slack);
-            Some(index_mask(ca, n, lo, hi))
+            let field = o.schema.field_with_name(dim).map_err(err)?.clone();
+            let known = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![values])
+                .map_err(err)?;
+            let keep = filters.may_match(&known)?;
+            Ok(Some(keep.values().iter().collect()))
         })
         .collect()
-}
-
-fn simple_filter(f: &vgi::pushdown::Filter) -> bool {
-    use vgi::pushdown::Filter::*;
-    match f {
-        Constant { .. } | In { .. } | IsNull { .. } | IsNotNull { .. } => true,
-        And(v) | Or(v) => v.iter().all(simple_filter),
-        _ => false,
-    }
-}
-
-/// Whether the filters mark any row of `batch` definitely false.
-fn excludes(f: &PushdownFilters, batch: &Option<RecordBatch>) -> bool {
-    match batch.as_ref().map(|b| f.evaluate(b)) {
-        Some(Ok(r)) => (0..r.len()).any(|i| r.is_valid(i) && !r.value(i)),
-        _ => true,
-    }
-}
-
-/// `n` all-NULL rows, except dimension `dim`'s column holds its coordinates.
-fn null_batch(o: &Opened, n: usize, dim: Option<usize>) -> Option<RecordBatch> {
-    let cols = o
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(i, col)| {
-            let ty = o.schema.field(i).data_type();
-            match (dim, col.dim_idx) {
-                (Some(k), Some(d)) if d == k => match o.coord_arrays.get(&col.name) {
-                    Some(ca) => to_array(ty, (0..n).map(|j| ca.data.key_at(j))),
-                    None => Arc::new(Int64Array::from_iter_values(0..n as i64)),
-                },
-                _ => new_null_array(ty, n),
-            }
-        })
-        .collect();
-    RecordBatch::try_new(o.schema.clone(), cols).ok()
 }
 
 /// `describe_dims(path, dims := ..)`: one row per dimension with its length,
@@ -511,7 +505,7 @@ impl TableFunction for DescribeDims {
                 Some(c) => c.data.key_at(i),
                 None => Some(i as f64),
             };
-            first.push(at(0));
+            first.push((n > 0).then(|| at(0)).flatten());
             last.push(n.checked_sub(1).and_then(at));
             // Every coordinate, for axes short enough to ship (lead times,
             // members, irregular grids); long regular axes go by first/last.
@@ -653,10 +647,24 @@ struct Producer {
     queue: VecDeque<RecordBatch>,
     started: Instant,
     rows: usize,
+    diagnostics: ExecutionDiagnostics,
+    stats: SourceStats,
+    bytes_read: Arc<AtomicU64>,
+    arrays: HashMap<String, ZarrArray>,
+    shard_caches: Option<HashMap<String, ArrayShardedReadableExtCache>>,
+    scan_started: bool,
+    finished: bool,
 }
 
 impl TableProducer for Producer {
-    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+    fn next_batch(&mut self, out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.finished {
+            return Ok(None);
+        }
+        if !self.scan_started {
+            self.diagnostics.scan_started(out);
+            self.scan_started = true;
+        }
         while self.queue.is_empty() {
             if self.next_unit >= self.units.len() {
                 log::info!(
@@ -671,7 +679,15 @@ impl TableProducer for Producer {
                     s.worker_ms = self.started.elapsed().as_secs_f64() * 1e3;
                     report_scan(s);
                 }
+                self.stats.bytes_read = self.bytes_read.load(Ordering::Relaxed);
+                self.diagnostics.scan_finished(out, &self.stats);
+                self.finished = true;
                 return Ok(None);
+            }
+            for cache in self.shard_caches.iter().flat_map(HashMap::values) {
+                if cache.len() > SHARD_INDEXES {
+                    cache.clear();
+                }
             }
             let end = (self.next_unit + PARALLEL_UNITS).min(self.units.len());
             let batch = &self.units[self.next_unit..end];
@@ -680,9 +696,41 @@ impl TableProducer for Producer {
             let t = Instant::now();
             let decoded: Vec<RecordBatch> = batch
                 .par_iter()
-                .map(|wu| decode_unit(o, projected, masks, wu))
+                .map(|wu| {
+                    decode_unit(
+                        o,
+                        &self.arrays,
+                        self.shard_caches.as_ref(),
+                        projected,
+                        masks,
+                        wu,
+                    )
+                })
                 .collect::<std::result::Result<_, _>>()
-                .map_err(err)?;
+                .map_err(|e| {
+                    self.diagnostics
+                        .annotate_error(crate::source::read_error(e.as_ref()))
+                })?;
+            if o.columns
+                .iter()
+                .enumerate()
+                .any(|(i, col)| projected[i] && !col.is_coord)
+            {
+                self.stats.chunks_read += batch.len() as u64;
+            }
+            // Count the logical grid cells decoded before coordinate masks or
+            // SDK filters. Edge-chunk padding is not a source row.
+            self.stats.rows_read += batch
+                .iter()
+                .map(|wu| {
+                    (0..o.dims.len())
+                        .map(|k| {
+                            (o.shape[k] - wu.chunk_indices[k] * o.chunk_shape[k])
+                                .min(o.chunk_shape[k])
+                        })
+                        .product::<u64>()
+                })
+                .sum::<u64>();
             log::debug!(
                 "vgi-zarr: refill {} units on {} threads in {:?}",
                 batch.len(),
@@ -711,6 +759,8 @@ impl TableProducer for Producer {
 /// Decode one chunk tuple into a batch of the rows its masks keep.
 fn decode_unit(
     o: &Opened,
+    arrays: &HashMap<String, ZarrArray>,
+    shard_caches: Option<&HashMap<String, ArrayShardedReadableExtCache>>,
     projected: &[bool],
     masks: &[Option<Vec<bool>>],
     wu: &WorkUnit,
@@ -766,29 +816,41 @@ fn decode_unit(
         }
         if let Some(k) = col.dim_idx {
             match o.coord_arrays.get(&col.name) {
-                Some(ca) => cols.push(to_array(&ty, rows.iter().map(|r| ca.data.key_at(r.0[k])))),
+                Some(ca) => cols.push(crate::arrow_values::to_array(
+                    ca.data.as_ref(),
+                    rows.iter().map(|r| r.0[k]),
+                )?),
                 None => cols.push(Arc::new(Int64Array::from_iter_values(
                     rows.iter().map(|r| r.0[k] as i64),
                 ))),
             }
             continue;
         }
+        let arr = &arrays[&col.name];
         if col.on_disk_dtype == ZarrDtype::String {
-            // SPIKE: strings not wired through yet.
-            cols.push(new_null_array(&ty, rows.len()));
+            let strings = match shard_caches.and_then(|c| c.get(&col.name)) {
+                Some(cache) => arr.retrieve_subchunk_opt::<Vec<String>>(
+                    cache,
+                    &wu.chunk_indices,
+                    &CodecOptions::default(),
+                ),
+                None => arr.retrieve_chunk::<Vec<String>>(&wu.chunk_indices),
+            }?;
+            cols.push(crate::arrow_values::to_array(
+                &StringValues { strings },
+                rows.iter().map(|r| r.1),
+            )?);
             continue;
         }
-        let arr = &o.arrays[&col.name];
         let t = Instant::now();
-        let raw = match o.shard_caches.as_ref().and_then(|c| c.get(&col.name)) {
+        let raw = match shard_caches.and_then(|c| c.get(&col.name)) {
             Some(cache) => arr.retrieve_subchunk_opt::<ArrayBytes<'static>>(
                 cache,
                 &wu.chunk_indices,
                 &CodecOptions::default(),
             ),
             None => arr.retrieve_chunk::<ArrayBytes<'static>>(&wu.chunk_indices),
-        }
-        .map_err(|e| e.to_string())?;
+        }?;
         fetch += t.elapsed();
         let bytes = raw
             .into_fixed()
@@ -803,7 +865,10 @@ fn decode_unit(
             )
             .ok_or("not fixed width")?,
         );
-        cols.push(to_array(&ty, rows.iter().map(|r| values.key_at(r.1))));
+        cols.push(crate::arrow_values::to_array(
+            values.as_ref(),
+            rows.iter().map(|r| r.1),
+        )?);
     }
     log::debug!(
         "vgi-zarr: unit {:?}: {} rows, fetch+decode {:?}, total {:?}",
@@ -813,17 +878,6 @@ fn decode_unit(
         t_fetch.elapsed()
     );
     Ok(RecordBatch::try_new(o.schema.clone(), cols)?)
-}
-
-fn to_array(ty: &DataType, vals: impl Iterator<Item = Option<f64>>) -> ArrayRef {
-    match ty {
-        DataType::Timestamp(..) => Arc::new(TimestampMicrosecondArray::from_iter(
-            vals.map(|v| v.map(|x| x as i64)),
-        )),
-        DataType::Int64 => Arc::new(Int64Array::from_iter(vals.map(|v| v.map(|x| x as i64)))),
-        DataType::Boolean => Arc::new(BooleanArray::from_iter(vals.map(|v| v.map(|x| x != 0.0)))),
-        _ => Arc::new(Float64Array::from_iter(vals)),
-    }
 }
 
 /// Browser only: the wasm heap's current size (it grows, never shrinks).

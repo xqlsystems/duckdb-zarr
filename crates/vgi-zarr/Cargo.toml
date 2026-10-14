@@ -20,7 +20,7 @@ path = "src/main.rs"
 # Engine-independent reading shared with the DuckDB extension (no duckdb, no arrow).
 zarr-core = { path = "../zarr-core" }
 # Feature-less: the wasm build must not pull tokio/sqlite.
-vgi = { version = "0.43", default-features = false }
+vgi = { version = "0.44", default-features = false }
 vgi-rpc = { version = "0.31", default-features = false }
 arrow-array = "60"
 arrow-schema = "60"
@@ -33,6 +33,12 @@ env_logger = { version = "0.11", default-features = false }
 # Native transport for HttpStore. rustls: no system OpenSSL to find.
 [target.'cfg(not(target_os = "emscripten"))'.dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+
+[dev-dependencies]
+vgi-client = { version = "0.44", default-features = false, features = ["testing"] }
+arrow-select = "60"
+tempfile = "3"
+tiny_http = "0.12"
 
 [profile.release]
 opt-level = 3

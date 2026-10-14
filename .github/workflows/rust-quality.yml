@@ -11,6 +11,29 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  vgi-worker:
+    name: VGI worker (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: crates/vgi-zarr
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/vgi-zarr
+      - run: cargo fmt -- --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      # This crate is deliberately outside the extension's workspace. Exercise
+      # its actual stdio worker with local fixtures, without DuckDB or live URLs.
+      - run: cargo test --locked
+
   prek:
     name: prek
     runs-on: ubuntu-latest

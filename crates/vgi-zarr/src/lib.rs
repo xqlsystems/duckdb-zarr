@@ -4,8 +4,11 @@
 //! the `vgi` DuckDB extension) and, on `wasm32-unknown-emscripten`, a browser
 //! worker served over Haybarn-wasm's SharedArrayBuffer channel.
 
+mod arrow_values;
 mod http_store;
 mod read_zarr;
+mod shard_index_cache;
+mod source;
 
 use vgi::catalog::CatalogModel;
 
