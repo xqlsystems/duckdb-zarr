@@ -27,6 +27,16 @@ Scientific datasets are often stored in Zarr format because it handles multi-ter
 
 This project is related to [xarray-sql](https://github.com/alxmrs/xarray-sql) and [zarr-datafusion](https://github.com/alxmrs/zarr-datafusion), which provide similar functionality for other query engines.
 
+## Guides by domain
+
+- **Biology:** [AnnData annotated matrices](anndata.md), with a cell-by-gene
+  example and a section on AnnData tables in SpatialData stores;
+  [OME-Zarr bioimages](ome-zarr.md).
+- **Climate and geoscience:** [gridded-data quick start](#basic-usage) below;
+  [tested atmospheric and ocean datasets](domains.md#climate-and-geoscience).
+- **General reference:** [design and SQL interfaces](design.md) and
+  [tested scientific domains](domains.md).
+
 ## Quick Start
 
 ### Installation
@@ -59,7 +69,7 @@ above can compare `time` against a date literal. Pass `decode_times := false` if
 you want the raw on-disk offsets instead.
 
 For a small bioimage walkthrough, see [Querying OME-Zarr](ome-zarr.md).
-For single-cell data written by AnnData, see [Querying AnnData stores](anndata.md).
+For annotated matrices written by AnnData, see [Querying AnnData stores](anndata.md).
 For the domains covered by the current test suite, see
 [Tested scientific domains](domains.md).
 

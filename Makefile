@@ -48,6 +48,19 @@ test: test_debug
 test_debug: generate_fixtures test_extension_debug
 test_release: generate_fixtures test_extension_release
 
+# Run AnnData edge cases in the normal debug/release test targets (including CI).
+# Use the configured Python environment when uv is unavailable, as for fixtures.
+test_debug test_release:
+	@if command -v uv >/dev/null 2>&1; then \
+		uv run --with pytest --with 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' \
+			pytest test/test_anndata_edge_cases.py \
+			--extension build/$(patsubst test_%,%,$@)/$(EXTENSION_NAME).duckdb_extension -v; \
+	else \
+		$(PYTHON_VENV_BIN) -m pip install --quiet pytest && \
+		$(PYTHON_VENV_BIN) -m pytest test/test_anndata_edge_cases.py \
+			--extension build/$(patsubst test_%,%,$@)/$(EXTENSION_NAME).duckdb_extension -v; \
+	fi
+
 # HTTP integration tests. Build the extension first (make debug / make release).
 # pytest runs via uv, so no venv setup is needed; duckdb is pinned to the target
 # DuckDB version. Both files run together as one suite:

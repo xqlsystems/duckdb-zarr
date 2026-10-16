@@ -1,14 +1,41 @@
 # Querying AnnData stores
 
-[AnnData](https://anndata.readthedocs.io/) is the file format of the scverse
-single-cell ecosystem (scanpy, cellxgene). This page shows how to query a store
-that `AnnData.write_zarr()` wrote: cell and gene annotations (`obs`, `var`),
-the expression matrix (`X`), `layers`, embeddings (`obsm`) and pairwise
-matrices (`obsp`, `varp`).
+[AnnData](https://anndata.readthedocs.io/) is a file format of the
+[scverse](https://scverse.org/) ecosystem for annotated data matrices. Its axes
+are observations (`obs`) and variables (`var`), not necessarily cells and genes.
+This page uses a cell-by-gene example to query a store that
+`AnnData.write_zarr()` wrote: annotations (`obs`, `var`), the expression matrix
+(`X`), `layers`, embeddings (`obsm`) and pairwise matrices (`obsp`, `varp`).
 
 The examples use the small test store in this repository. Run
 `make generate_fixtures` to create it. The store has 20 cells, named `cell_0`
 to `cell_19`, and 8 genes, named `gene_0` to `gene_7`.
+
+## When to use SQL instead of loading an AnnData object
+
+Use [`anndata.read_zarr`](https://anndata.readthedocs.io/en/stable/generated/anndata.io.read_zarr.html)
+when you want an `AnnData` object for slicing, analysis, or plotting in Python.
+Use `duckdb-zarr` when the result you need is a table: counts by annotation,
+expression summaries, or joins to sample metadata in CSV, Parquet, or another
+DuckDB table. You can query the store from SQL without first constructing an
+`AnnData` object. This is a relational view of the data, not a replacement for
+AnnData's analysis APIs or a full round-trip representation of the object.
+
+- Start with `read_zarr_tables` to discover the available tables.
+- Use `read_zarr` with `table_name :=` and, for child groups, `group_path :=`
+  for a one-off query. It decodes annotations and uses observation and variable
+  names as coordinates, so you can join `obs`, `var`, and `X` by name.
+- Use `read_zarr_views` when several queries should share stable table names.
+  Run the returned SQL to create views; the views still read the Zarr store,
+  rather than copying it into DuckDB.
+- Use `array_path :=` for a single array or encoded element, including arrays
+  under `uns`, or to inspect encoding components. This lower-level route uses
+  integer positions instead of observation and variable names; prefer the
+  tables for annotation joins.
+
+Sparse tables omit unstored zeros, so SQL aggregates need care: see
+[Sparse matrices omit zeros](#sparse-matrices-omit-zeros). See [Limits](#limits)
+before substituting SQL reads for an AnnData workflow.
 
 ## How a store maps to tables
 
@@ -195,7 +222,7 @@ T cell   23.142857
 NULL      0.000000
 ```
 
-When the gene names are the gene symbols, as in most scanpy data sets, the
+When the gene names are the gene symbols, the
 inner query is not necessary: `LEFT JOIN pbmc.obs_var x ON x.obs = o.obs AND
 x.var = 'CD4'`.
 
@@ -274,6 +301,12 @@ stored entries of a sparse `X` as `obs`, `var` and `value`, and
 tables.
 
 ## SpatialData stores
+
+This section covers the AnnData tables inside SpatialData stores and a join to
+a label image. It is not a comprehensive SpatialData tutorial and does not cover
+coordinate transformations or spatial analysis APIs. The tested example uses a
+small synthetic SpatialData-like store; it does not validate every SpatialData
+element or storage version.
 
 A [SpatialData](https://spatialdata.scverse.org/) store keeps each table as an
 AnnData object at `tables/<name>`. The extension reads any group with

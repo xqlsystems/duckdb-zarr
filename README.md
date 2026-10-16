@@ -53,9 +53,15 @@ SELECT sql FROM read_zarr_views('test/fixtures/xarray_tutorial/era5_like.zarr', 
   view_names := MAP {'time_latitude_longitude': 'surface'});
 ```
 
-See [docs/design.md](docs/design.md) for the full design,
-[docs/ome-zarr.md](docs/ome-zarr.md) for a small bioimage example, and
-[docs/anndata.md](docs/anndata.md) for single-cell data written by AnnData.
+## Documentation
+
+- **Biology:** [AnnData annotated matrices](docs/anndata.md), including a
+  cell-by-gene example and SpatialData table boundaries;
+  [OME-Zarr bioimages](docs/ome-zarr.md).
+- **Climate and geoscience:** [gridded-data quick start](docs/README.md#basic-usage)
+  and [tested atmospheric and ocean datasets](docs/domains.md#climate-and-geoscience).
+- **General reference:** [documentation overview](docs/README.md),
+  [full design](docs/design.md), and [tested scientific domains](docs/domains.md).
 
 ## Remote stores
 
