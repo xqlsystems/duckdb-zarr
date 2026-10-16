@@ -48,7 +48,7 @@ test: test_debug
 test_debug: generate_fixtures test_extension_debug
 test_release: generate_fixtures test_extension_release
 
-# Run AnnData edge cases in the normal debug/release test targets (including CI).
+# Run AnnData and DataTree regressions in the normal test targets (including CI).
 # Honor the shared runner's skip flag: PyPI DuckDB cannot load every build ABI
 # (notably MinGW), and some Linux builds are tested separately inside Docker.
 # Use the configured Python environment when uv is unavailable, as for fixtures.
@@ -56,11 +56,11 @@ ifneq ($(SKIP_TESTS),1)
 test_debug test_release:
 	@if command -v uv >/dev/null 2>&1; then \
 		uv run --with pytest --with 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' \
-			pytest test/test_anndata_edge_cases.py \
+			pytest test/test_anndata_edge_cases.py test/test_datatree_compatibility.py \
 			--extension build/$(patsubst test_%,%,$@)/$(EXTENSION_NAME).duckdb_extension -v; \
 	else \
 		$(PYTHON_VENV_BIN) -m pip install --quiet pytest && \
-		$(PYTHON_VENV_BIN) -m pytest test/test_anndata_edge_cases.py \
+		$(PYTHON_VENV_BIN) -m pytest test/test_anndata_edge_cases.py test/test_datatree_compatibility.py \
 			--extension build/$(patsubst test_%,%,$@)/$(EXTENSION_NAME).duckdb_extension -v; \
 	fi
 endif

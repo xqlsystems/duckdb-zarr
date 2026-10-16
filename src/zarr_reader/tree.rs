@@ -245,19 +245,18 @@ impl StoreTree {
             let key = (var.node.clone(), dim.clone());
             let len = var.shape[0];
             self.variables.remove(&path);
-            self.coords.insert(key, (values, len));
+            let coord = (values, len);
+            // Only AnnData indexes have pairwise-axis aliases. Aliasing every
+            // coordinate in a mixed store would overwrite plain-Zarr obs_i /
+            // var_i coordinates with unrelated obs / var values.
+            for &(alias, of) in anndata::COORDINATE_ALIASES {
+                if of == key.1.as_str() {
+                    self.coords
+                        .insert((key.0.clone(), alias.to_string()), coord.clone());
+                }
+            }
+            self.coords.insert(key, coord);
         }
-        let aliased: Vec<_> = self
-            .coords
-            .iter()
-            .flat_map(|((node, dim), coord)| {
-                anndata::COORDINATE_ALIASES
-                    .iter()
-                    .filter(move |(_, of)| of == dim)
-                    .map(move |(alias, _)| ((node.clone(), alias.to_string()), coord.clone()))
-            })
-            .collect();
-        self.coords.extend(aliased);
     }
 
     /// Load `node` and its ancestors, which is everything a read of `node` needs.
