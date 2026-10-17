@@ -1,0 +1,155 @@
+# name: test/sql/spatialdata.test
+# description: AnnData objects inside a store, as SpatialData writes its tables (issue #40, design decision 9)
+# group: [zarr]
+#
+# A SpatialData store keeps each table as an AnnData object at tables/<name>.
+# Any group with `encoding-type: anndata` reads as AnnData, with its elements
+# named relative to it: tables/cells/obs folds into the node tables/cells,
+# beside its X, and tables/cells/obsm inherits its cell names. The rest of the
+# store reads as plain Zarr. Points and shapes are Parquet files, which
+# read_parquet reads; the reader skips them.
+#
+# Fixture: test/fixtures/anndata/spatialdata_like.zarr (scripts/generate_fixtures.py):
+#   labels/cells/s0       uint16 (y=3, x=4) label image: instance 1 covers 3
+#                         pixels, 2 covers 4, 3 covers 2, background 0 covers 3
+#   tables/cells          AnnData, 3 cells (c1..c3) x 2 genes (g0, g1), dense X;
+#                         obs/instance_id 1..3, obs/region categorical 'cells';
+#                         obsm/spatial (3, 2). Its attributes name the region
+#                         (labels 'cells') and the instance key (instance_id).
+#   tables/spots          AnnData, 2 cells (s1, s2) x 1 gene (g9)
+#   points/transcripts    a group with a Parquet placeholder and no arrays
+
+require zarr
+
+# ══ Catalog ══════════════════════════════════════════════════════════════════
+
+# Newer anndata releases write an index as a nullable string array, whose
+# values are at <frame>/_index/values; the trim makes both read the same.
+query TTTTT
+SELECT group_path, schema_name, table_name, dims,
+  [regexp_replace(c, '/values$', '') FOR c IN coord_vars]
+FROM read_zarr_tables('test/fixtures/anndata/spatialdata_like.zarr');
+----
+/labels/cells	labels/cells	y_x	[y, x]	[]
+/tables/cells	tables/cells	obs	[obs]	[tables/cells/obs/_index]
+/tables/cells	tables/cells	obs_var	[obs, var]	[tables/cells/obs/_index, tables/cells/var/_index]
+/tables/cells/obsm	tables/cells/obsm	obs_spatial_component	[obs, spatial_component]	[tables/cells/obs/_index]
+/tables/spots	tables/spots	obs_var	[obs, var]	[tables/spots/obs/_index, tables/spots/var/_index]
+
+# AnnData axis names apply inside the objects only.
+query TT
+SELECT name, array_path_dims
+FROM read_zarr_metadata('test/fixtures/anndata/spatialdata_like.zarr')
+WHERE name IN ('labels/cells/s0', 'tables/cells/X', 'tables/cells/obs/instance_id',
+               'tables/cells/obsm/spatial', 'tables/spots/X')
+ORDER BY name;
+----
+labels/cells/s0	[y, x]
+tables/cells/X	[obs, var]
+tables/cells/obs/instance_id	[obs]
+tables/cells/obsm/spatial	[obs, spatial_component]
+tables/spots/X	[obs, var]
+
+# ══ Tables ═══════════════════════════════════════════════════════════════════
+
+query TIT
+SELECT * FROM read_zarr('test/fixtures/anndata/spatialdata_like.zarr',
+  group_path := 'tables/cells', table_name := 'obs');
+----
+c1	1	cells
+c2	2	cells
+c3	3	cells
+
+query TTR
+SELECT obs, var, X FROM read_zarr('test/fixtures/anndata/spatialdata_like.zarr',
+  group_path := 'tables/cells', table_name := 'obs_var')
+WHERE X > 0;
+----
+c1	g0	1.0
+c2	g1	2.0
+c3	g0	3.0
+
+# obsm inherits the cell names of its AnnData object.
+query TIR
+SELECT * FROM read_zarr('test/fixtures/anndata/spatialdata_like.zarr',
+  group_path := 'tables/cells/obsm')
+WHERE spatial_component = 0;
+----
+c1	0	1.5
+c2	0	2.5
+c3	0	0.5
+
+# Each object has its own cells and genes.
+query TTR
+SELECT * FROM read_zarr('test/fixtures/anndata/spatialdata_like.zarr',
+  group_path := 'tables/spots', table_name := 'obs_var');
+----
+s1	g9	5.0
+s2	g9	6.0
+
+# An element read alone has positions on its AnnData axes.
+query IIR
+SELECT * FROM read_zarr('test/fixtures/anndata/spatialdata_like.zarr',
+  array_path := 'tables/cells/X')
+WHERE value > 0;
+----
+0	0	1.0
+1	1	2.0
+2	0	3.0
+
+# The pixel area of each annotated cell: the label image's pixel values are
+# the table's instance ids.
+query ITI
+SELECT o.instance_id, o.region, COUNT(*) AS area_px
+FROM read_zarr('test/fixtures/anndata/spatialdata_like.zarr',
+  array_path := 'labels/cells/s0') AS l
+JOIN read_zarr('test/fixtures/anndata/spatialdata_like.zarr',
+  group_path := 'tables/cells', table_name := 'obs') AS o
+  ON l.value = o.instance_id
+GROUP BY ALL
+ORDER BY area_px DESC;
+----
+2	cells	4
+1	cells	3
+3	cells	2
+
+# ══ Errors ═══════════════════════════════════════════════════════════════════
+
+statement error
+SELECT * FROM read_zarr('test/fixtures/anndata/spatialdata_like.zarr',
+  group_path := 'tables/cells/obs');
+----
+the columns of '/tables/cells/obs' are in the group '/tables/cells': read_zarr('test/fixtures/anndata/spatialdata_like.zarr', group_path := 'tables/cells', table_name := 'obs')
+
+statement error
+SELECT * FROM read_zarr('test/fixtures/anndata/spatialdata_like.zarr',
+  group_path := 'tables/cells/obs/region');
+----
+'/tables/cells/obs/region' is part of the variable 'tables/cells/obs/region'
+
+# ══ Mounting ═════════════════════════════════════════════════════════════════
+
+query TT
+SELECT schema_name, view_name
+FROM read_zarr_views('test/fixtures/anndata/spatialdata_like.zarr', 'sd')
+WHERE view_name IS NOT NULL;
+----
+labels/cells	y_x
+tables/cells	obs
+tables/cells	obs_var
+tables/cells/obsm	obs_spatial_component
+tables/spots	obs_var
+
+statement ok
+ATTACH ':memory:' AS "sd";
+
+statement ok
+CREATE SCHEMA IF NOT EXISTS "sd"."tables/cells";
+
+statement ok
+CREATE OR REPLACE VIEW "sd"."tables/cells"."obs" AS SELECT * FROM read_zarr('test/fixtures/anndata/spatialdata_like.zarr', group_path := 'tables/cells', table_name := 'obs');
+
+query I
+SELECT COUNT(*) FROM sd."tables/cells".obs WHERE region = 'cells';
+----
+3

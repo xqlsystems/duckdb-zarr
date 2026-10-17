@@ -25,6 +25,20 @@ use super::duckdb_store::DuckDbStore;
 /// # Safety
 /// Must be called from within a DuckDB table-function bind callback.
 pub unsafe fn extract_file_system(bind: &duckdb::vtab::BindInfo) -> duckdb_file_system {
+    let raw = raw_bind_info(bind);
+    let mut ctx: duckdb_client_context = std::ptr::null_mut();
+    duckdb_table_function_get_client_context(raw, &mut ctx);
+    let fs = duckdb_client_context_get_file_system(ctx);
+    duckdb_destroy_client_context(&mut ctx);
+    fs
+}
+
+/// The C API handle inside a duckdb-rs `BindInfo`, for the bind calls
+/// duckdb-rs does not wrap.
+///
+/// # Safety
+/// Must be called from within a DuckDB table-function bind callback.
+pub unsafe fn raw_bind_info(bind: &duckdb::vtab::BindInfo) -> duckdb::ffi::duckdb_bind_info {
     // SAFETY: BindInfo is `struct BindInfo { ptr: duckdb_bind_info }` — one pointer-sized field,
     // no padding, offset 0. transmute_copy reads those pointer bytes as a duckdb_bind_info.
     // The assert catches any future duckdb-rs version that adds fields to BindInfo.
@@ -32,12 +46,7 @@ pub unsafe fn extract_file_system(bind: &duckdb::vtab::BindInfo) -> duckdb_file_
         std::mem::size_of::<duckdb::vtab::BindInfo>()
             == std::mem::size_of::<duckdb::ffi::duckdb_bind_info>()
     );
-    let raw: duckdb::ffi::duckdb_bind_info = std::mem::transmute_copy(bind);
-    let mut ctx: duckdb_client_context = std::ptr::null_mut();
-    duckdb_table_function_get_client_context(raw, &mut ctx);
-    let fs = duckdb_client_context_get_file_system(ctx);
-    duckdb_destroy_client_context(&mut ctx);
-    fs
+    std::mem::transmute_copy(bind)
 }
 
 /// Open a Zarr store.

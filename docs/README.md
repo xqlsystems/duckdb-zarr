@@ -27,6 +27,16 @@ Scientific datasets are often stored in Zarr format because it handles multi-ter
 
 This project is related to [xarray-sql](https://github.com/alxmrs/xarray-sql) and [zarr-datafusion](https://github.com/alxmrs/zarr-datafusion), which provide similar functionality for other query engines.
 
+## Guides by domain
+
+- **Biology:** [AnnData annotated matrices](anndata.md), with a cell-by-gene
+  example and a section on AnnData tables in SpatialData stores;
+  [OME-Zarr bioimages](ome-zarr.md).
+- **Climate and geoscience:** [gridded-data quick start](#basic-usage) below;
+  [tested atmospheric and ocean datasets](domains.md#climate-and-geoscience).
+- **General reference:** [design and SQL interfaces](design.md) and
+  [tested scientific domains](domains.md).
+
 ## Quick Start
 
 ### Installation
@@ -59,8 +69,47 @@ above can compare `time` against a date literal. Pass `decode_times := false` if
 you want the raw on-disk offsets instead.
 
 For a small bioimage walkthrough, see [Querying OME-Zarr](ome-zarr.md).
+For annotated matrices written by AnnData, see [Querying AnnData stores](anndata.md).
 For the domains covered by the current test suite, see
 [Tested scientific domains](domains.md).
+
+### Nested groups and DataTree stores
+
+A nested store has one set of tables per Zarr group. `read_zarr(store)` reads
+only the root group; it does not combine sibling groups, even when their
+arrays have identical names, dimensions and shapes. This is a change from
+older releases, which pooled arrays across the store.
+
+Discover the tables first, then select a group and its table:
+
+```sql
+SELECT group_path, schema_name, table_name, dims, data_vars
+FROM read_zarr_tables('test/fixtures/xarray_tutorial/datatree.zarr')
+ORDER BY group_path;
+
+SELECT x, y, foo
+FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr',
+  group_path := 'simulation/fine', table_name := 'x_y')
+ORDER BY x, y;
+```
+
+Coordinates are inherited from ancestor groups, so the second query uses the
+root's `x` values. Misaligned groups have a NULL `table_name` in the catalog
+and cannot be read as a table. `dims := ['x', 'y']` is an alternative to
+`table_name := 'x_y'`; do not pass both. Catalog columns such as `dims` and
+`data_vars` are SQL lists, not JSON strings. `read_zarr_groups` remains an
+alias of `read_zarr_tables`.
+
+For arrays without dimension names, select one explicitly with `array_path :=`.
+Its unnamed axes become integer-position columns `dim_0`, `dim_1`, and so on.
+Group tables omit these arrays rather than joining unrelated data by position.
+AnnData has its own axis naming and decoded tables; see the
+[AnnData guide](anndata.md).
+
+To mount all readable tables as views, call `read_zarr_views(store, database)`
+and execute the returned SQL statements on the same connection. It returns
+SQL; it does not execute the statements itself. See the
+[Python and CLI mounting recipes](design.md#3-mounting-multi-table-stores-attach-and-read_zarr_views).
 
 ### OME-Zarr Features
 

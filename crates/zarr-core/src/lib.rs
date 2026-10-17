@@ -4,9 +4,12 @@
 //! VGI worker (`crates/vgi-zarr`) are thin adapters that turn these into
 //! DataChunks and RecordBatches respectively.
 
+pub mod anndata;
 pub mod bounds;
 pub mod cftime;
 pub mod consolidated_store;
 pub mod decode;
 pub mod meta;
+pub mod sparse;
+pub mod tree;
 pub mod types;

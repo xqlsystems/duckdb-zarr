@@ -4,7 +4,7 @@ use zarr_core::decode::{
     matches_float_sentinel, matches_int_sentinel, read_as_f64_pub, read_int_as_i64_pub,
 };
 
-use super::types::{ColumnEncoding, FillSentinel, ZarrDtype};
+use super::types::{ColumnEncoding, FillSentinel, WriteElement, ZarrDtype};
 
 /// Copy one scalar element from raw native-endian bytes into a DuckDB vector slot,
 /// applying NULL masking via the sentinel.
@@ -153,6 +153,31 @@ pub fn fill_element(
     match encoding {
         ColumnEncoding::Plain => {
             fill_scalar_element_pub(vector, bytes, dtype, sentinel, flat_row, elem_size, dst);
+        }
+        ColumnEncoding::Categorical(categories) => {
+            let code = read_int_as_i64_pub(bytes, dtype, flat_row * elem_size);
+            // A negative code is a missing value (pandas writes -1).
+            if code < 0 || code as usize >= categories.len() {
+                vector.set_null(dst);
+                return;
+            }
+            let idx = code as usize;
+            // An ENUM vector holds the member index, in the narrowest unsigned
+            // type that fits the member count (DuckDB's EnumTypeInfo::DictType).
+            if categories.enum_members().is_some() {
+                let n = categories.len();
+                unsafe {
+                    if n <= u8::MAX as usize {
+                        *vector.as_mut_ptr::<u8>().add(dst) = idx as u8;
+                    } else if n <= u16::MAX as usize {
+                        *vector.as_mut_ptr::<u16>().add(dst) = idx as u16;
+                    } else {
+                        *vector.as_mut_ptr::<u32>().add(dst) = idx as u32;
+                    }
+                }
+                return;
+            }
+            categories.values.data.write_element(vector, idx, dst);
         }
         ColumnEncoding::PackedInt {
             scale_factor,

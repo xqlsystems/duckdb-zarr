@@ -55,17 +55,17 @@ lon	coord
 temperature	data
 time	coord
 
-# ── read_zarr_groups ──────────────────────────────────────────────────────────
+# ── read_zarr_tables ──────────────────────────────────────────────────────────
 
 query I
-SELECT COUNT(*) FROM read_zarr_groups('test/fixtures/xarray_tutorial/float_baseline.zarr');
+SELECT COUNT(*) FROM read_zarr_tables('test/fixtures/xarray_tutorial/float_baseline.zarr');
 ----
 1
 
 query T
-SELECT dims FROM read_zarr_groups('test/fixtures/xarray_tutorial/float_baseline.zarr');
+SELECT dims FROM read_zarr_tables('test/fixtures/xarray_tutorial/float_baseline.zarr');
 ----
-["time","lat","lon"]
+[time, lat, lon]
 
 # ── air_temperature ───────────────────────────────────────────────────────────
 # int16 on-disk with scale_factor=0.01 → packed-int decoding → Double column.
@@ -195,21 +195,21 @@ true
 # ── rasm ──────────────────────────────────────────────────────────────────────
 # rasm has 2D non-dimension coordinate arrays xc and yc (shape 205×275).
 # They must be silently excluded from the row schema (aux_coords path).
-# The store has exactly one dim group: (time, y, x).
+# The store has exactly one table: (time, y, x).
 # Skipped: fixture requires cftime for noleap calendar; support deferred (issue #45).
 
 # ── multi_dim_group ───────────────────────────────────────────────────────────
-# Two dim groups: surface (time,lat,lon) and atmosphere (time,level,lat,lon).
+# Two tables: surface (time,lat,lon) and atmosphere (time,level,lat,lon).
 # read_zarr without selection must error.
 
 statement error
 SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/multi_dim_group.zarr') LIMIT 1;
 ----
-contains multiple dimension groups
+has 2 tables
 
-# read_zarr_groups shows two groups.
+# read_zarr_tables shows two groups.
 query I
-SELECT COUNT(*) FROM read_zarr_groups('test/fixtures/xarray_tutorial/multi_dim_group.zarr');
+SELECT COUNT(*) FROM read_zarr_tables('test/fixtures/xarray_tutorial/multi_dim_group.zarr');
 ----
 2
 
@@ -229,15 +229,17 @@ SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/multi_dim_group.za
 statement error
 SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/multi_dim_group.zarr', dims=['x','y']) LIMIT 1;
 ----
-no dimension group matches
+no table in group '/' has dims=
 
 # ── air_temperature_gradient ─────────────────────────────────────────────────
-# Mismatched chunk shapes within one dim group → bind error.
+# Tair is chunked [1, 4, 6] and dTdx, dTdy [2, 4, 6] over the same dims. One
+# table reads all three (decision 6); test/sql/ragged_chunks.test checks values.
 
-statement error
-SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/air_temperature_gradient.zarr') LIMIT 1;
+query IIII
+SELECT COUNT(*), COUNT(Tair), COUNT(dTdx), COUNT(DISTINCT time)
+FROM read_zarr('test/fixtures/xarray_tutorial/air_temperature_gradient.zarr');
 ----
-chunk shape mismatch
+96	96	96	4
 
 # ── big_endian ────────────────────────────────────────────────────────────────
 # Big-endian bytes codec: zarrs normalises to native; memcpy must be correct.

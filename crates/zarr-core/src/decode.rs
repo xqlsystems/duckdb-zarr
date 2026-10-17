@@ -71,11 +71,31 @@ pub fn element_key(
     idx: usize,
     elem_size: usize,
 ) -> Option<f64> {
-    let src = idx * elem_size;
+    let size = dtype.byte_size()?;
+    if elem_size != size {
+        return None;
+    }
+    let src = idx.checked_mul(elem_size)?;
+    bytes.get(src..src.checked_add(size)?)?;
+    if let ColumnEncoding::Categorical(categories) = encoding {
+        if !dtype.is_integer() {
+            return None;
+        }
+        let raw = read_int_as_i64_pub(bytes, dtype, src);
+        let code = if dtype.is_unsigned() {
+            usize::try_from(raw as u64).ok()?
+        } else {
+            usize::try_from(raw).ok()?
+        };
+        return (code < categories.len())
+            .then(|| categories.values.data.key_at(code))
+            .flatten();
+    }
     if *dtype == ZarrDtype::Bool {
         return Some((bytes[src] != 0) as u8 as f64);
     }
     match encoding {
+        ColumnEncoding::Categorical(_) => unreachable!("handled above"),
         ColumnEncoding::Plain | ColumnEncoding::PackedInt { .. } => {
             let numeric = if dtype.is_integer() {
                 let raw = read_int_as_i64_pub(bytes, dtype, src);
@@ -117,5 +137,104 @@ pub fn element_key(
             };
             decoded.map(|micros| micros as f64)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn categorical_keys_are_category_values_not_codes() {
+        use crate::types::{Categories, ColumnValues, CoordArray, FixedValues, StringValues};
+        use std::sync::Arc;
+        let values = CoordArray {
+            dtype: ZarrDtype::Float64,
+            encoding: ColumnEncoding::PackedInt {
+                scale_factor: 2.0,
+                add_offset: 1.0,
+            },
+            sentinel: None,
+            data: Arc::new(
+                FixedValues::new(
+                    [10f64, 20.0]
+                        .into_iter()
+                        .flat_map(f64::to_ne_bytes)
+                        .collect(),
+                    ZarrDtype::Float64,
+                    ColumnEncoding::PackedInt {
+                        scale_factor: 2.0,
+                        add_offset: 1.0,
+                    },
+                    None,
+                )
+                .unwrap(),
+            ),
+        };
+        // Even inconsistent declared category lengths must not index past values.
+        let encoding = ColumnEncoding::Categorical(Arc::new(Categories::new(values, 3, None)));
+        let codes = FixedValues::new(
+            vec![1, 0, 255, 2, 3],
+            ZarrDtype::Int8,
+            encoding.clone(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            (0..6).map(|i| codes.key_at(i)).collect::<Vec<_>>(),
+            vec![Some(41.0), Some(21.0), None, None, None, None]
+        );
+        let unsigned = FixedValues::new(
+            u64::MAX.to_ne_bytes().to_vec(),
+            ZarrDtype::UInt64,
+            encoding,
+            None,
+        )
+        .unwrap();
+        assert_eq!(unsigned.key_at(0), None);
+        let strings = CoordArray {
+            dtype: ZarrDtype::String,
+            encoding: ColumnEncoding::Plain,
+            sentinel: None,
+            data: Arc::new(StringValues {
+                strings: vec!["a".into()],
+            }),
+        };
+        let encoding = ColumnEncoding::Categorical(Arc::new(Categories::new(
+            strings,
+            1,
+            Some(vec!["a".into()]),
+        )));
+        let codes = FixedValues::new(vec![0], ZarrDtype::Int8, encoding.clone(), None).unwrap();
+        assert_eq!(codes.key_at(0), None);
+        assert_eq!(
+            element_key(&[0], &ZarrDtype::Bool, &encoding, &None, 0, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn key_lookup_rejects_out_of_range_and_malformed_buffers() {
+        for (bytes, idx, size) in [
+            (&[1u8][..], 1, 1),
+            (&[1u8][..], usize::MAX, 8),
+            (&[1u8][..], 0, 1),
+        ] {
+            assert_eq!(
+                element_key(
+                    bytes,
+                    &ZarrDtype::Int64,
+                    &ColumnEncoding::Plain,
+                    &None,
+                    idx,
+                    size
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            element_key(&[], &ZarrDtype::String, &ColumnEncoding::Plain, &None, 0, 0),
+            None
+        );
     }
 }
