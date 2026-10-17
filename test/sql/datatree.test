@@ -180,7 +180,7 @@ query TTT
 SELECT * FROM read_zarr_views('test/fixtures/xarray_tutorial/datatree.zarr', 'sim',
   view_names := MAP {'/simulation/coarse/x_y': 'coarse'});
 ----
-NULL	NULL	ATTACH IF NOT EXISTS ':memory:' AS "sim";
+NULL	NULL	ATTACH ':memory:' AS "sim";
 main	x	CREATE OR REPLACE VIEW "sim"."main"."x" AS SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', table_name := 'x');
 simulation/coarse	NULL	CREATE SCHEMA IF NOT EXISTS "sim"."simulation/coarse";
 simulation/coarse	coarse	CREATE OR REPLACE VIEW "sim"."simulation/coarse"."coarse" AS SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', group_path := 'simulation/coarse', table_name := 'x_y');
@@ -189,7 +189,7 @@ simulation/fine	x_y	CREATE OR REPLACE VIEW "sim"."simulation/fine"."x_y" AS SELE
 
 # The statements a client would run, minus the coarse group's.
 statement ok
-ATTACH IF NOT EXISTS ':memory:' AS "sim";
+ATTACH ':memory:' AS "sim";
 
 statement ok
 CREATE OR REPLACE VIEW "sim"."main"."x" AS SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', table_name := 'x');
@@ -250,7 +250,7 @@ query TTT
 SELECT * FROM read_zarr_views('test/fixtures/xarray_tutorial/case_names.zarr', 'cn',
   view_names := MAP {'Main/x': 'main_x'});
 ----
-NULL	NULL	ATTACH IF NOT EXISTS ':memory:' AS "cn";
+NULL	NULL	ATTACH ':memory:' AS "cn";
 main	x	CREATE OR REPLACE VIEW "cn"."main"."x" AS SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/case_names.zarr', table_name := 'x');
 main	Ärger	CREATE OR REPLACE VIEW "cn"."main"."Ärger" AS SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/case_names.zarr', table_name := 'Ärger');
 Main	main_x	CREATE OR REPLACE VIEW "cn"."Main"."main_x" AS SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/case_names.zarr', group_path := 'Main', table_name := 'x');

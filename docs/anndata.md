@@ -139,15 +139,17 @@ DuckDB, so the quotes are necessary.
 
 Views give each table a stable name, so queries do not repeat `read_zarr`.
 `read_zarr_views` returns the SQL statements that mount the store, one
-statement in each row. Run the statements in order. They attach an in-memory
-database, create one schema for each group, and create one view for each table.
+statement in each row. Run the statements in order and stop on the first error.
+They attach a new in-memory database, create one schema for each group, and
+create one view for each table. The database alias must not already exist;
+the first statement rejects it rather than replacing its views.
 
 ```sql
 SELECT sql FROM read_zarr_views('test/fixtures/anndata/pbmc_like.zarr', 'pbmc');
 ```
 
 ```
-ATTACH IF NOT EXISTS ':memory:' AS "pbmc";
+ATTACH ':memory:' AS "pbmc";
 CREATE OR REPLACE VIEW "pbmc"."main"."obs" AS SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', table_name := 'obs');
 CREATE OR REPLACE VIEW "pbmc"."main"."obs_var" AS SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', table_name := 'obs_var');
 CREATE OR REPLACE VIEW "pbmc"."main"."var" AS SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', table_name := 'var');
@@ -166,6 +168,7 @@ for (sql,) in con.sql("SELECT sql FROM read_zarr_views('pbmc_like.zarr', 'pbmc')
 In the DuckDB CLI, write the rows to a file, then read the file:
 
 ```
+.bail on
 .mode list
 .headers off
 .once mount.sql

@@ -84,6 +84,37 @@ def test_same_shaped_groups_remain_separate(tmp_path, extension_path, zarr_forma
             ).fetchall() == list(zip([10, 20, 30], values))
 
 
+@pytest.mark.parametrize("existing", ["memory", "file", "default", "case-folded"])
+def test_mount_rejects_existing_database_alias(tmp_path, extension_path, existing):
+    """A generated mount must not replace views in an unrelated database."""
+    store = tmp_path / "mount.zarr"
+    xr.Dataset({"signal": ("sample", [1, 2])}).to_zarr(
+        store, zarr_format=3, consolidated=False,
+    )
+    with duckdb.connect(config={"allow_unsigned_extensions": True}) as con:
+        con.load_extension(str(extension_path))
+        if existing == "default":
+            row = con.execute("SELECT current_database()").fetchone()
+            assert row is not None
+            database = row[0]
+        else:
+            database = "mount"
+            source = str(tmp_path / "existing.duckdb") if existing == "file" else ":memory:"
+            source = source.replace("'", "''")
+            con.execute(f"ATTACH '{source}' AS mount")
+        requested = database.upper() if existing == "case-folded" else database
+        con.execute(f'CREATE VIEW "{database}".main.sample AS SELECT 999 AS sentinel')
+        statements = con.execute(
+            "SELECT sql FROM read_zarr_views(?, ?)", [str(store), requested],
+        ).fetchall()
+        with pytest.raises(duckdb.Error, match="already exists"):
+            for (statement,) in statements:
+                con.execute(statement)
+        assert con.execute(
+            f'SELECT sentinel FROM "{database}".main.sample',
+        ).fetchall() == [(999,)]
+
+
 @pytest.mark.parametrize("zarr_format", [2, 3], ids=["zarr-v2", "zarr-v3"])
 @pytest.mark.parametrize("group", ["", "measurements"], ids=["root", "sibling"])
 @pytest.mark.parametrize("axis", ["obs_i", "obs_j", "var_i", "var_j"])

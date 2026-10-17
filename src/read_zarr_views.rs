@@ -2,9 +2,9 @@
 //! views, one statement per row (decision 8, Mounting).
 //!
 //! The C API cannot run DDL from inside a table function, so this function
-//! returns the statements and the caller runs them in order: an `ATTACH` of an
-//! in-memory database named `database`, a `CREATE SCHEMA` per non-root node,
-//! and a `CREATE VIEW` per table that `read_zarr_tables` gives a name.
+//! returns the statements and the caller runs them in order, stopping on error:
+//! an `ATTACH` of an in-memory database named `database`, a `CREATE SCHEMA` per
+//! non-root node, and a `CREATE VIEW` per table that `read_zarr_tables` gives a name.
 //! `view_names := MAP {...}` renames views, like xarray-sql's `table_names`.
 
 use std::collections::{BTreeMap, HashMap};
@@ -63,7 +63,7 @@ impl VTab for ReadZarrViewsVTab {
         let mut statements = vec![Statement {
             schema_name: None,
             view_name: None,
-            sql: format!("ATTACH IF NOT EXISTS ':memory:' AS {db};"),
+            sql: format!("ATTACH ':memory:' AS {db};"),
         }];
         // Views per schema, both keyed by tree::fold_case, to catch two views
         // that DuckDB would see as one. Schema names fold too: groups `Sim`

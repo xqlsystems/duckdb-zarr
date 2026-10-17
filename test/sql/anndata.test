@@ -71,7 +71,7 @@ obsp	obs_i_obs_j
 varp	var_i_var_j
 
 statement ok
-ATTACH IF NOT EXISTS ':memory:' AS "ad";
+ATTACH ':memory:' AS "ad";
 
 statement ok
 CREATE OR REPLACE VIEW "ad"."main"."X" AS SELECT * FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', table_name := 'obs_var');

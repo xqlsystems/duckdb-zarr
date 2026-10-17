@@ -141,7 +141,7 @@ tables/cells/obsm	obs_spatial_component
 tables/spots	obs_var
 
 statement ok
-ATTACH IF NOT EXISTS ':memory:' AS "sd";
+ATTACH ':memory:' AS "sd";
 
 statement ok
 CREATE SCHEMA IF NOT EXISTS "sd"."tables/cells";

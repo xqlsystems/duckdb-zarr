@@ -58,13 +58,13 @@ SELECT * FROM read_zarr_views('test/fixtures/xarray_tutorial/era5_like.zarr', 'e
   view_names := MAP {'time_latitude_longitude': 'surface',
                      'time_level_latitude_longitude': 'atmosphere'});
 ----
-NULL	NULL	ATTACH IF NOT EXISTS ':memory:' AS "era5";
+NULL	NULL	ATTACH ':memory:' AS "era5";
 main	surface	CREATE OR REPLACE VIEW "era5"."main"."surface" AS SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/era5_like.zarr', table_name := 'time_latitude_longitude');
 main	atmosphere	CREATE OR REPLACE VIEW "era5"."main"."atmosphere" AS SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/era5_like.zarr', table_name := 'time_level_latitude_longitude');
 
 # The statements above, run in order as a client would.
 statement ok
-ATTACH IF NOT EXISTS ':memory:' AS "era5";
+ATTACH ':memory:' AS "era5";
 
 statement ok
 CREATE OR REPLACE VIEW "era5"."main"."surface" AS SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/era5_like.zarr', table_name := 'time_latitude_longitude');
