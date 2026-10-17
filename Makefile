@@ -26,6 +26,22 @@ all: configure debug
 include extension-ci-tools/makefiles/c_api_extensions/base.Makefile
 include extension-ci-tools/makefiles/c_api_extensions/rust.Makefile
 
+# extension-ci-tools' wasm job installs Rust 1.86.0, but zarrs needs a newer
+# rustc. For wasm platforms only, install and select the stable toolchain with the
+# emscripten target (rustup is a no-op when it is already present).
+ifneq ($(filter wasm_%,$(DUCKDB_PLATFORM)),)
+WASM_RUST_TOOLCHAIN := stable
+$(info $(shell rustup toolchain install $(WASM_RUST_TOOLCHAIN) --profile minimal --target wasm32-unknown-emscripten 1>&2))
+export RUSTUP_TOOLCHAIN := $(WASM_RUST_TOOLCHAIN)
+# emsdk 3.1.71's emcc turns every entry in the linked wasm's target_features section
+# into a `wasm-opt --enable-*` flag, and its binaryen rejects the newer features
+# (bulk-memory-opt, call-indirect-overlong) that recent rustc/LLVM objects carry.
+# Pin the output feature set at link time (and skip wasm-ld's check that every
+# object stays inside it: the extra features are subsets of those listed) instead of bumping emsdk, which must
+# match the emscripten version duckdb-wasm itself was built with.
+export EMCC_CFLAGS := $(EMCC_CFLAGS) -Xlinker --no-check-features -Xlinker --features=bulk-memory,exception-handling,multivalue,mutable-globals,nontrapping-fptoint,reference-types,sign-ext
+endif
+
 configure: venv platform extension_version
 
 # DuckDB CI sets CC=gcc/CXX=g++ for windows_amd64_mingw but the Rust default

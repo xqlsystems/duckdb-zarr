@@ -16,7 +16,7 @@ A design for `duckdb-zarr` — a Rust DuckDB extension that lets users query Zar
 - Automatic relational joins across nested groups. Each Zarr group is a node with its own tables (decision 8), and each `read_zarr` scan reads one dimension group of one node, or one array selected by store-relative path.
 - Replacing xarray. Users who need lazy array operations should keep using xarray; we just want a SQL handle on the same data.
 - Custom codecs beyond what `zarrs` already supports.
-- WebAssembly as a distributed platform. The extension compiles for `wasm32-unknown-emscripten` and loads in duckdb-wasm (`make wasm_mvp`): every store is read through DuckDB's own FileSystem (`DuckDbStore`) because `zarrs_http` depends on `reqwest::blocking`, and `zarrs`' rayon work runs on a one-thread pool built at extension init. The wasm platforms stay in `excluded_platforms` until CI builds and tests them. Local (non-URL) store paths are not supported on wasm: array listing for local stores walks the host filesystem.
+- WebAssembly as a distributed platform. The extension compiles for `wasm32-unknown-emscripten` and loads in duckdb-wasm (`make wasm_mvp`): every store is read through DuckDB's own FileSystem (`DuckDbStore`) because `zarrs_http` depends on `reqwest::blocking`, and `zarrs`' rayon work runs on a one-thread pool built at extension init. Local (non-URL) store paths are not supported on wasm: array listing for local stores walks the host filesystem.
 
 ## Future integration boundaries (deferred)
 
