@@ -131,7 +131,11 @@ pub(crate) fn catalog_rows(
 ) -> Result<Vec<TableRow>, Box<dyn std::error::Error>> {
     let fs = unsafe { extract_file_system(bind) };
     let store = open_store(store_path, Some(fs))?;
-    let array_names = list_array_names(store_path, &store)?;
+    let array_names = match &selection {
+        // Reading one known array does not require a remote store listing.
+        Selection::Array(_) => list_array_names(store_path, &store).unwrap_or_default(),
+        Selection::Node(_) | Selection::Store => list_array_names(store_path, &store)?,
+    };
     let row = |node: &str, table_name: Option<String>, table: &Table| TableRow {
         group_path: tree::display_group(node),
         schema_name: tree::schema_name(node),
