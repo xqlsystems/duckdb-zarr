@@ -1,0 +1,1206 @@
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::sync::Arc;
+
+use base64::Engine as _;
+use zarrs::array::Array;
+use zarrs::storage::{Bytes, ReadableStorageTraits, StoreKey};
+
+use super::anndata;
+use super::consolidated_store::ConsolidatedCacheStore;
+use super::tree;
+use super::types::{
+    Categories, ColumnDef, ColumnEncoding, CoordArray, FillSentinel, FixedValues,
+    SharedColumnValues, Storage, StringValues, Table, Variable, WorkUnit, ZarrDtype,
+};
+
+pub type ZarrStore = Arc<dyn ReadableStorageTraits>;
+pub type ZarrArray = Array<dyn ReadableStorageTraits>;
+
+pub fn is_remote_scheme(path: &str) -> bool {
+    let l = path.to_ascii_lowercase();
+    l.starts_with("http://")
+        || l.starts_with("https://")
+        || l.starts_with("s3://")
+        || l.starts_with("gs://")
+        || l.starts_with("az://")
+}
+
+/// Wrap a remote store with an in-memory cache of its consolidated metadata,
+/// if any, so that the many per-array metadata opens in [`tree::StoreTree::load`]
+/// and engine-adapter binding are served from memory instead of one
+/// HTTP round trip each. A no-op for local stores (`is_remote_scheme` guards
+/// that). For remote stores, finding out costs:
+/// - **one** extra GET when `zarr.json` itself carries v3 consolidated
+///   metadata (the common case for v3 stores);
+/// - **two** when it doesn't — a `zarr.json` probe that 404s on a v2-only
+///   store, followed by `.zmetadata` — including when the store has no
+///   consolidated metadata at all, in which case both probes 404 and this
+///   is a no-op too.
+pub fn with_consolidated_cache(store_path: &str, store: ZarrStore) -> ZarrStore {
+    if !is_remote_scheme(store_path) {
+        return store;
+    }
+    match build_consolidated_cache(&store) {
+        Ok(Some(cache)) => Arc::new(ConsolidatedCacheStore::new(store, cache)),
+        // No consolidated metadata found — normal for a store that predates
+        // it, or was never written with `consolidated=True`. Not an error.
+        Ok(None) => store,
+        // Something went wrong reading it — malformed JSON, a missing
+        // `metadata` object, but also a transient network/auth failure on
+        // the zarr.json/.zmetadata probe itself (both surface through the
+        // same `?`, and there's no cheap way to tell them apart here). Don't
+        // claim to know which; just say what happened and what we're doing
+        // about it. Printed to stderr, so it's visible when running the
+        // DuckDB CLI directly — clients that don't inherit the process's
+        // stderr (Python, JDBC, GUI shells) won't see it, only the slower
+        // per-array fallback.
+        Err(err) => {
+            eprintln!(
+                "duckdb_zarr: could not read consolidated metadata for '{store_path}' ({err}); \
+                 falling back to per-array metadata reads"
+            );
+            store
+        }
+    }
+}
+
+fn build_consolidated_cache(
+    store: &ZarrStore,
+) -> Result<Option<HashMap<StoreKey, Bytes>>, Box<dyn std::error::Error>> {
+    // Zarr v3: consolidated metadata is embedded in the root `zarr.json`, as a
+    // map of node path -> that node's full metadata document.
+    if let Some(bytes) = store.get(&StoreKey::new("zarr.json")?)? {
+        let doc: serde_json::Value = serde_json::from_slice(&bytes)?;
+        if let Some(metadata) = doc
+            .get("consolidated_metadata")
+            .and_then(|c| c.get("metadata"))
+            .and_then(serde_json::Value::as_object)
+        {
+            let mut cache = HashMap::new();
+            // Insert the full root document (the only entry carrying the
+            // `consolidated_metadata` block itself) first. Some writers may
+            // additionally list the root group under its own path ("" or
+            // "/") in `metadata` — if so, skip it below rather than
+            // overwrite this entry with that sub-document, which lacks
+            // `consolidated_metadata` and would break any later
+            // `Group::open(store, "/")` that reads it back from the cache.
+            cache.insert(StoreKey::new("zarr.json")?, bytes.clone());
+            for (name, node_meta) in metadata {
+                let name = name.trim_start_matches('/');
+                if name.is_empty() {
+                    continue;
+                }
+                cache.insert(
+                    StoreKey::new(format!("{name}/zarr.json"))?,
+                    Bytes::from(serde_json::to_vec(node_meta)?),
+                );
+            }
+            return Ok(Some(cache));
+        }
+    }
+
+    // Zarr v2: consolidated metadata lives in a separate `.zmetadata` object —
+    // a flat map from `<path>/.zarray` / `<path>/.zattrs` / `.zgroup` keys to
+    // their file contents.
+    if let Some(bytes) = store.get(&StoreKey::new(".zmetadata")?)? {
+        let doc: serde_json::Value = serde_json::from_slice(&bytes)?;
+        if let Some(metadata) = doc.get("metadata").and_then(serde_json::Value::as_object) {
+            let mut cache = HashMap::new();
+            cache.insert(StoreKey::new(".zmetadata")?, bytes.clone());
+            for (key, value) in metadata {
+                cache.insert(
+                    StoreKey::new(key.as_str())?,
+                    Bytes::from(serde_json::to_vec(value)?),
+                );
+            }
+            return Ok(Some(cache));
+        }
+    }
+
+    Ok(None)
+}
+
+/// List the store-relative paths of all arrays in the Zarr hierarchy.
+///
+/// - Local paths: recursively scans directories containing `zarr.json` (v3) or `.zarray` (v2).
+/// - Remote paths (HTTP/HTTPS/S3/GCS/Azure): enumerates arrays from consolidated metadata,
+///   since object stores cannot list directories — a v3 `consolidated_metadata` block in
+///   `zarr.json`, or a v2 `.zmetadata` object.
+pub fn list_array_names(
+    store_path: &str,
+    store: &ZarrStore,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    if is_remote_scheme(store_path) {
+        list_array_names_remote(store)
+    } else {
+        list_array_names_local(store_path)
+    }
+}
+
+fn list_array_names_local(store_path: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let root = Path::new(store_path);
+    let mut names = Vec::new();
+    collect_array_names_local(root, root, &mut names)?;
+    names.sort();
+    Ok(names)
+}
+
+fn collect_array_names_local(
+    root: &Path,
+    directory: &Path,
+    names: &mut Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let child_path = entry.path();
+
+        // Zarr v3: arrays are terminal; groups are traversed recursively.
+        if child_path.join("zarr.json").exists() {
+            let content = std::fs::read_to_string(child_path.join("zarr.json"))?;
+            let meta: serde_json::Value = serde_json::from_str(&content)?;
+            if meta.get("node_type").and_then(|v| v.as_str()) == Some("group") {
+                collect_array_names_local(root, &child_path, names)?;
+                continue;
+            }
+            names.push(relative_array_path(root, &child_path)?);
+            continue;
+        }
+
+        // Zarr v2: .zarray present.
+        if child_path.join(".zarray").exists() {
+            names.push(relative_array_path(root, &child_path)?);
+            continue;
+        }
+
+        // A v2 group has .zgroup; intermediate containers may have no metadata.
+        collect_array_names_local(root, &child_path, names)?;
+    }
+    Ok(())
+}
+
+fn relative_array_path(
+    root: &Path,
+    array_path: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(array_path
+        .strip_prefix(root)?
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/"))
+}
+
+fn list_array_names_remote(store: &ZarrStore) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    use zarrs::group::Group;
+    use zarrs::metadata::NodeMetadata;
+
+    // Zarr v3: consolidated metadata is embedded in the root `zarr.json`.
+    let group = Group::open(store.clone(), "/")?;
+    if let Some(consolidated) = group.consolidated_metadata() {
+        let mut names: Vec<String> = consolidated
+            .metadata
+            .iter()
+            .filter_map(|(path, meta)| {
+                let name = path.trim_start_matches('/');
+                if matches!(meta, NodeMetadata::Array(_)) {
+                    Some(name.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        names.sort();
+        return Ok(names);
+    }
+
+    // Zarr v2: consolidated metadata lives in a separate `.zmetadata` object.
+    // HTTP/object stores cannot list directories, so `.zmetadata` is the only
+    // way to enumerate a v2 store's arrays remotely.
+    if let Some(names) = list_array_names_zmetadata(store)? {
+        return Ok(names);
+    }
+
+    Err(
+        "remote Zarr store has no consolidated metadata: found neither a v3 \
+         `consolidated_metadata` block in `zarr.json` nor a v2 `.zmetadata` object. \
+         Re-write the store with consolidated metadata \
+         (xarray: `ds.to_zarr(store, consolidated=True)`)."
+            .into(),
+    )
+}
+
+/// Enumerate array names from a Zarr v2 consolidated-metadata (`.zmetadata`) object.
+///
+/// Returns `Ok(None)` when the store has no `.zmetadata`, so the caller can emit a
+/// single clear error. Arrays are the entries whose key ends in `/.zarray`.
+fn list_array_names_zmetadata(
+    store: &ZarrStore,
+) -> Result<Option<Vec<String>>, Box<dyn std::error::Error>> {
+    let Some(bytes) = store.get(&StoreKey::new(".zmetadata")?)? else {
+        return Ok(None);
+    };
+    let doc: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let metadata = doc
+        .get("metadata")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("`.zmetadata` is missing its `metadata` object")?;
+    let mut names: Vec<String> = metadata
+        .keys()
+        .filter_map(|key| key.strip_suffix("/.zarray").map(str::to_string))
+        .collect();
+    names.sort();
+    Ok(Some(names))
+}
+
+/// Open one array by name from the store.
+pub fn open_array(store: &ZarrStore, name: &str) -> Result<ZarrArray, Box<dyn std::error::Error>> {
+    let path = format!("/{name}");
+    Ok(Array::open(store.clone(), &path)?)
+}
+
+/// Whether an [`open_array`] error means zarrs does not support the array's data
+/// type, codecs, storage transformers or extension fields.
+///
+/// `read_zarr_metadata` lists such arrays as `unsupported` and keeps going. Every
+/// other error (I/O, auth, missing metadata, an invalid fill value) returns `false`
+/// so that the caller fails.
+pub fn is_unsupported_array_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    use zarrs::array::ArrayCreateError as E;
+    matches!(
+        err.downcast_ref::<E>(),
+        Some(
+            E::DataTypeCreateError(_)
+                | E::CodecsCreateError(_)
+                | E::StorageTransformersCreateError(_)
+                | E::AdditionalFieldUnsupportedError(_)
+        )
+    )
+}
+
+/// Resolve and validate a user-provided store-relative array path.
+pub fn select_array_name(
+    array_names: &[String],
+    requested: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let normalized = requested.trim().trim_matches('/');
+    array_names
+        .iter()
+        .find(|name| name.as_str() == normalized)
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "array '{requested}' not found; available arrays: {:?}",
+                array_names
+            )
+            .into()
+        })
+}
+
+/// What `array_path := requested` reads, as its path and its one-variable
+/// table: one array, or an AnnData encoded variable (a group of arrays read as
+/// one variable, see [`anndata::variable_table`]). With no listing (a remote
+/// store without consolidated metadata) the path is taken as an array.
+pub fn array_path_table(
+    store: &ZarrStore,
+    array_names: &[String],
+    requested: &str,
+) -> Result<(String, Table), Box<dyn std::error::Error>> {
+    let layout = if array_names.is_empty() {
+        None
+    } else {
+        anndata::layout(store, array_names)
+    };
+    if let Some(layout) = &layout {
+        if !array_names.iter().any(|n| n == requested) {
+            if let Some(table) = anndata::variable_table(store, layout, requested)? {
+                return Ok((requested.to_string(), table));
+            }
+        }
+    }
+    let name = if array_names.is_empty() {
+        requested.to_string()
+    } else {
+        select_array_name(array_names, requested)?
+    };
+    let mut table = array_table(store, array_names, &name)?;
+    // In an AnnData store an obs or var column belongs to the root, where its
+    // data frame folds (decision 9), not to the group that stores it.
+    if let Some(layout) = &layout {
+        for var in &mut table.variables {
+            var.node = layout.node_of(&var.path);
+            var.in_dataframe = layout.is_frame_column(&var.path);
+        }
+    }
+    Ok((name, table))
+}
+
+/// The shape and declared dimension names of an array, read from its metadata
+/// document without opening it. For an array zarrs cannot open (unknown codec
+/// or data type), so that it can still be placed in its table. `None` when the
+/// document cannot be read or has no shape.
+pub fn raw_array_layout(store: &ZarrStore, name: &str) -> Option<(Vec<u64>, Option<Vec<String>>)> {
+    let get = |key: String| -> Option<serde_json::Value> {
+        let bytes = store.get(&StoreKey::new(key).ok()?).ok()??;
+        serde_json::from_slice(&bytes).ok()
+    };
+    let shape = |doc: &serde_json::Value| -> Option<Vec<u64>> {
+        doc.get("shape")?
+            .as_array()?
+            .iter()
+            .map(|v| v.as_u64())
+            .collect()
+    };
+    let names = |v: Option<&serde_json::Value>| -> Option<Vec<String>> {
+        v?.as_array()?
+            .iter()
+            .map(|d| d.as_str().map(str::to_string))
+            .collect()
+    };
+    if let Some(doc) = get(format!("{name}/zarr.json")) {
+        let dims = names(doc.get("dimension_names"))
+            .or_else(|| names(doc.get("attributes")?.get("_ARRAY_DIMENSIONS")));
+        return Some((shape(&doc)?, dims));
+    }
+    let doc = get(format!("{name}/.zarray"))?;
+    let attrs = get(format!("{name}/.zattrs"));
+    let dims = names(attrs.as_ref().and_then(|a| a.get("_ARRAY_DIMENSIONS")));
+    Some((shape(&doc)?, dims))
+}
+
+/// The element shape of an array's first chunk (empty for a 0-d array). With a
+/// regular chunk grid this is the chunk shape of every chunk.
+pub fn first_chunk_shape(arr: &ZarrArray) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
+    let ndim = arr.shape().len();
+    if ndim == 0 {
+        return Ok(Vec::new());
+    }
+    Ok(arr
+        .chunk_shape(&vec![0u64; ndim])?
+        .iter()
+        .map(|x| x.get())
+        .collect())
+}
+
+/// The table of one array, for `read_zarr(..., array_path='path')`.
+///
+/// Dimension names come from [`array_path_dims`]. For each declared name, the
+/// coordinate array is looked up in the selected array's parent group first, then
+/// at the store root. A dimension without a coordinate array reads as an integer
+/// index; that is the usual case for OME-Zarr, and always the case for a
+/// synthesized `dim_N`.
+pub fn array_table(
+    store: &ZarrStore,
+    array_names: &[String],
+    array_name: &str,
+) -> Result<Table, Box<dyn std::error::Error>> {
+    let arr = open_array(store, array_name)?;
+    let shape = arr.shape().to_vec();
+    let declared = declared_dims(store, &arr, array_name)
+        .or_else(|| anndata::axis_names_for_array(store, array_name, shape.len()));
+    let chunk_shape = first_chunk_shape(&arr)?;
+    // A synthesized `dim_N` is a placeholder, not a name any coordinate array was
+    // written under, so only look up coordinates for declared names.
+    let (dims, coords) = match declared {
+        Some(dims) => {
+            let coords = dims
+                .iter()
+                .filter_map(|dim| {
+                    find_coord_array_path(store, array_names, array_name, dim)
+                        .map(|path| (dim.clone(), path))
+                })
+                .collect();
+            (dims, coords)
+        }
+        None => (synthesize_dim_names(shape.len()), Vec::new()),
+    };
+
+    Ok(Table {
+        dims: dims.clone(),
+        shape: shape.clone(),
+        chunk_shape: chunk_shape.clone(),
+        coords,
+        variables: vec![Variable {
+            path: array_name.to_string(),
+            node: tree::node_of(array_name).to_string(),
+            dims: Some(dims),
+            shape,
+            chunk_shape,
+            attrs: arr.attributes().clone(),
+            storage: Storage::Array,
+            in_dataframe: false,
+        }],
+    })
+}
+
+/// The dimension names that `read_zarr(store, array_path := name)` binds.
+///
+/// These are the declared names (see [`declared_dims`]), else the AnnData axis
+/// names for an AnnData element (`obs`, `var`, ...; see
+/// [`anndata::axis_names`]), else `dim_0..dim_{ndim-1}`. `read_zarr_metadata`
+/// shows this list in its `array_path_dims` column.
+/// `layout` is the store's AnnData layout ([`anndata::layout`], `None` for other
+/// stores). The caller reads it once, so listing many arrays does not read the
+/// root and each ancestor group again for every array.
+pub fn array_path_dims(
+    store: &ZarrStore,
+    layout: Option<&anndata::Layout>,
+    arr: &ZarrArray,
+    name: &str,
+) -> Vec<String> {
+    let ndim = arr.shape().len();
+    declared_dims(store, arr, name)
+        .or_else(|| {
+            let layout = layout?;
+            anndata::axis_names(name, ndim, |g| layout.encoding_of(g))
+        })
+        .unwrap_or_else(|| synthesize_dim_names(ndim))
+}
+
+/// Dimension names that the store itself records for an array: the array's
+/// `dimension_names` / `_ARRAY_DIMENSIONS`, or else the parent OME-Zarr group's
+/// `multiscales.axes` when their count matches the array's rank. `None` when the
+/// store records no names at all, as in AnnData stores.
+pub fn declared_dims(store: &ZarrStore, arr: &ZarrArray, name: &str) -> Option<Vec<String>> {
+    let ndim = arr.shape().len();
+    dimension_names(arr, name)
+        .ok()
+        .or_else(|| ome_axis_names(store, name).filter(|axes| axes.len() == ndim))
+}
+
+/// OME-Zarr fallback for dimension names.
+///
+/// Real OME-Zarr images record axis names in the parent group's
+/// `multiscales.axes` rather than in per-array `dimension_names` /
+/// `_ARRAY_DIMENSIONS`. This resolves them by matching the array to its
+/// `multiscales.datasets[].path` entry, recovering `c`/`z`/`y`/`x` for
+/// `array_path` reads of stores like those in the IDR.
+fn ome_axis_names(store: &ZarrStore, array_name: &str) -> Option<Vec<String>> {
+    use zarrs::group::Group;
+
+    let (group_path, dataset) = match array_name.rsplit_once('/') {
+        Some((group, ds)) => (format!("/{group}"), ds),
+        None => ("/".to_string(), array_name),
+    };
+    let group = Group::open(store.clone(), &group_path).ok()?;
+    let multiscales = group.attributes().get("multiscales")?.as_array()?;
+    for ms in multiscales {
+        let matches_dataset = ms
+            .get("datasets")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|datasets| {
+                datasets
+                    .iter()
+                    .any(|d| d.get("path").and_then(serde_json::Value::as_str) == Some(dataset))
+            });
+        if !matches_dataset {
+            continue;
+        }
+        let Some(axes) = ms.get("axes").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        let names: Vec<String> = axes
+            .iter()
+            .filter_map(|axis| {
+                axis.get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from)
+            })
+            .collect();
+        if !names.is_empty() {
+            return Some(names);
+        }
+    }
+    None
+}
+
+/// The coordinate array for `dim` of the array `data_var_name`: a 1-D array
+/// called `dim` along `dim`, in the array's own group or, failing that, the
+/// nearest ancestor group that has one (as `DataTree` inherits coordinates).
+fn find_coord_array_path(
+    store: &ZarrStore,
+    array_names: &[String],
+    data_var_name: &str,
+    dim: &str,
+) -> Option<String> {
+    tree::self_and_ancestors(tree::node_of(data_var_name))
+        .into_iter()
+        .map(|node| tree::join(&node, dim))
+        .find(|candidate| {
+            array_names.iter().any(|name| name == candidate)
+                && open_array(store, candidate).is_ok_and(|arr| {
+                    arr.shape().len() == 1
+                        && dimension_names(&arr, candidate).is_ok_and(|dims| dims == [dim])
+                })
+        })
+}
+
+/// Dimension names from the array's own metadata: the Zarr v3 `dimension_names`
+/// field, else the xarray `_ARRAY_DIMENSIONS` attribute. A `null` entry in either
+/// list becomes `dim_<i>`. Errors when the array has neither.
+pub fn dimension_names(
+    array: &ZarrArray,
+    name: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    // Zarr v3: dimension_names is a first-class field in zarr.json.
+    if let Some(dim_names) = array.dimension_names() {
+        return Ok(dim_names
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                d.as_deref()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| fallback_dim_name(i))
+            })
+            .collect());
+    }
+    // Zarr v2 / OME-Zarr fallback: _ARRAY_DIMENSIONS in attrs.
+    let attrs = array.attributes();
+    if let Some(serde_json::Value::Array(arr)) = attrs.get("_ARRAY_DIMENSIONS") {
+        return Ok(arr
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                v.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| fallback_dim_name(i))
+            })
+            .collect());
+    }
+    Err(format!(
+        "array '{name}' has no dimension_names or _ARRAY_DIMENSIONS; read it on its own \
+         with array_path='{name}', which names its dimensions dim_0, dim_1, ..."
+    )
+    .into())
+}
+
+/// Placeholder name for dimension `i` of an array whose metadata leaves it unnamed.
+fn fallback_dim_name(i: usize) -> String {
+    format!("dim_{i}")
+}
+
+/// `dim_0..dim_{ndim-1}`, for an array that declares no dimension names.
+///
+/// Used only when one array is selected with `array_path=`. AnnData and plain
+/// zarr-python stores never write dimension names (issue #40). Whole-store
+/// enumeration ([`tree::StoreTree`]) must not use this: two unrelated arrays of the
+/// same length would both get `dim_0` and be joined row by row as if they shared an
+/// axis.
+pub fn synthesize_dim_names(ndim: usize) -> Vec<String> {
+    (0..ndim).map(fallback_dim_name).collect()
+}
+
+/// Parse `ZarrDtype` from the zarrs DataType.
+/// `DataType::to_string()` may emit "v3_name / v2_name"; we use the v3 name (first token).
+pub fn parse_dtype(array: &ZarrArray, name: &str) -> Result<ZarrDtype, Box<dyn std::error::Error>> {
+    let full = array.data_type().to_string();
+    let type_str = full.split(" / ").next().unwrap_or(&full);
+    ZarrDtype::from_str(type_str)
+        .ok_or_else(|| format!("unsupported dtype '{full}' for array '{name}'").into())
+}
+
+/// Parse `ColumnEncoding` and `FillSentinel` from CF attrs.
+///
+/// Packed-int rule: integer on-disk dtype AND (scale_factor OR add_offset in attrs).
+/// CF-time rule: `units` parses as `"<step> since <reference>"` on a decodable
+/// calendar, and the column is not already claimed by packed-int decoding.
+/// `decode_times = false` (the `decode_times=` named parameter) suppresses the
+/// latter and leaves the raw offsets visible, mirroring `xarray.open_zarr`.
+///
+/// Packed-int deliberately takes priority: CF §8.1 permits packing *any* numeric
+/// variable, including a time axis, but no store seen in practice packs time —
+/// it is already a compact int64/float64 — so a column with both `scale_factor`
+/// and CF-time `units` is decoded as the scaled physical quantity, not double
+/// -decoded into a scaled-then-CF-timestamped value. Combining the two would need
+/// its own `ColumnEncoding` variant for a case that has not shown up.
+pub fn parse_encoding_and_sentinel(
+    dtype: &ZarrDtype,
+    attrs: &serde_json::Map<String, serde_json::Value>,
+    decode_times: bool,
+) -> (ColumnEncoding, Option<FillSentinel>) {
+    let scale = attrs
+        .get("scale_factor")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1.0);
+    let offset = attrs
+        .get("add_offset")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+
+    let has_packing = attrs.contains_key("scale_factor") || attrs.contains_key("add_offset");
+    let encoding = if dtype.is_integer() && has_packing {
+        ColumnEncoding::PackedInt {
+            scale_factor: scale,
+            add_offset: offset,
+        }
+    } else {
+        // Bool and String are excluded: neither can hold a numeric time offset, and a
+        // string column must stay on the string decode path.
+        match (decode_times && !matches!(dtype, ZarrDtype::Bool | ZarrDtype::String))
+            .then(|| super::cftime::parse(attrs))
+            .flatten()
+        {
+            Some(cf) => ColumnEncoding::CfTime(cf),
+            None => ColumnEncoding::Plain,
+        }
+    };
+
+    let sentinel = parse_sentinel(dtype, attrs);
+    (encoding, sentinel)
+}
+
+fn parse_sentinel(
+    dtype: &ZarrDtype,
+    attrs: &serde_json::Map<String, serde_json::Value>,
+) -> Option<FillSentinel> {
+    let fill = attrs
+        .get("_FillValue")
+        .and_then(|v| parse_fill_value(dtype, v));
+    let missing = attrs
+        .get("missing_value")
+        .and_then(|v| parse_fill_value(dtype, v));
+    // xarray encodes _FillValue=NaN when it has already replaced fill values with NaN
+    // in memory. For stores that use missing_value as the actual on-disk sentinel,
+    // NaN in _FillValue is not the sentinel we need to mask; prefer missing_value.
+    match fill {
+        Some(FillSentinel::Float(v)) if v.is_nan() => missing.or(fill),
+        Some(s) => Some(s),
+        None => missing,
+    }
+}
+
+fn parse_fill_value(dtype: &ZarrDtype, v: &serde_json::Value) -> Option<FillSentinel> {
+    match v {
+        // xarray FillValueCoder encodes float _FillValue as base64 LE float64.
+        serde_json::Value::String(s) => {
+            let bytes = base64::engine::general_purpose::STANDARD.decode(s).ok()?;
+            if bytes.len() == 8 {
+                let arr: [u8; 8] = bytes.try_into().ok()?;
+                Some(FillSentinel::Float(f64::from_le_bytes(arr)))
+            } else {
+                None
+            }
+        }
+        serde_json::Value::Number(n) => {
+            if dtype.is_unsigned() {
+                n.as_u64().map(FillSentinel::UInt)
+            } else if dtype.is_integer() {
+                n.as_i64().map(FillSentinel::Int)
+            } else {
+                n.as_f64().map(FillSentinel::Float)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Fall back to the zarr.json `fill_value` field when no CF sentinel attr is present.
+/// Returns None for the all-zero default fill_value so we don't mask legitimate zeros.
+fn parse_zarr_fill_sentinel(array: &ZarrArray, dtype: &ZarrDtype) -> Option<FillSentinel> {
+    let bytes = array.fill_value().as_ne_bytes();
+    if bytes.iter().all(|&b| b == 0) {
+        return None;
+    }
+    match dtype {
+        ZarrDtype::Bool => None,
+        ZarrDtype::Int8 => Some(FillSentinel::Int(bytes[0] as i8 as i64)),
+        ZarrDtype::Int16 => {
+            let arr: [u8; 2] = bytes.try_into().ok()?;
+            Some(FillSentinel::Int(i16::from_ne_bytes(arr) as i64))
+        }
+        ZarrDtype::Int32 => {
+            let arr: [u8; 4] = bytes.try_into().ok()?;
+            Some(FillSentinel::Int(i32::from_ne_bytes(arr) as i64))
+        }
+        ZarrDtype::Int64 => {
+            let arr: [u8; 8] = bytes.try_into().ok()?;
+            Some(FillSentinel::Int(i64::from_ne_bytes(arr)))
+        }
+        ZarrDtype::UInt8 => Some(FillSentinel::UInt(bytes[0] as u64)),
+        ZarrDtype::UInt16 => {
+            let arr: [u8; 2] = bytes.try_into().ok()?;
+            Some(FillSentinel::UInt(u16::from_ne_bytes(arr) as u64))
+        }
+        ZarrDtype::UInt32 => {
+            let arr: [u8; 4] = bytes.try_into().ok()?;
+            Some(FillSentinel::UInt(u32::from_ne_bytes(arr) as u64))
+        }
+        ZarrDtype::UInt64 => {
+            let arr: [u8; 8] = bytes.try_into().ok()?;
+            Some(FillSentinel::UInt(u64::from_ne_bytes(arr)))
+        }
+        ZarrDtype::Float32 => {
+            let arr: [u8; 4] = bytes.try_into().ok()?;
+            Some(FillSentinel::Float(f32::from_ne_bytes(arr) as f64))
+        }
+        ZarrDtype::Float64 => {
+            let arr: [u8; 8] = bytes.try_into().ok()?;
+            Some(FillSentinel::Float(f64::from_ne_bytes(arr)))
+        }
+        // Unlike a numeric fill_value, a non-empty string fill_value (e.g. "N/A")
+        // is plausible real data, so we can't safely treat it as a NULL sentinel here.
+        ZarrDtype::String => None,
+    }
+}
+
+/// One array's path, attributes and shape, as [`cf_auxiliary_vars`] reads them.
+pub type ArrayFacts<'a> = (
+    &'a str,
+    &'a serde_json::Map<String, serde_json::Value>,
+    &'a [u64],
+);
+
+/// The CF variables among `arrays` that describe other variables instead of
+/// holding data: auxiliary coordinates named in a `coordinates` attribute (CF
+/// §5), and bounds variables named in a `bounds` attribute or, failing that,
+/// named `*_bnds` / `*_bounds` with shape (N, 2) (CF §7.1). Names in those
+/// attributes are relative to the array's group. Returns `(aux, bounds)` as
+/// store-relative paths. `read_zarr` leaves both out of its tables, and
+/// `read_zarr_metadata` gives them their own `role`.
+pub fn cf_auxiliary_vars(arrays: &[ArrayFacts]) -> (HashSet<String>, HashSet<String>) {
+    let mut aux = HashSet::new();
+    let mut bounds = HashSet::new();
+    for (name, attrs, _) in arrays {
+        let node = tree::node_of(name);
+        if let Some(serde_json::Value::String(coords)) = attrs.get("coordinates") {
+            for token in coords.split_whitespace() {
+                aux.insert(tree::join(node, token));
+            }
+        }
+        if let Some(serde_json::Value::String(b)) = attrs.get("bounds") {
+            bounds.insert(tree::join(node, b));
+        }
+    }
+    for (name, _, shape) in arrays {
+        let is_pattern = name.ends_with("_bnds") || name.ends_with("_bounds");
+        if is_pattern && shape.len() == 2 && shape[1] == 2 && !aux.contains(*name) {
+            bounds.insert(name.to_string());
+        }
+    }
+    (aux, bounds)
+}
+
+/// Pre-load a coordinate array's raw bytes at bind time.
+pub fn load_coord_array(
+    store: &ZarrStore,
+    coord_name: &str,
+    decode_times: bool,
+) -> Result<CoordArray, Box<dyn std::error::Error>> {
+    let arr = open_array(store, coord_name)?;
+    let dtype = parse_dtype(&arr, coord_name)?;
+    let attrs = arr.attributes().clone();
+    let (encoding, sentinel) = parse_encoding_and_sentinel(&dtype, &attrs, decode_times);
+    let sentinel = sentinel.or_else(|| parse_zarr_fill_sentinel(&arr, &dtype));
+    let shape = arr.shape().to_vec();
+    let n = shape[0] as usize;
+    let subset = arr.subset_all();
+
+    let data: SharedColumnValues = if dtype == ZarrDtype::String {
+        let strings = arr.retrieve_array_subset::<Vec<String>>(&subset)?;
+        debug_assert_eq!(
+            strings.len(),
+            n,
+            "coord element count mismatch for '{coord_name}'"
+        );
+        Arc::new(StringValues { strings })
+    } else {
+        // ArrayBytes<'static> is the zarrs convention for requesting owned (non-borrowed)
+        // decoded bytes; zarrs allocates a fresh Vec<u8> satisfying the 'static bound.
+        let array_bytes =
+            arr.retrieve_array_subset::<zarrs::array::ArrayBytes<'static>>(&subset)?;
+        let raw = array_bytes
+            .into_fixed()
+            .map_err(|_| "coord array has variable-length dtype")?;
+        let bytes: Vec<u8> = raw.into_owned();
+        debug_assert_eq!(
+            bytes.len(),
+            n * dtype
+                .byte_size()
+                .expect("Fixed column values imply a fixed-width dtype"),
+            "coord byte count mismatch for '{coord_name}'"
+        );
+        Arc::new(
+            FixedValues::new(bytes, dtype.clone(), encoding.clone(), sentinel.clone())
+                .ok_or_else(|| format!("coord '{coord_name}' has no fixed-width dtype"))?,
+        )
+    };
+
+    Ok(CoordArray {
+        dtype,
+        encoding,
+        sentinel,
+        data,
+    })
+}
+
+/// Build the list of `WorkUnit`s for one table: one per cell of its plan grid.
+pub fn build_work_units(table: &Table) -> Vec<WorkUnit> {
+    // Number of chunks per dimension.
+    let n_chunks_per_dim: Vec<u64> = table
+        .dims
+        .iter()
+        .enumerate()
+        .map(|(i, _)| table.shape[i].div_ceil(table.chunk_shape[i]))
+        .collect();
+
+    // Total number of chunks.
+    let total: u64 = n_chunks_per_dim.iter().product();
+
+    // Generate all chunk index tuples in C (row-major) order.
+    let ndim = n_chunks_per_dim.len();
+    let mut strides = vec![1u64; ndim];
+    for k in (0..ndim.saturating_sub(1)).rev() {
+        strides[k] = strides[k + 1] * n_chunks_per_dim[k + 1];
+    }
+
+    (0..total)
+        .map(|i| {
+            let chunk_indices = (0..ndim)
+                .map(|k| (i / strides[k]) % n_chunks_per_dim[k])
+                .collect();
+            WorkUnit { chunk_indices }
+        })
+        .collect()
+}
+
+/// Build work units for the cartesian product of the given per-dimension chunk
+/// indices, in C (row-major) order. An empty list for any dimension yields no units.
+pub fn build_work_units_in(chunks_per_dim: &[Vec<u64>]) -> Vec<WorkUnit> {
+    let ndim = chunks_per_dim.len();
+    let total: usize = chunks_per_dim.iter().map(Vec::len).product();
+    let mut strides = vec![1usize; ndim];
+    for k in (0..ndim.saturating_sub(1)).rev() {
+        strides[k] = strides[k + 1] * chunks_per_dim[k + 1].len();
+    }
+    (0..total)
+        .map(|i| WorkUnit {
+            chunk_indices: (0..ndim)
+                .map(|k| chunks_per_dim[k][(i / strides[k]) % chunks_per_dim[k].len()])
+                .collect(),
+        })
+        .collect()
+}
+
+/// Build `ColumnDef`s for one table: dimensions first, then variables.
+pub fn build_column_defs(
+    store: &ZarrStore,
+    table: &Table,
+    coord_arrays: &HashMap<String, CoordArray>,
+    decode_times: bool,
+) -> Result<Vec<ColumnDef>, Box<dyn std::error::Error>> {
+    let mut cols = Vec::new();
+
+    // Dimension columns (coords or synthesized integers).
+    for (dim_idx, dim) in table.dims.iter().enumerate() {
+        let (on_disk_dtype, encoding, sentinel) = match coord_arrays.get(dim) {
+            Some(ca) => (ca.dtype.clone(), ca.encoding.clone(), ca.sentinel.clone()),
+            // Unindexed dim → synthesize 0..N integer range (Int64).
+            None => (ZarrDtype::Int64, ColumnEncoding::Plain, None),
+        };
+        cols.push(ColumnDef {
+            name: dim.clone(),
+            storage: Storage::Array,
+            on_disk_dtype,
+            encoding,
+            sentinel,
+            is_coord: true,
+            dim_idx: Some(dim_idx),
+        });
+    }
+
+    // Data variable columns.
+    for var in &table.variables {
+        let var_name = &var.path;
+        let (on_disk_dtype, encoding, sentinel) = match &var.storage {
+            Storage::Array => {
+                let arr = open_array(store, var_name)?;
+                let dtype = parse_dtype(&arr, var_name)?;
+                let attrs = arr.attributes().clone();
+                let (encoding, sentinel) =
+                    parse_encoding_and_sentinel(&dtype, &attrs, decode_times);
+                let sentinel = sentinel.or_else(|| parse_zarr_fill_sentinel(&arr, &dtype));
+                (dtype, encoding, sentinel)
+            }
+            Storage::Unreadable { error } => {
+                return Err(format!("zarrs cannot open '{var_name}': {error}").into());
+            }
+            // AnnData encodings mark missing values themselves (a negative
+            // code, a mask), so the Zarr fill value is not a NULL sentinel.
+            Storage::Categorical { codes, categories } => {
+                let dtype = parse_dtype(&open_array(store, codes)?, codes)?;
+                if !dtype.is_integer() {
+                    return Err(format!("categorical '{var_name}' has non-integer codes").into());
+                }
+                let categories_arr = open_array(store, categories)?;
+                let len = categories_arr.shape().first().copied().unwrap_or(0) as usize;
+                // String categories may become an ENUM, which needs them as
+                // strings. They are read once and serve as the values as well;
+                // a string array has no sentinel or CF encoding to apply.
+                let (values, strings) =
+                    if parse_dtype(&categories_arr, categories)? == ZarrDtype::String {
+                        let strings = categories_arr
+                            .retrieve_array_subset::<Vec<String>>(&categories_arr.subset_all())?;
+                        let values = CoordArray {
+                            dtype: ZarrDtype::String,
+                            encoding: ColumnEncoding::Plain,
+                            sentinel: None,
+                            data: Arc::new(StringValues {
+                                strings: strings.clone(),
+                            }),
+                        };
+                        (values, Some(strings))
+                    } else {
+                        (load_coord_array(store, categories, decode_times)?, None)
+                    };
+                let categories = Categories::new(values, len, strings);
+                (
+                    dtype,
+                    ColumnEncoding::Categorical(Arc::new(categories)),
+                    None,
+                )
+            }
+            Storage::Nullable { values, mask } => {
+                let arr = open_array(store, values)?;
+                let mask_arr = open_array(store, mask)?;
+                // The chunks may differ: the scan then reads both as subsets.
+                if mask_arr.shape() != arr.shape() {
+                    return Err(format!(
+                        "nullable '{var_name}': `mask` and `values` differ in shape"
+                    )
+                    .into());
+                }
+                (parse_dtype(&arr, values)?, ColumnEncoding::Plain, None)
+            }
+            Storage::Sparse(matrix) => {
+                let dtype = parse_dtype(&open_array(store, &matrix.data)?, &matrix.data)?;
+                if dtype == ZarrDtype::String {
+                    return Err(format!("sparse matrix '{var_name}' holds strings").into());
+                }
+                (dtype, ColumnEncoding::Plain, None)
+            }
+        };
+        cols.push(ColumnDef {
+            name: var_name.clone(),
+            storage: var.storage.clone(),
+            on_disk_dtype,
+            encoding,
+            sentinel,
+            is_coord: false,
+            dim_idx: None,
+        });
+    }
+
+    Ok(cols)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use zarrs::storage::store::MemoryStore;
+    use zarrs::storage::WritableStorageTraits;
+
+    use super::*;
+
+    #[test]
+    fn bounded_work_units_keep_row_major_order_and_empty_dimensions() {
+        let units = build_work_units_in(&[vec![1, 3], vec![0, 2, 4]]);
+        assert_eq!(
+            units
+                .iter()
+                .map(|u| u.chunk_indices.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![1, 0],
+                vec![1, 2],
+                vec![1, 4],
+                vec![3, 0],
+                vec![3, 2],
+                vec![3, 4]
+            ]
+        );
+        assert!(build_work_units_in(&[vec![1], vec![]]).is_empty());
+        assert!(build_work_units_in(&[vec![], vec![1]]).is_empty());
+        let scalar = build_work_units_in(&[]);
+        assert_eq!(scalar.len(), 1);
+        assert!(scalar[0].chunk_indices.is_empty());
+    }
+
+    #[test]
+    fn v3_consolidated_cache_survives_a_self_referencing_root_entry() {
+        // Some v3 writers list the root group under its own path ("" or "/")
+        // inside `consolidated_metadata.metadata`. That sub-document doesn't
+        // itself carry `consolidated_metadata`, so it must never overwrite
+        // the full root document already cached under the "zarr.json" key.
+        let store_inner = MemoryStore::new();
+        let root_doc = serde_json::json!({
+            "zarr_format": 3,
+            "node_type": "group",
+            "consolidated_metadata": {
+                "kind": "inline",
+                "must_understand": false,
+                "metadata": {
+                    "/": {"zarr_format": 3, "node_type": "group"},
+                    "foo": {"zarr_format": 3, "node_type": "array"},
+                }
+            }
+        });
+        store_inner
+            .set(
+                &StoreKey::new("zarr.json").unwrap(),
+                Bytes::from(serde_json::to_vec(&root_doc).unwrap()),
+            )
+            .unwrap();
+        let store: ZarrStore = Arc::new(store_inner);
+
+        let cache = build_consolidated_cache(&store).unwrap().unwrap();
+
+        let cached_root = cache.get(&StoreKey::new("zarr.json").unwrap()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(cached_root).unwrap();
+        assert!(
+            parsed.get("consolidated_metadata").is_some(),
+            "root zarr.json cache entry lost its consolidated_metadata block: {parsed}"
+        );
+        assert!(cache.contains_key(&StoreKey::new("foo/zarr.json").unwrap()));
+    }
+
+    fn store_with_array_json(name: &str, doc: serde_json::Value) -> ZarrStore {
+        let inner = Arc::new(MemoryStore::new());
+        put_array_json(&inner, name, doc);
+        inner
+    }
+
+    fn put_array_json(store: &Arc<MemoryStore>, name: &str, doc: serde_json::Value) {
+        store
+            .set(
+                &StoreKey::new(format!("{name}/zarr.json")).unwrap(),
+                Bytes::from(serde_json::to_vec(&doc).unwrap()),
+            )
+            .unwrap();
+    }
+
+    fn array_doc(data_type: &str, fill_value: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "zarr_format": 3, "node_type": "array", "shape": [4], "data_type": data_type,
+            "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [4]}},
+            "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+            "fill_value": fill_value,
+            "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}],
+            "attributes": {}
+        })
+    }
+
+    #[test]
+    fn array_path_synthesizes_dims_but_group_enumeration_leaves_the_array_out() {
+        // AnnData and zarr-python write neither `dimension_names` nor
+        // `_ARRAY_DIMENSIONS` (issue #40). One array selected with array_path= gets
+        // dim_0, dim_1, ... Enumerating a group must never do that: with placeholder
+        // names, unrelated arrays of the same length would be joined row by row. The
+        // array is left out of every table and reported as unnamed instead.
+        let store = store_with_array_json("X", {
+            let mut d = array_doc("float32", serde_json::json!(0.0));
+            d["shape"] = serde_json::json!([20, 8]);
+            d["chunk_grid"]["configuration"]["chunk_shape"] = serde_json::json!([20, 8]);
+            d
+        });
+        let names = vec!["X".to_string()];
+
+        let table = array_table(&store, &names, "X").unwrap();
+        assert_eq!(table.dims, vec!["dim_0", "dim_1"]);
+
+        let node = tree::StoreTree::load(&store, &names, None)
+            .unwrap()
+            .tables("");
+        assert!(node.tables.is_empty(), "{:?}", node.tables);
+        assert_eq!(node.unnamed, vec!["X"]);
+    }
+
+    #[test]
+    fn partially_named_dims_fill_only_the_unnamed_slot() {
+        // A v3 `dimension_names` list may contain null; only that slot gets dim_<i>.
+        let store = store_with_array_json("a", {
+            let mut d = array_doc("float32", serde_json::json!(0.0));
+            d["shape"] = serde_json::json!([4, 4]);
+            d["chunk_grid"]["configuration"]["chunk_shape"] = serde_json::json!([4, 4]);
+            d["dimension_names"] = serde_json::json!(["x", null]);
+            d
+        });
+        let arr = open_array(&store, "a").unwrap();
+        assert_eq!(dimension_names(&arr, "a").unwrap(), vec!["x", "dim_1"]);
+    }
+
+    #[test]
+    fn array_path_dims_matches_what_read_zarr_binds() {
+        let store = store_with_array_json("X", {
+            let mut d = array_doc("float32", serde_json::json!(0.0));
+            d["shape"] = serde_json::json!([20, 8]);
+            d["chunk_grid"]["configuration"]["chunk_shape"] = serde_json::json!([20, 8]);
+            d
+        });
+        let arr = open_array(&store, "X").unwrap();
+        let table = array_table(&store, &["X".to_string()], "X").unwrap();
+        assert_eq!(array_path_dims(&store, None, &arr, "X"), table.dims);
+        assert_eq!(table.dims, vec!["dim_0", "dim_1"]);
+    }
+
+    #[test]
+    fn synthesized_dims_never_bind_a_coordinate_array() {
+        // A sibling array that happens to be called `dim_0` is not a coordinate for
+        // X's first axis: X never named that axis.
+        let store = Arc::new(MemoryStore::new());
+        put_array_json(&store, "g/X", {
+            let mut d = array_doc("float32", serde_json::json!(0.0));
+            d["shape"] = serde_json::json!([4, 2]);
+            d["chunk_grid"]["configuration"]["chunk_shape"] = serde_json::json!([4, 2]);
+            d
+        });
+        put_array_json(
+            &store,
+            "g/dim_0",
+            array_doc("float32", serde_json::json!(0.0)),
+        );
+        let store: ZarrStore = store;
+        let names = vec!["g/X".to_string(), "g/dim_0".to_string()];
+        let table = array_table(&store, &names, "g/X").unwrap();
+        assert_eq!(table.dims, vec!["dim_0", "dim_1"]);
+        assert!(table.coords.is_empty(), "{:?}", table.coords);
+    }
+
+    #[test]
+    fn unsupported_dtype_is_distinguished_from_other_open_errors() {
+        let store =
+            store_with_array_json("bad", array_doc("not_a_real_dtype", serde_json::json!(0)));
+        let err = open_array(&store, "bad")
+            .err()
+            .expect("bogus dtype must fail to open");
+        assert!(is_unsupported_array_error(err.as_ref()), "{err}");
+
+        // A missing array is an ordinary error, not "unsupported".
+        let empty: ZarrStore = Arc::new(MemoryStore::new());
+        let err = open_array(&empty, "nope")
+            .err()
+            .expect("missing array must fail to open");
+        assert!(!is_unsupported_array_error(err.as_ref()), "{err}");
+    }
+
+    #[test]
+    fn unsupported_codec_degrades_but_a_bad_fill_value_does_not() {
+        let mut doc = array_doc("float32", serde_json::json!(0.0));
+        doc["codecs"] = serde_json::json!([{"name": "not_a_real_codec"}]);
+        let store = store_with_array_json("c", doc);
+        let err = open_array(&store, "c")
+            .err()
+            .expect("unknown codec must fail");
+        assert!(is_unsupported_array_error(err.as_ref()), "{err}");
+
+        // An invalid fill value is broken metadata, not an unsupported feature.
+        let store = store_with_array_json("f", array_doc("float32", serde_json::json!("garbage")));
+        let err = open_array(&store, "f")
+            .err()
+            .expect("bad fill value must fail");
+        assert!(!is_unsupported_array_error(err.as_ref()), "{err}");
+    }
+}

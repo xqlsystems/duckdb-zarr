@@ -3209,8 +3209,19 @@ dependencies = [
  "openssl",
  "rayon",
  "serde_json",
+ "zarr-core",
  "zarrs",
  "zarrs_http",
+]
+
+[[package]]
+name = "zarr-core"
+version = "0.1.3"
+dependencies = [
+ "base64",
+ "chrono",
+ "serde_json",
+ "zarrs",
 ]
 
 [[package]]

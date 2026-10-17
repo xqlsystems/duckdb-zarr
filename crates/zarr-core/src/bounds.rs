@@ -11,7 +11,7 @@
 
 use chrono::NaiveDate;
 
-use super::types::{ColumnEncoding, CoordArray};
+use crate::types::{ColumnEncoding, CoordArray};
 
 /// One parsed `[dim, lo, hi]` entry. `None` means unbounded on that side.
 #[derive(Debug, Clone, PartialEq)]
@@ -22,7 +22,7 @@ pub struct RawBound {
 }
 
 /// 2^53: beyond this an `f64` can no longer hold every integer exactly.
-const EXACT_F64: f64 = 9_007_199_254_740_992.0;
+const EXACT_F64: u64 = 9_007_199_254_740_992;
 
 /// Parse one bound endpoint for a coordinate with the given encoding.
 pub fn parse_endpoint(
@@ -32,18 +32,21 @@ pub fn parse_endpoint(
 ) -> Result<f64, Box<dyn std::error::Error>> {
     let text = text.trim();
     let value = match encoding {
-        ColumnEncoding::CfTime(_) => parse_timestamp_micros(text)
-            .ok_or_else(|| format!("bounds for time dimension '{dim}': cannot parse '{text}' as a timestamp (use e.g. '2022-07-01 12:00:00')"))?
-            as f64,
+        ColumnEncoding::CfTime(_) => {
+            let micros = parse_timestamp_micros(text)
+                .ok_or_else(|| format!("bounds for time dimension '{dim}': cannot parse '{text}' as a timestamp (use e.g. '2022-07-01 12:00:00')"))?;
+            // Check the integer before conversion: 2^53 + 1 rounds down to 2^53.
+            if micros.unsigned_abs() >= EXACT_F64 {
+                return Err(format!("bounds for time dimension '{dim}': '{text}' exceeds exact timestamp precision; use WHERE for exact comparisons").into());
+            }
+            micros as f64
+        }
         _ => text
             .parse::<f64>()
             .map_err(|_| format!("bounds for dimension '{dim}': '{text}' is not a number"))?,
     };
     if value.is_nan() {
         return Err(format!("bounds for dimension '{dim}': NaN is not a valid bound").into());
-    }
-    if matches!(encoding, ColumnEncoding::CfTime(_)) && value.abs() > EXACT_F64 {
-        return Err(format!("bounds for time dimension '{dim}': '{text}' is out of range").into());
     }
     Ok(value)
 }
@@ -114,7 +117,7 @@ pub fn chunks_with_kept(mask: &[bool], shape: u64, chunk_size: u64) -> Vec<u64> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::zarr_reader::types::{FixedValues, ZarrDtype};
+    use crate::types::{FixedValues, ZarrDtype};
     use std::sync::Arc;
 
     fn f64_coord(values: &[f64]) -> CoordArray {
@@ -190,6 +193,34 @@ mod tests {
         m[2] = true;
         m[3] = true;
         assert_eq!(chunks_with_kept(&m, 7, 3), [0, 1]);
+    }
+
+    #[test]
+    fn timestamp_endpoints_reject_precision_loss_before_conversion() {
+        let encoding = ColumnEncoding::CfTime(crate::cftime::CfTimeEncoding {
+            step_num: 1,
+            step_den: 1,
+            epoch_us: 0,
+            floor_us: i64::MIN,
+        });
+        let limit = 1_i64 << 53;
+        for micros in [limit, limit + 1, -limit, -limit - 1] {
+            let text = chrono::DateTime::from_timestamp_micros(micros)
+                .unwrap()
+                .naive_utc()
+                .to_string();
+            assert!(parse_endpoint(&text, &encoding, "time").is_err(), "{text}");
+        }
+        for micros in [limit - 1, -limit + 1] {
+            let text = chrono::DateTime::from_timestamp_micros(micros)
+                .unwrap()
+                .naive_utc()
+                .to_string();
+            assert_eq!(
+                parse_endpoint(&text, &encoding, "time").unwrap(),
+                micros as f64
+            );
+        }
     }
 
     #[test]

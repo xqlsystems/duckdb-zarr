@@ -37,12 +37,31 @@ GROUP BY month ORDER BY month;
 -- Select one array by its store-relative path (e.g. an OME-Zarr resolution level or nested label)
 SELECT * FROM read_zarr('test/fixtures/bioimage/ome_zarr/synthetic_multichannel.ome.zarr', array_path='0');
 
--- List a store's dimension groups
-SELECT dims, shape, data_vars FROM read_zarr_groups('test/fixtures/xarray_tutorial/multi_dim_group.zarr');
+-- List a store's tables, then read one by name
+SELECT table_name, dims, data_vars FROM read_zarr_tables('test/fixtures/xarray_tutorial/multi_dim_group.zarr');
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/multi_dim_group.zarr', table_name := 'time_lat_lon') LIMIT 5;
+
+-- Read one group of a nested store (xarray.DataTree.to_zarr, AnnData); the root is the default
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', group_path := 'simulation/fine');
+
+-- AnnData: cell annotations (cell_type is an ENUM), one row per cell named in `obs`
+SELECT cell_type, COUNT(*) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', table_name := 'obs') GROUP BY ALL;
+
+-- Get the statements that mount every table as a view (era5.main.surface, ...),
+-- then run them; docs/design.md, section 3, shows how from Python and the CLI
+SELECT sql FROM read_zarr_views('test/fixtures/xarray_tutorial/era5_like.zarr', 'era5',
+  view_names := MAP {'time_latitude_longitude': 'surface'});
 ```
 
-See [docs/design.md](docs/design.md) for the full design and
-[docs/ome-zarr.md](docs/ome-zarr.md) for a small bioimage example.
+## Documentation
+
+- **Biology:** [AnnData annotated matrices](docs/anndata.md), including a
+  cell-by-gene example and SpatialData table boundaries;
+  [OME-Zarr bioimages](docs/ome-zarr.md).
+- **Climate and geoscience:** [gridded-data quick start](docs/README.md#basic-usage)
+  and [tested atmospheric and ocean datasets](docs/domains.md#climate-and-geoscience).
+- **General reference:** [documentation overview](docs/README.md),
+  [full design](docs/design.md), and [tested scientific domains](docs/domains.md).
 
 ## Remote stores
 
@@ -60,6 +79,7 @@ Active development. Phases 1–3 are implemented:
 - **Phase 1** — `read_zarr`, `read_zarr_metadata`, `read_zarr_groups` table functions; Zarr v3; CF conventions (fill values, scale/offset, time → `TIMESTAMP`, bounds variables, aux coords)
 - **Phase 2** — Zarr v2, Blosc/LZ4, replacement scan for local `.zarr` paths, projection pushdown
 - **Phase 3** — HTTP/HTTPS stores, `dims=` and `array_path=` selection, recursive array discovery
+- **Nested groups** — one table set per Zarr group (`group_path=`), as in `xarray.DataTree`; AnnData stores with named axes, cell and gene names as coordinates, categoricals as `ENUM`, nullable columns, and sparse matrices
 
 See the [phased plan](docs/design.md#phased-plan) for what's next.
 

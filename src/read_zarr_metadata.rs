@@ -3,21 +3,28 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use duckdb::core::LogicalTypeId;
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
 
+use crate::list_columns::{ubigint_list, varchar_list, write_string_lists, write_u64_lists};
+use crate::selection::Selection;
 use crate::zarr_reader::meta::{
-    collect_auxiliary_coords, collect_bounds_vars, dimension_names as get_dim_names,
-    extract_file_system, list_array_names, open_array, open_store, select_array_name,
+    array_path_dims, cf_auxiliary_vars, dimension_names as get_dim_names, extract_file_system,
+    first_chunk_shape, is_unsupported_array_error, list_array_names, open_array, open_store,
+    select_array_name, ArrayFacts,
 };
+use crate::zarr_reader::{anndata, tree};
 
 /// One metadata row per array.
 #[derive(Debug, Clone)]
 struct MetaRow {
     name: String,
-    dims: String, // JSON array string e.g. '["lat","lon"]'
+    dims: Vec<String>,
     dtype: String,
-    shape: String, // JSON array string e.g. '[4,6]'
-    chunk_shape: String,
-    attrs: String, // full attrs as JSON string
-    role: String,  // "coord" | "data" | "aux_coord" | "bounds" | "scalar" | "unknown"
+    shape: Vec<u64>,
+    chunk_shape: Vec<u64>,
+    attrs: String, // full attrs as JSON string; for "unsupported", {"error": ...}
+    role: String,  // "coord" | "data" | "aux_coord" | "bounds" | "scalar" | "unsupported"
+    // Dimension names that read_zarr(store, array_path := name) binds. Differs from
+    // `dims` only when the array declares no names (then dim_0, dim_1, ...).
+    array_path_dims: Vec<String>,
 }
 
 pub struct ReadZarrMetaBind {
@@ -42,49 +49,103 @@ impl VTab for ReadZarrMetaVTab {
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
         bind.add_result_column("name", LogicalTypeId::Varchar.into());
-        bind.add_result_column("dims", LogicalTypeId::Varchar.into());
+        bind.add_result_column("dims", varchar_list());
         bind.add_result_column("dtype", LogicalTypeId::Varchar.into());
-        bind.add_result_column("shape", LogicalTypeId::Varchar.into());
-        bind.add_result_column("chunk_shape", LogicalTypeId::Varchar.into());
+        bind.add_result_column("shape", ubigint_list());
+        bind.add_result_column("chunk_shape", ubigint_list());
         bind.add_result_column("attrs", LogicalTypeId::Varchar.into());
         bind.add_result_column("role", LogicalTypeId::Varchar.into());
+        bind.add_result_column("array_path_dims", varchar_list());
 
         let store_path = bind.get_parameter(0).to_string();
         let fs = unsafe { extract_file_system(bind) };
         let store = open_store(&store_path, Some(fs))?;
         let mut array_names = list_array_names(&store_path, &store)?;
-        let array_path = bind
-            .get_named_parameter("array_path")
-            .map(|value| value.to_string());
-        let array_alias = bind
-            .get_named_parameter("array")
-            .map(|value| value.to_string());
-        if array_path.is_some() && array_alias.is_some() {
-            return Err("use either array_path= or \"array\"=, not both".into());
-        }
-        if let Some(requested) = array_path.or(array_alias) {
-            array_names = vec![select_array_name(&array_names, &requested)?];
+        // The AnnData layout (None for other stores), read once for all arrays.
+        let layout = anndata::layout(&store, &array_names);
+        match Selection::from_bind(bind)? {
+            Selection::Array(requested) => {
+                // An AnnData encoded variable lists the arrays it is made of.
+                let is_variable = layout.as_ref().is_some_and(|layout| {
+                    layout
+                        .encoding_of(&requested)
+                        .is_some_and(|e| anndata::is_variable_encoding(&e))
+                });
+                if is_variable {
+                    let prefix = format!("{requested}/");
+                    array_names.retain(|name| name.starts_with(&prefix));
+                } else {
+                    array_names = vec![select_array_name(&array_names, &requested)?];
+                }
+            }
+            // group_path= lists the arrays of that node's tables, not of its
+            // subgroups. In an AnnData store that is the node read_zarr reads
+            // each array's variable from: the obs and var columns are in the
+            // root, and the arrays of an encoded group (X/data,
+            // obs/cell_type/codes) go with it.
+            Selection::Node(node) => {
+                tree::ensure_group_exists(&store_path, &array_names, &node)?;
+                anndata::check_group_path(&store_path, layout.as_ref(), &node)?;
+                match &layout {
+                    Some(layout) => array_names.retain(|name| layout.node_of_array(name) == node),
+                    None => array_names.retain(|name| tree::node_of(name) == node),
+                }
+            }
+            Selection::Store => {}
         }
 
-        let aux_coords = collect_auxiliary_coords(&store, &array_names);
-        let bounds_vars = collect_bounds_vars(&store, &array_names, &aux_coords);
+        // Open every array once. One with a data type or codec that zarrs cannot
+        // open must not hide the rest of the store, so it is listed as
+        // "unsupported"; any other error (I/O, auth, missing metadata) fails.
+        let mut opened = Vec::with_capacity(array_names.len());
+        for name in &array_names {
+            match open_array(&store, name) {
+                Ok(arr) => opened.push((name, Ok(arr))),
+                Err(err) if is_unsupported_array_error(err.as_ref()) => {
+                    opened.push((name, Err(err.to_string())))
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        // As in StoreTree::tables, CF rules do not apply to AnnData objects.
+        let in_anndata = |name: &str| {
+            layout
+                .as_ref()
+                .is_some_and(|l| l.object_of(tree::node_of(name)).is_some())
+        };
+        let facts: Vec<ArrayFacts> = opened
+            .iter()
+            .filter(|(name, _)| !in_anndata(name))
+            .filter_map(|(name, arr)| {
+                let arr = arr.as_ref().ok()?;
+                Some((name.as_str(), arr.attributes(), arr.shape()))
+            })
+            .collect();
+        let (aux_coords, bounds_vars) = cf_auxiliary_vars(&facts);
 
         let mut rows = Vec::new();
-        for name in &array_names {
-            let arr = open_array(&store, name)?;
-            let shape = arr.shape().to_vec();
-            // chunk_grid_shape() returns number-of-chunks per dim, NOT element shape.
-            // Use chunk_shape([0,0,...]) to get the actual per-chunk element dimensions.
-            let chunk_shape: Vec<u64> = if !shape.is_empty() {
-                let first = vec![0u64; shape.len()];
-                arr.chunk_shape(&first)
-                    .map(|cs| cs.iter().map(|x| x.get()).collect())
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
+        for &(name, ref arr) in &opened {
+            let arr = match arr {
+                Ok(arr) => arr,
+                Err(err) => {
+                    rows.push(MetaRow {
+                        name: name.to_string(),
+                        dims: Vec::new(),
+                        dtype: "unsupported".to_string(),
+                        shape: Vec::new(),
+                        chunk_shape: Vec::new(),
+                        attrs: serde_json::json!({ "error": err }).to_string(),
+                        role: "unsupported".to_string(),
+                        array_path_dims: Vec::new(),
+                    });
+                    continue;
+                }
             };
+            let shape = arr.shape().to_vec();
+            let chunk_shape = first_chunk_shape(arr).unwrap_or_default();
 
-            let dims = get_dim_names(&arr, name).unwrap_or_default();
+            let dims = get_dim_names(arr, name).unwrap_or_default();
+            let bound_dims = array_path_dims(&store, layout.as_ref(), arr, name);
             let dtype_str = arr.data_type().to_string();
             let attrs = arr.attributes().clone();
 
@@ -105,12 +166,13 @@ impl VTab for ReadZarrMetaVTab {
 
             rows.push(MetaRow {
                 name: name.clone(),
-                dims: serde_json::to_string(&dims).unwrap_or_default(),
+                dims,
                 dtype: dtype_str,
-                shape: serde_json::to_string(&shape).unwrap_or_default(),
-                chunk_shape: serde_json::to_string(&chunk_shape).unwrap_or_default(),
+                shape,
+                chunk_shape,
                 attrs: serde_json::to_string(&attrs).unwrap_or_default(),
                 role: role.to_string(),
+                array_path_dims: bound_dims,
             });
         }
 
@@ -141,24 +203,24 @@ impl VTab for ReadZarrMetaVTab {
         let end = (start + vector_size).min(bind.rows.len());
         let n = end - start;
 
+        let rows = &bind.rows[start..end];
         let v_name = output.flat_vector(0);
-        let v_dims = output.flat_vector(1);
         let v_dtype = output.flat_vector(2);
-        let v_shape = output.flat_vector(3);
-        let v_cshape = output.flat_vector(4);
         let v_attrs = output.flat_vector(5);
         let v_role = output.flat_vector(6);
-
-        for (i, row) in bind.rows[start..end].iter().enumerate() {
+        for (i, row) in rows.iter().enumerate() {
             use duckdb::core::Inserter;
             v_name.insert(i, row.name.as_str());
-            v_dims.insert(i, row.dims.as_str());
             v_dtype.insert(i, row.dtype.as_str());
-            v_shape.insert(i, row.shape.as_str());
-            v_cshape.insert(i, row.chunk_shape.as_str());
             v_attrs.insert(i, row.attrs.as_str());
             v_role.insert(i, row.role.as_str());
         }
+        let strings = |f: fn(&MetaRow) -> &[String]| rows.iter().map(f).collect::<Vec<_>>();
+        let numbers = |f: fn(&MetaRow) -> &[u64]| rows.iter().map(f).collect::<Vec<_>>();
+        write_string_lists(output, 1, &strings(|r| &r.dims));
+        write_u64_lists(output, 3, &numbers(|r| &r.shape));
+        write_u64_lists(output, 4, &numbers(|r| &r.chunk_shape));
+        write_string_lists(output, 7, &strings(|r| &r.array_path_dims));
 
         output.set_len(n);
         Ok(())
@@ -169,9 +231,6 @@ impl VTab for ReadZarrMetaVTab {
     }
 
     fn named_parameters() -> Option<Vec<(String, duckdb::core::LogicalTypeHandle)>> {
-        Some(vec![
-            ("array".to_string(), LogicalTypeId::Varchar.into()),
-            ("array_path".to_string(), LogicalTypeId::Varchar.into()),
-        ])
+        Some(Selection::named_parameters())
     }
 }
