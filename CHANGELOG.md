@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-18
+
 ### Changed
 - **BREAKING — CF time coordinates now come back as `TIMESTAMP`, not as the raw numeric offset they are physically stored as.** A coordinate carrying `units = "<step> since <reference>"` is decoded at scan time, so `WHERE time >= TIMESTAMP '2024-01-01'`, `date_trunc`, and the rest of DuckDB's date machinery work on Zarr time axes directly — previously ARCO-ERA5's `time` came back as a `BIGINT` count of hours and every time predicate had to be hand-written against the array's `units` attr. **This changes existing column types**: the `air_temperature` fixture's `time` goes `FLOAT` → `TIMESTAMP` and `ersstv5`'s goes `DOUBLE` → `TIMESTAMP`, so a query comparing a time column against a bare number (`WHERE time >= 1867128.0`) no longer binds. Pass `decode_times := false` (below) to keep the previous behaviour.
 
