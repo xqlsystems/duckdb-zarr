@@ -1,0 +1,26 @@
+[package]
+name = "zarr-core"
+version = "0.1.3"
+edition = "2021"
+publish = false
+description = "Engine-independent Zarr reading for duckdb-zarr: metadata, dimension groups, CF decoding, pruning"
+license = "Apache-2.0"
+
+[dependencies]
+# Same codec set as the extension (see the root Cargo.toml for why blosc is
+# target-conditional); decoding happens wherever arrays are read, so every
+# adapter gets these through this crate.
+zarrs = { version = "0.23", default-features = false, features = [
+    "filesystem",
+    "gzip",
+    "zstd",
+    "crc32c",
+    "sharding",
+    "transpose",
+] }
+serde_json = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false }
+
+[target.'cfg(not(all(target_os = "windows", target_env = "gnu")))'.dependencies]
+zarrs = { version = "0.23", default-features = false, features = ["blosc"] }

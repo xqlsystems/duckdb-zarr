@@ -6,6 +6,14 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib"]
 
+# The extension (this package) stays at the root so DuckDB's extension CI
+# builds it unchanged. zarr-core is shared with crates/vgi-zarr, which is
+# deliberately not a member: it pulls the Query.Farm VGI SDK (source-available
+# licence) and arrow, neither of which belongs in this crate's dependency graph.
+[workspace]
+members = ["crates/zarr-core"]
+exclude = ["crates/vgi-zarr"]
+
 [profile.release]
 lto = true
 strip = true
@@ -20,6 +28,7 @@ path = "src/wasm_lib.rs"
 crate-type = ["staticlib"]
 
 [dependencies]
+zarr-core = { path = "crates/zarr-core" }
 duckdb = { version = "=1.10505.0", features = ["loadable-extension"] }
 # Base zarrs features: no blosc here — blosc_src bundles pthreads that conflict
 # with Rtools42's libpthread on windows_amd64_mingw (x86_64-pc-windows-gnu).

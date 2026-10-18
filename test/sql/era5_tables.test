@@ -1,0 +1,171 @@
+# name: test/sql/era5_tables.test
+# description: xarray-sql's ARCO-ERA5 demo: surface and atmosphere variables as two tables
+# group: [zarr]
+#
+# xarray-sql's README (and perf_tests/era5_temp_profile.py) opens ARCO-ERA5 and
+# registers one table per dimension set:
+#
+#   ctx.from_dataset('era5', ds, table_names={
+#       ('time', 'latitude', 'longitude'): 'surface',
+#       ('time', 'level', 'latitude', 'longitude'): 'atmosphere',
+#   })
+#
+# then queries era5.surface and era5.atmosphere. This file runs the same queries
+# on era5_like.zarr (scripts/generate_fixtures.py), a small store with the
+# ARCO-ERA5 layout: one flat group, float32 variables in one-hour chunks, CF
+# time, 0-360 longitudes, a crop around New York.
+#
+#   time       2020-01-01 00:00 .. 11:00, hourly
+#   level      250, 500, 850, 1000
+#   latitude   41.0 .. 38.0, step 0.5
+#   longitude  285.0 .. 288.0, step 0.5
+#   2m_temperature[t, lat, lon] = 278.15 + t + (lat - 39.5) + (lon - 286.5) / 2
+#   temperature[t, level]       = 273.15 + level / 100 + t / 2
+#   total_precipitation is chunked six hours at a time, the rest one hour.
+
+require zarr
+
+# ── The two tables ────────────────────────────────────────────────────────────
+# read_zarr_tables gives one table per dimension set, named like xarray-sql's
+# default ("_".join(dims)). The surface table plans its work units on the
+# largest chunk per dimension (decision 6): total_precipitation's six hours.
+query TTTTT
+SELECT schema_name, table_name, dims, chunk_shape, data_vars
+FROM read_zarr_tables('test/fixtures/xarray_tutorial/era5_like.zarr')
+ORDER BY table_name;
+----
+main	time_latitude_longitude	[time, latitude, longitude]	[6, 7, 7]	[10m_u_component_of_wind, 2m_temperature, total_precipitation]
+main	time_level_latitude_longitude	[time, level, latitude, longitude]	[1, 4, 7, 7]	[geopotential, temperature]
+
+# The catalog's columns are lists: which table holds temperature?
+query T
+SELECT table_name FROM read_zarr_tables('test/fixtures/xarray_tutorial/era5_like.zarr')
+WHERE list_contains(data_vars, 'temperature');
+----
+time_level_latitude_longitude
+
+# A read of the whole store must say which table it means.
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/era5_like.zarr');
+----
+group '/' has 2 tables
+
+# ── Register them as era5.surface and era5.atmosphere ─────────────────────────
+# read_zarr_views returns the statements that mount the store, one per row.
+# view_names := MAP {...} is xarray-sql's table_names, keyed by table name.
+query TTT
+SELECT * FROM read_zarr_views('test/fixtures/xarray_tutorial/era5_like.zarr', 'era5',
+  view_names := MAP {'time_latitude_longitude': 'surface',
+                     'time_level_latitude_longitude': 'atmosphere'});
+----
+NULL	NULL	ATTACH ':memory:' AS "era5";
+main	surface	CREATE OR REPLACE VIEW "era5"."main"."surface" AS SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/era5_like.zarr', table_name := 'time_latitude_longitude');
+main	atmosphere	CREATE OR REPLACE VIEW "era5"."main"."atmosphere" AS SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/era5_like.zarr', table_name := 'time_level_latitude_longitude');
+
+# The statements above, run in order as a client would.
+statement ok
+ATTACH ':memory:' AS "era5";
+
+statement ok
+CREATE OR REPLACE VIEW "era5"."main"."surface" AS SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/era5_like.zarr', table_name := 'time_latitude_longitude');
+
+statement ok
+CREATE OR REPLACE VIEW "era5"."main"."atmosphere" AS SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/era5_like.zarr', table_name := 'time_level_latitude_longitude');
+
+# A misspelled table is an error, not a silently unrenamed view.
+statement error
+SELECT * FROM read_zarr_views('test/fixtures/xarray_tutorial/era5_like.zarr', 'era5',
+  view_names := MAP {'time_lat_lon': 'surface'});
+----
+view_names names table 'time_lat_lon', which the store does not have; its tables are [time_latitude_longitude, time_level_latitude_longitude]
+
+# So is a rename onto another table's name.
+statement error
+SELECT * FROM read_zarr_views('test/fixtures/xarray_tutorial/era5_like.zarr', 'era5',
+  view_names := MAP {'time_latitude_longitude': 'Time_Level_Latitude_Longitude'});
+----
+tables 'time_latitude_longitude' and 'time_level_latitude_longitude' would both be view 'time_level_latitude_longitude' in schema 'main'
+
+query T
+SELECT string_agg(column_name || ' ' || column_type, ', ') FROM (DESCRIBE era5.surface);
+----
+time TIMESTAMP, latitude FLOAT, longitude FLOAT, 10m_u_component_of_wind FLOAT, 2m_temperature FLOAT, total_precipitation FLOAT
+
+query T
+SELECT string_agg(column_name || ' ' || column_type, ', ') FROM (DESCRIBE era5.atmosphere);
+----
+time TIMESTAMP, level BIGINT, latitude FLOAT, longitude FLOAT, geopotential FLOAT, temperature FLOAT
+
+# ── The demo's queries ────────────────────────────────────────────────────────
+# Average 2m-temperature over NYC on the morning of 2020-01-01. The 3 x 3 cells
+# are symmetric around (39.5, 286.5), so the average is 278.15 + 2.5 K.
+query R
+SELECT AVG("2m_temperature") - 273.15 AS avg_c
+FROM era5.surface
+WHERE time BETWEEN TIMESTAMP '2020-01-01'
+               AND TIMESTAMP '2020-01-01 05:00:00'
+  AND latitude  BETWEEN 39 AND 40
+  AND longitude BETWEEN 286 AND 287;
+----
+7.500000
+
+# Average temperature per pressure level: level / 100 + 1.25.
+query IR
+SELECT level, AVG(temperature) - 273.15 AS avg_c
+FROM era5.atmosphere
+WHERE time BETWEEN TIMESTAMP '2020-01-01'
+               AND TIMESTAMP '2020-01-01 05:00:00'
+GROUP BY level
+ORDER BY level DESC;
+----
+1000	11.250000
+850	9.750000
+500	6.250000
+250	3.750000
+
+# Average 2m-temperature per (lat, lon) cell: 49 cells, the first three shown.
+query I
+SELECT COUNT(*) FROM (
+  SELECT latitude, longitude, AVG("2m_temperature") - 273.15 AS avg_c
+  FROM era5.surface
+  WHERE time BETWEEN TIMESTAMP '2020-01-01'
+                 AND TIMESTAMP '2020-01-01 05:00:00'
+  GROUP BY latitude, longitude
+);
+----
+49
+
+query RRR
+SELECT latitude, longitude, AVG("2m_temperature") - 273.15 AS avg_c
+FROM era5.surface
+WHERE time BETWEEN TIMESTAMP '2020-01-01'
+               AND TIMESTAMP '2020-01-01 05:00:00'
+GROUP BY latitude, longitude
+ORDER BY latitude DESC, longitude
+LIMIT 3;
+----
+41.000000	285.000000	8.250000
+41.000000	285.500000	8.500000
+41.000000	286.000000	8.750000
+
+# ── Across the two tables ─────────────────────────────────────────────────────
+# The tables share time, latitude and longitude, so they join on them: 2m
+# temperature minus the 1000 hPa temperature at one cell is t / 2 - 5.
+query TR
+SELECT s.time, s."2m_temperature" - a.temperature AS diff_k
+FROM era5.surface s
+JOIN era5.atmosphere a USING (time, latitude, longitude)
+WHERE a.level = 1000 AND s.latitude = 39.5 AND s.longitude = 286.5
+ORDER BY s.time
+LIMIT 3;
+----
+2020-01-01 00:00:00	-5.000000
+2020-01-01 01:00:00	-4.500000
+2020-01-01 02:00:00	-4.000000
+
+# total_precipitation (six-hour chunks) reads beside the one-hour variables:
+# 12 hours x 49 cells, 0.001 m each.
+query IR
+SELECT COUNT(*), SUM(total_precipitation) FROM era5.surface;
+----
+588	0.588000
