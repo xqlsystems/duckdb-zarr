@@ -74,8 +74,8 @@ SELECT * FROM 'test/fixtures/xarray_tutorial/does_not_exist.zarr';
 ----
 
 # Multi-group store accessed via replacement scan: read_zarr errors with
-# "multiple dimension groups" — same error as explicit read_zarr call.
+# "has 2 tables": the same error as an explicit read_zarr call.
 statement error
 SELECT * FROM 'test/fixtures/xarray_tutorial/multi_dim_group.zarr';
 ----
-contains multiple dimension groups
+has 2 tables

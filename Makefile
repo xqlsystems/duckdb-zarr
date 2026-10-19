@@ -1,4 +1,4 @@
-.PHONY: clean clean_all clippy fmt fmt-check generate_fixtures lint release-check render-community-descriptor test_http test_http_debug test_http_release test_http_real
+.PHONY: check_anndata clean clean_all clippy fmt fmt-check generate_fixtures lint release-check render-community-descriptor test_http test_http_debug test_http_release test_http_real
 
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
@@ -64,6 +64,23 @@ test: test_debug
 test_debug: generate_fixtures test_extension_debug
 test_release: generate_fixtures test_extension_release
 
+# Run AnnData and DataTree regressions in the normal test targets (including CI).
+# Honor the shared runner's skip flag: PyPI DuckDB cannot load every build ABI
+# (notably MinGW), and some Linux builds are tested separately inside Docker.
+# Use the configured Python environment when uv is unavailable, as for fixtures.
+ifneq ($(SKIP_TESTS),1)
+test_debug test_release:
+	@if command -v uv >/dev/null 2>&1; then \
+		uv run --with pytest --with 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' \
+			pytest test/test_anndata_edge_cases.py test/test_datatree_compatibility.py \
+			--extension build/$(patsubst test_%,%,$@)/$(EXTENSION_NAME).duckdb_extension -v; \
+	else \
+		$(PYTHON_VENV_BIN) -m pip install --quiet pytest && \
+		$(PYTHON_VENV_BIN) -m pytest test/test_anndata_edge_cases.py test/test_datatree_compatibility.py \
+			--extension build/$(patsubst test_%,%,$@)/$(EXTENSION_NAME).duckdb_extension -v; \
+	fi
+endif
+
 # HTTP integration tests. Build the extension first (make debug / make release).
 # pytest runs via uv, so no venv setup is needed; duckdb is pinned to the target
 # DuckDB version. Both files run together as one suite:
@@ -107,11 +124,16 @@ render-community-descriptor:
 	python3 scripts/render_community_descriptor.py --ref "$(REF)" $(if $(REF_NEXT),--ref-next "$(REF_NEXT)",) --out build/community-extensions/extensions/zarr/description.yml
 	python3 scripts/check_release_ready.py --description-path build/community-extensions/extensions/zarr/description.yml --strict-community-ref
 
+# Compare the extension's AnnData tables with anndata.read_zarr (design decision 9).
+# Build the extension and the fixtures first (make debug generate_fixtures).
+check_anndata:
+	uv run scripts/check_anndata_tables.py build/debug/$(EXTENSION_NAME).duckdb_extension
+
 generate_fixtures:
 	@if command -v uv >/dev/null 2>&1; then \
 		uv run scripts/generate_fixtures.py; \
 	elif [ -f "$(PYTHON_VENV_BIN)" ]; then \
-		$(PYTHON_VENV_BIN) -m pip install --quiet "xarray" "zarr>=3.0.0" numpy scipy h5netcdf h5py pooch; \
+		$(PYTHON_VENV_BIN) -m pip install --quiet "xarray" "zarr>=3.0.0" numpy scipy h5netcdf h5py pooch anndata; \
 		$(PYTHON_VENV_BIN) scripts/generate_fixtures.py; \
 	else \
 		echo "Error: neither uv nor configure/venv found. Run 'make configure' or install uv." >&2; \
