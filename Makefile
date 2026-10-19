@@ -31,7 +31,10 @@ include extension-ci-tools/makefiles/c_api_extensions/rust.Makefile
 # emscripten target (rustup is a no-op when it is already present).
 ifneq ($(filter wasm_%,$(DUCKDB_PLATFORM)),)
 WASM_RUST_TOOLCHAIN := stable
-$(info $(shell rustup toolchain install $(WASM_RUST_TOOLCHAIN) --profile minimal --target wasm32-unknown-emscripten 1>&2))
+WASM_RUST_TOOLCHAIN_INSTALL_STATUS := $(shell rustup toolchain install $(WASM_RUST_TOOLCHAIN) --profile minimal --target wasm32-unknown-emscripten 1>&2; printf '%s' $$?)
+ifneq ($(WASM_RUST_TOOLCHAIN_INSTALL_STATUS),0)
+$(error rustup toolchain install $(WASM_RUST_TOOLCHAIN) failed with status $(WASM_RUST_TOOLCHAIN_INSTALL_STATUS))
+endif
 export RUSTUP_TOOLCHAIN := $(WASM_RUST_TOOLCHAIN)
 # emsdk 3.1.71's emcc turns every entry in the linked wasm's target_features section
 # into a `wasm-opt --enable-*` flag, and its binaryen rejects the newer features
