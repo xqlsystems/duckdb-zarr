@@ -42,6 +42,17 @@ export RUSTUP_TOOLCHAIN := $(WASM_RUST_TOOLCHAIN)
 export EMCC_CFLAGS := $(EMCC_CFLAGS) -Xlinker --no-check-features -Xlinker --features=bulk-memory,exception-handling,multivalue,mutable-globals,nontrapping-fptoint,reference-types,sign-ext
 endif
 
+# extension-ci-tools' `wasm_threads` target (duckdb/extension-ci-tools#391) never
+# passes -DUSE_WASM_THREADS=1 through to emcc's post-build link, so the side
+# module gets non-shared memory and fails to load in duckdb-wasm's threaded
+# runtime. emcc reads EMCC_CFLAGS at link time too, so for wasm_threads declare
+# shared memory here: the base.Makefile `emcc ... -sSIDE_MODULE=2` link line
+# picks it up without forking the toolchain. The wasm_mvp/wasm_eh builds are
+# unaffected (they target the non-threaded runtimes).
+ifeq ($(DUCKDB_PLATFORM),wasm_threads)
+export EMCC_CFLAGS := $(EMCC_CFLAGS) -sSHARED_MEMORY=1 -pthread
+endif
+
 configure: venv platform extension_version
 
 # DuckDB CI sets CC=gcc/CXX=g++ for windows_amd64_mingw but the Rust default

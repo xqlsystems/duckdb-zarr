@@ -104,7 +104,8 @@ extension:
 
 The descriptor excludes only `linux_amd64_musl`. The local distribution workflow
 uses the same exclusion set. The `wasm_mvp`, `wasm_eh`, and `wasm_threads`
-platforms are built and tested by CI; re-add one to the exclusions if it stops
+platforms are built by CI (the wasm matrix has no test step — it builds and
+uploads artifacts only); re-add one to the exclusions if its build stops
 passing.
 
 ## Submission Steps
