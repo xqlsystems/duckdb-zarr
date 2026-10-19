@@ -39,18 +39,23 @@ export RUSTUP_TOOLCHAIN := $(WASM_RUST_TOOLCHAIN)
 # Pin the output feature set at link time (and skip wasm-ld's check that every
 # object stays inside it: the extra features are subsets of those listed) instead of bumping emsdk, which must
 # match the emscripten version duckdb-wasm itself was built with.
-export EMCC_CFLAGS := $(EMCC_CFLAGS) -Xlinker --no-check-features -Xlinker --features=bulk-memory,exception-handling,multivalue,mutable-globals,nontrapping-fptoint,reference-types,sign-ext
-endif
+WASM_LD_FEATURES := bulk-memory,exception-handling,multivalue,mutable-globals,nontrapping-fptoint,reference-types,sign-ext
 
 # extension-ci-tools' `wasm_threads` target (duckdb/extension-ci-tools#391) never
 # passes -DUSE_WASM_THREADS=1 through to emcc's post-build link, so the side
 # module gets non-shared memory and fails to load in duckdb-wasm's threaded
 # runtime. emcc reads EMCC_CFLAGS at link time too, so for wasm_threads declare
 # shared memory here: the base.Makefile `emcc ... -sSIDE_MODULE=2` link line
-# picks it up without forking the toolchain. The wasm_mvp/wasm_eh builds are
-# unaffected (they target the non-threaded runtimes).
+# picks it up without forking the toolchain. `atomics` (binaryen's name for the
+# threads feature) must join the pinned feature list as well — emscripten asserts
+# `--enable-threads` is present in BINARYEN_FEATURES when SHARED_MEMORY is set,
+# and that list is derived from the wasm-ld features section pinned above. The
+# wasm_mvp/wasm_eh builds are unaffected (they target the non-threaded runtimes).
 ifeq ($(DUCKDB_PLATFORM),wasm_threads)
-export EMCC_CFLAGS := $(EMCC_CFLAGS) -sSHARED_MEMORY=1 -pthread
+WASM_LD_FEATURES := $(WASM_LD_FEATURES),atomics
+export EMCC_CFLAGS := $(EMCC_CFLAGS) -pthread -sSHARED_MEMORY=1
+endif
+export EMCC_CFLAGS := $(EMCC_CFLAGS) -Xlinker --no-check-features -Xlinker --features=$(WASM_LD_FEATURES)
 endif
 
 configure: venv platform extension_version
