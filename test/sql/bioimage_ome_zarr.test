@@ -42,13 +42,13 @@ WHERE c = 0 AND y < 2 AND x < 2;
 ----
 4	14
 
-# The OME-Zarr array is discoverable as one c/y/x dimension group.
+# The OME-Zarr array is discoverable as one c/y/x table.
 query II rowsort
 SELECT dims, data_vars
-FROM read_zarr_groups('test/fixtures/bioimage/ome_zarr/synthetic_multichannel.ome.zarr');
+FROM read_zarr_tables('test/fixtures/bioimage/ome_zarr/synthetic_multichannel.ome.zarr');
 ----
-["c","y","x"]	["0"]
-["y","x"]	["labels/nuclei/0"]
+[c, y, x]	[0]
+[y, x]	[labels/nuclei/0]
 
 # Recursive metadata discovery reports arrays inside the labels hierarchy.
 query TT rowsort
@@ -76,16 +76,16 @@ FROM read_zarr_metadata(
     "array" = '/labels/nuclei/0/'
 );
 ----
-[3,4]
+[3, 4]
 
 query TT
 SELECT dims, data_vars
-FROM read_zarr_groups(
+FROM read_zarr_tables(
     'test/fixtures/bioimage/ome_zarr/synthetic_multichannel.ome.zarr',
     array_path = 'labels/nuclei/0'
 );
 ----
-["y","x"]	["labels/nuclei/0"]
+[y, x]	[labels/nuclei/0]
 
 statement error
 SELECT *

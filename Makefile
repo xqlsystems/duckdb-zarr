@@ -1,4 +1,4 @@
-.PHONY: clean clean_all clippy fmt fmt-check generate_fixtures lint release-check render-community-descriptor test_http test_http_debug test_http_release test_http_real
+.PHONY: check_anndata clean clean_all clippy fmt fmt-check generate_fixtures lint release-check render-community-descriptor test_http test_http_debug test_http_release test_http_real
 
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
@@ -31,7 +31,12 @@ include extension-ci-tools/makefiles/c_api_extensions/rust.Makefile
 # emscripten target (rustup is a no-op when it is already present).
 ifneq ($(filter wasm_%,$(DUCKDB_PLATFORM)),)
 WASM_RUST_TOOLCHAIN := stable
-$(info $(shell rustup toolchain install $(WASM_RUST_TOOLCHAIN) --profile minimal --target wasm32-unknown-emscripten 1>&2))
+# Defer the toolchain install check to a build prerequisite (not parse time):
+# otherwise `make clean` on a wasm platform would fail when rustup or the
+# network is unavailable, and cleanup must not need a Rust toolchain.
+WASM_RUST_TOOLCHAIN_INSTALL := rustup toolchain install $(WASM_RUST_TOOLCHAIN) --profile minimal --target wasm32-unknown-emscripten
+wasm_toolchain:
+	@$(WASM_RUST_TOOLCHAIN_INSTALL) 1>&2
 export RUSTUP_TOOLCHAIN := $(WASM_RUST_TOOLCHAIN)
 # emsdk 3.1.71's emcc turns every entry in the linked wasm's target_features section
 # into a `wasm-opt --enable-*` flag, and its binaryen rejects the newer features
@@ -39,10 +44,34 @@ export RUSTUP_TOOLCHAIN := $(WASM_RUST_TOOLCHAIN)
 # Pin the output feature set at link time (and skip wasm-ld's check that every
 # object stays inside it: the extra features are subsets of those listed) instead of bumping emsdk, which must
 # match the emscripten version duckdb-wasm itself was built with.
-export EMCC_CFLAGS := $(EMCC_CFLAGS) -Xlinker --no-check-features -Xlinker --features=bulk-memory,exception-handling,multivalue,mutable-globals,nontrapping-fptoint,reference-types,sign-ext
+WASM_LD_FEATURES := bulk-memory,exception-handling,multivalue,mutable-globals,nontrapping-fptoint,reference-types,sign-ext
+
+# extension-ci-tools' `wasm_threads` target (duckdb/extension-ci-tools#391) never
+# passes -DUSE_WASM_THREADS=1 through to emcc's post-build link, so the side
+# module gets non-shared memory and fails to load in duckdb-wasm's threaded
+# runtime. emcc reads EMCC_CFLAGS at link time too, so for wasm_threads declare
+# shared memory here: the base.Makefile `emcc ... -sSIDE_MODULE=2` link line
+# picks it up without forking the toolchain. `atomics` (binaryen's name for the
+# threads feature) must join the pinned feature list as well — emscripten asserts
+# `--enable-threads` is present in BINARYEN_FEATURES when SHARED_MEMORY is set,
+# and that list is derived from the wasm-ld features section pinned above. The
+# wasm_mvp/wasm_eh builds are unaffected (they target the non-threaded runtimes).
+ifeq ($(DUCKDB_PLATFORM),wasm_threads)
+WASM_LD_FEATURES := $(WASM_LD_FEATURES),atomics
+export EMCC_CFLAGS := $(EMCC_CFLAGS) -pthread -sSHARED_MEMORY=1
+endif
+export EMCC_CFLAGS := $(EMCC_CFLAGS) -Xlinker --no-check-features -Xlinker --features=$(WASM_LD_FEATURES)
+else
+# No toolchain step is needed off wasm; stub the prerequisite so `configure`
+# still parses on native platforms.
+wasm_toolchain:
 endif
 
-configure: venv platform extension_version
+# The wasm build goals (`wasm_mvp` etc. from base.Makefile) always run
+# `configure` first via their recursive make, so hooking the deferred
+# toolchain install there reaches every wasm build without touching
+# parse-time evaluation.
+configure: venv platform extension_version wasm_toolchain
 
 # DuckDB CI sets CC=gcc/CXX=g++ for windows_amd64_mingw but the Rust default
 # target on Windows is x86_64-pc-windows-msvc (MSVC linker).  cc-rs picks up
@@ -63,6 +92,23 @@ release: build_extension_library_release build_extension_with_metadata_release
 test: test_debug
 test_debug: generate_fixtures test_extension_debug
 test_release: generate_fixtures test_extension_release
+
+# Run AnnData and DataTree regressions in the normal test targets (including CI).
+# Honor the shared runner's skip flag: PyPI DuckDB cannot load every build ABI
+# (notably MinGW), and some Linux builds are tested separately inside Docker.
+# Use the configured Python environment when uv is unavailable, as for fixtures.
+ifneq ($(SKIP_TESTS),1)
+test_debug test_release:
+	@if command -v uv >/dev/null 2>&1; then \
+		uv run --with pytest --with 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' \
+			pytest test/test_anndata_edge_cases.py test/test_datatree_compatibility.py \
+			--extension build/$(patsubst test_%,%,$@)/$(EXTENSION_NAME).duckdb_extension -v; \
+	else \
+		$(PYTHON_VENV_BIN) -m pip install --quiet pytest && \
+		$(PYTHON_VENV_BIN) -m pytest test/test_anndata_edge_cases.py test/test_datatree_compatibility.py \
+			--extension build/$(patsubst test_%,%,$@)/$(EXTENSION_NAME).duckdb_extension -v; \
+	fi
+endif
 
 # HTTP integration tests. Build the extension first (make debug / make release).
 # pytest runs via uv, so no venv setup is needed; duckdb is pinned to the target
@@ -107,11 +153,16 @@ render-community-descriptor:
 	python3 scripts/render_community_descriptor.py --ref "$(REF)" $(if $(REF_NEXT),--ref-next "$(REF_NEXT)",) --out build/community-extensions/extensions/zarr/description.yml
 	python3 scripts/check_release_ready.py --description-path build/community-extensions/extensions/zarr/description.yml --strict-community-ref
 
+# Compare the extension's AnnData tables with anndata.read_zarr (design decision 9).
+# Build the extension and the fixtures first (make debug generate_fixtures).
+check_anndata:
+	uv run scripts/check_anndata_tables.py build/debug/$(EXTENSION_NAME).duckdb_extension
+
 generate_fixtures:
 	@if command -v uv >/dev/null 2>&1; then \
 		uv run scripts/generate_fixtures.py; \
 	elif [ -f "$(PYTHON_VENV_BIN)" ]; then \
-		$(PYTHON_VENV_BIN) -m pip install --quiet "xarray" "zarr>=3.0.0" numpy scipy h5netcdf h5py pooch; \
+		$(PYTHON_VENV_BIN) -m pip install --quiet "xarray" "zarr>=3.0.0" numpy scipy h5netcdf h5py pooch anndata; \
 		$(PYTHON_VENV_BIN) scripts/generate_fixtures.py; \
 	else \
 		echo "Error: neither uv nor configure/venv found. Run 'make configure' or install uv." >&2; \

@@ -206,6 +206,31 @@ pub fn fill_element(
         ColumnEncoding::Plain => {
             fill_scalar_element_pub(vector, bytes, dtype, sentinel, flat_row, elem_size, dst);
         }
+        ColumnEncoding::Categorical(categories) => {
+            let code = read_int_as_i64_pub(bytes, dtype, flat_row * elem_size);
+            // A negative code is a missing value (pandas writes -1).
+            if code < 0 || code as usize >= categories.len() {
+                vector.set_null(dst);
+                return;
+            }
+            let idx = code as usize;
+            // An ENUM vector holds the member index, in the narrowest unsigned
+            // type that fits the member count (DuckDB's EnumTypeInfo::DictType).
+            if categories.enum_members().is_some() {
+                let n = categories.len();
+                unsafe {
+                    if n <= u8::MAX as usize {
+                        *vector.as_mut_ptr::<u8>().add(dst) = idx as u8;
+                    } else if n <= u16::MAX as usize {
+                        *vector.as_mut_ptr::<u16>().add(dst) = idx as u16;
+                    } else {
+                        *vector.as_mut_ptr::<u32>().add(dst) = idx as u32;
+                    }
+                }
+                return;
+            }
+            categories.values.data.write_element(vector, idx, dst);
+        }
         ColumnEncoding::PackedInt {
             scale_factor,
             add_offset,
