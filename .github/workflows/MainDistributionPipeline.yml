@@ -45,4 +45,4 @@ jobs:
       ci_tools_version: v1.5-variegata
       extension_name: zarr
       extra_toolchains: rust;python3
-      exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads;linux_amd64_musl'
+      exclude_archs: 'linux_amd64_musl'
