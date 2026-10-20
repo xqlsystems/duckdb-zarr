@@ -31,10 +31,12 @@ include extension-ci-tools/makefiles/c_api_extensions/rust.Makefile
 # emscripten target (rustup is a no-op when it is already present).
 ifneq ($(filter wasm_%,$(DUCKDB_PLATFORM)),)
 WASM_RUST_TOOLCHAIN := stable
-WASM_RUST_TOOLCHAIN_INSTALL_STATUS := $(shell rustup toolchain install $(WASM_RUST_TOOLCHAIN) --profile minimal --target wasm32-unknown-emscripten 1>&2; printf '%s' $$?)
-ifneq ($(WASM_RUST_TOOLCHAIN_INSTALL_STATUS),0)
-$(error rustup toolchain install $(WASM_RUST_TOOLCHAIN) failed with status $(WASM_RUST_TOOLCHAIN_INSTALL_STATUS))
-endif
+# Defer the toolchain install check to a build prerequisite (not parse time):
+# otherwise `make clean` on a wasm platform would fail when rustup or the
+# network is unavailable, and cleanup must not need a Rust toolchain.
+WASM_RUST_TOOLCHAIN_INSTALL := rustup toolchain install $(WASM_RUST_TOOLCHAIN) --profile minimal --target wasm32-unknown-emscripten
+wasm_toolchain:
+	@$(WASM_RUST_TOOLCHAIN_INSTALL) 1>&2
 export RUSTUP_TOOLCHAIN := $(WASM_RUST_TOOLCHAIN)
 # emsdk 3.1.71's emcc turns every entry in the linked wasm's target_features section
 # into a `wasm-opt --enable-*` flag, and its binaryen rejects the newer features
@@ -59,9 +61,17 @@ WASM_LD_FEATURES := $(WASM_LD_FEATURES),atomics
 export EMCC_CFLAGS := $(EMCC_CFLAGS) -pthread -sSHARED_MEMORY=1
 endif
 export EMCC_CFLAGS := $(EMCC_CFLAGS) -Xlinker --no-check-features -Xlinker --features=$(WASM_LD_FEATURES)
+else
+# No toolchain step is needed off wasm; stub the prerequisite so `configure`
+# still parses on native platforms.
+wasm_toolchain:
 endif
 
-configure: venv platform extension_version
+# The wasm build goals (`wasm_mvp` etc. from base.Makefile) always run
+# `configure` first via their recursive make, so hooking the deferred
+# toolchain install there reaches every wasm build without touching
+# parse-time evaluation.
+configure: venv platform extension_version wasm_toolchain
 
 # DuckDB CI sets CC=gcc/CXX=g++ for windows_amd64_mingw but the Rust default
 # target on Windows is x86_64-pc-windows-msvc (MSVC linker).  cc-rs picks up
