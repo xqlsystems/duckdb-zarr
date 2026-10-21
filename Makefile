@@ -1,4 +1,4 @@
-.PHONY: check_anndata clean clean_all clippy fmt fmt-check generate_fixtures lint release-check render-community-descriptor test_http test_http_debug test_http_release test_http_real test-rust
+.PHONY: check_anndata clean clean_all clippy fmt fmt-check generate_fixtures lint release-check render-community-descriptor test_http test_http_debug test_http_release test_http_real test-rust wasm_toolchain
 
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
@@ -9,7 +9,7 @@ EXTENSION_NAME=zarr
 USE_UNSTABLE_C_API=1
 
 # Target DuckDB version
-TARGET_DUCKDB_VERSION=v1.5.5
+TARGET_DUCKDB_VERSION=v1.5.6
 
 # The sqllogictest runner (pip `duckdb`) must match the build pin exactly:
 # USE_UNSTABLE_C_API=1 makes the loader reject an extension built for a
@@ -26,7 +26,52 @@ all: configure debug
 include extension-ci-tools/makefiles/c_api_extensions/base.Makefile
 include extension-ci-tools/makefiles/c_api_extensions/rust.Makefile
 
-configure: venv platform extension_version
+# extension-ci-tools' wasm job installs Rust 1.86.0, but zarrs needs a newer
+# rustc. For wasm platforms only, install and select the stable toolchain with the
+# emscripten target (rustup is a no-op when it is already present).
+ifneq ($(filter wasm_%,$(DUCKDB_PLATFORM)),)
+WASM_RUST_TOOLCHAIN := stable
+# Defer the toolchain install check to a build prerequisite (not parse time):
+# otherwise `make clean` on a wasm platform would fail when rustup or the
+# network is unavailable, and cleanup must not need a Rust toolchain.
+WASM_RUST_TOOLCHAIN_INSTALL := rustup toolchain install $(WASM_RUST_TOOLCHAIN) --profile minimal --target wasm32-unknown-emscripten
+wasm_toolchain:
+	@$(WASM_RUST_TOOLCHAIN_INSTALL) 1>&2
+export RUSTUP_TOOLCHAIN := $(WASM_RUST_TOOLCHAIN)
+# emsdk 3.1.71's emcc turns every entry in the linked wasm's target_features section
+# into a `wasm-opt --enable-*` flag, and its binaryen rejects the newer features
+# (bulk-memory-opt, call-indirect-overlong) that recent rustc/LLVM objects carry.
+# Pin the output feature set at link time (and skip wasm-ld's check that every
+# object stays inside it: the extra features are subsets of those listed) instead of bumping emsdk, which must
+# match the emscripten version duckdb-wasm itself was built with.
+WASM_LD_FEATURES := bulk-memory,exception-handling,multivalue,mutable-globals,nontrapping-fptoint,reference-types,sign-ext
+
+# extension-ci-tools' `wasm_threads` target (duckdb/extension-ci-tools#391) never
+# passes -DUSE_WASM_THREADS=1 through to emcc's post-build link, so the side
+# module gets non-shared memory and fails to load in duckdb-wasm's threaded
+# runtime. emcc reads EMCC_CFLAGS at link time too, so for wasm_threads declare
+# shared memory here: the base.Makefile `emcc ... -sSIDE_MODULE=2` link line
+# picks it up without forking the toolchain. `atomics` (binaryen's name for the
+# threads feature) must join the pinned feature list as well — emscripten asserts
+# `--enable-threads` is present in BINARYEN_FEATURES when SHARED_MEMORY is set,
+# and that list is derived from the wasm-ld features section pinned above. The
+# wasm_mvp/wasm_eh builds are unaffected (they target the non-threaded runtimes).
+ifeq ($(DUCKDB_PLATFORM),wasm_threads)
+WASM_LD_FEATURES := $(WASM_LD_FEATURES),atomics
+export EMCC_CFLAGS := $(EMCC_CFLAGS) -pthread -sSHARED_MEMORY=1
+endif
+export EMCC_CFLAGS := $(EMCC_CFLAGS) -Xlinker --no-check-features -Xlinker --features=$(WASM_LD_FEATURES)
+else
+# No toolchain step is needed off wasm; stub the prerequisite so `configure`
+# still parses on native platforms.
+wasm_toolchain:
+endif
+
+# The wasm build goals (`wasm_mvp` etc. from base.Makefile) always run
+# `configure` first via their recursive make, so hooking the deferred
+# toolchain install there reaches every wasm build without touching
+# parse-time evaluation.
+configure: venv platform extension_version wasm_toolchain
 
 # DuckDB CI sets CC=gcc/CXX=g++ for windows_amd64_mingw but the Rust default
 # target on Windows is x86_64-pc-windows-msvc (MSVC linker).  cc-rs picks up

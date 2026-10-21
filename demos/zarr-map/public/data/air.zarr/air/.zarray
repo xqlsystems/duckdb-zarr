@@ -1,0 +1,22 @@
+{
+  "shape": [
+    40,
+    25,
+    53
+  ],
+  "chunks": [
+    20,
+    25,
+    53
+  ],
+  "dtype": "<f8",
+  "fill_value": "NaN",
+  "order": "C",
+  "filters": null,
+  "dimension_separator": ".",
+  "compressor": {
+    "id": "gzip",
+    "level": 1
+  },
+  "zarr_format": 2
+}

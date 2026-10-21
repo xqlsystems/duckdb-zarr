@@ -16,7 +16,7 @@ A design for `duckdb-zarr` — a Rust DuckDB extension that lets users query Zar
 - Automatic relational joins across nested groups. Each Zarr group is a node with its own tables (decision 8), and each `read_zarr` scan reads one dimension group of one node, or one array selected by store-relative path.
 - Replacing xarray. Users who need lazy array operations should keep using xarray; we just want a SQL handle on the same data.
 - Custom codecs beyond what `zarrs` already supports.
-- WebAssembly as a distributed platform. The extension compiles for `wasm32-unknown-emscripten` and loads in duckdb-wasm (`make wasm_mvp`): every store is read through DuckDB's own FileSystem (`DuckDbStore`) because `zarrs_http` depends on `reqwest::blocking`, and `zarrs`' rayon work runs on a one-thread pool built at extension init. The wasm platforms stay in `excluded_platforms` until CI builds and tests them. Local (non-URL) store paths are not supported on wasm: array listing for local stores walks the host filesystem.
+- WebAssembly as a distributed platform. The extension compiles for `wasm32-unknown-emscripten` and loads in duckdb-wasm (`make wasm_mvp`): every store is read through DuckDB's own FileSystem (`DuckDbStore`) because `zarrs_http` depends on `reqwest::blocking`, and `zarrs`' rayon work runs on a one-thread pool built at extension init. Local (non-URL) store paths are not supported on wasm: array listing for local stores walks the host filesystem.
 
 ## Future integration boundaries (deferred)
 
@@ -408,6 +408,8 @@ Because the rest of the reader is built around `ColumnEncoding`/byte-offset math
 - `ColumnValues` (a trait with `FixedValues` and `StringValues` implementations, shared as `Arc<dyn ColumnValues>`) replaces the bare `Vec<u8>` used for a coordinate array's pre-loaded values and a data variable's per-chunk decode buffer. Each implementation writes its own elements into a DuckDB vector, so both paths carry either representation without branching on the dtype.
 - zarrs pads a boundary chunk's *element count* to the full nominal `chunk_shape` for every dtype uniformly (fill-value elements past the array's logical bound), so the existing `zarrs_flat` physical-offset math indexes correctly into a `Vec<String>` with no changes. [string_dtype.test](../test/sql/string_dtype.test) (`string_var_v3_2d`) and [ragged_chunks.test](../test/sql/ragged_chunks.test) cover ragged boundary chunks for 1-D and 2-D string and float arrays.
 - No NULL masking applies: `FillSentinel` only represents numeric sentinels (`Float`/`Int`/`UInt`, see [meta.rs](../crates/zarr-core/src/meta.rs)), so a `_FillValue`/`missing_value` attr on a string variable doesn't parse into a sentinel and every decoded string (including zarrs' own empty-string fill-value substitution) is written through as-is.
+
+`ColumnEncoding::PackedInt` never applies to strings (its trigger condition requires an integer on-disk dtype), and CF-time detection explicitly skips them (a string array carrying a `units` attr is not a time axis), so neither decoding ever intersects string decoding.
 
 `ColumnEncoding::PackedInt` never applies to strings (its trigger condition requires an integer on-disk dtype), and CF-time detection explicitly skips them (a string array carrying a `units` attr is not a time axis), so neither decoding ever intersects string decoding.
 

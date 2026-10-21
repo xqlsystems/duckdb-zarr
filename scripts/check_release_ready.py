@@ -136,7 +136,7 @@ def main() -> int:
         "extension.requires_toolchains": r'^\s*requires_toolchains:\s*["\']rust;python3["\']\s*$',
         "extension.excluded_platforms": (
             r'^\s*excluded_platforms:\s*["\']'
-            r"wasm_mvp;wasm_eh;wasm_threads;linux_amd64_musl"
+            r"linux_amd64_musl"
             r'["\']\s*$'
         ),
     }
