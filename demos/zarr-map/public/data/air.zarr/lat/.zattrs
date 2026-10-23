@@ -1,0 +1,9 @@
+{
+  "standard_name": "latitude",
+  "long_name": "Latitude",
+  "units": "degrees_north",
+  "axis": "Y",
+  "_ARRAY_DIMENSIONS": [
+    "lat"
+  ]
+}

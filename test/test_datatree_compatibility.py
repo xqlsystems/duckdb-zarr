@@ -1,5 +1,9 @@
 """Keep the generic DataTree contract intact alongside AnnData support."""
 
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
+
 import anndata as ad
 import duckdb
 import numpy as np
@@ -82,6 +86,55 @@ def test_same_shaped_groups_remain_separate(tmp_path, extension_path, zarr_forma
             assert con.execute(
                 f'SELECT sample, signal FROM tree."{schema}".sample ORDER BY sample',
             ).fetchall() == list(zip([10, 20, 30], values))
+
+
+@pytest.fixture(params=[2, 3], ids=["zarr-v2", "zarr-v3"])
+def unconsolidated_http_store(tmp_path, request):
+    """Serve a real Zarr store that cannot be enumerated remotely."""
+    store = tmp_path / "unconsolidated.zarr"
+    xr.Dataset({"signal": ("x", [1, 2, 3])}).to_zarr(
+        store, group="measurements", zarr_format=request.param, consolidated=False,
+    )
+    handler = partial(SimpleHTTPRequestHandler, directory=str(tmp_path))
+    with ThreadingHTTPServer(("127.0.0.1", 0), handler) as server:
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{server.server_port}/{store.name}"
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+
+def test_direct_array_catalog_without_consolidation(extension_path, unconsolidated_http_store):
+    """A directly readable array must also be available in the table catalog."""
+    with duckdb.connect(config={"allow_unsigned_extensions": True}) as con:
+        con.load_extension(str(extension_path))
+        path = unconsolidated_http_store
+        assert con.execute(
+            "SELECT * FROM read_zarr(?, array_path := 'measurements/signal') ORDER BY x",
+            [path],
+        ).fetchall() == [(0, 1), (1, 2), (2, 3)]
+        assert con.execute(
+            "SELECT group_path, schema_name, table_name, dims, shape, data_vars "
+            "FROM read_zarr_tables(?, array_path := 'measurements/signal')", [path],
+        ).fetchall() == [
+            ("/measurements", "measurements", None, ["x"], [3], ["measurements/signal"]),
+        ]
+
+
+@pytest.mark.parametrize("selector", ["", ", group_path := 'measurements'"])
+def test_remote_catalog_listing_still_requires_consolidation(
+    extension_path, unconsolidated_http_store, selector,
+):
+    """Listing a store or node must not hide the missing-consolidation error."""
+    with duckdb.connect(config={"allow_unsigned_extensions": True}) as con:
+        con.load_extension(str(extension_path))
+        with pytest.raises(duckdb.Error, match="consolidated"):
+            con.execute(
+                f"SELECT * FROM read_zarr_tables(?{selector})", [unconsolidated_http_store],
+            ).fetchall()
 
 
 @pytest.mark.parametrize("existing", ["memory", "file", "default", "case-folded"])

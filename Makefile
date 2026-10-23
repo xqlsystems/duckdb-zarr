@@ -1,4 +1,4 @@
-.PHONY: check_anndata clean clean_all clippy fmt fmt-check generate_fixtures lint release-check render-community-descriptor test_http test_http_debug test_http_release test_http_real
+.PHONY: check_anndata clean clean_all clippy fmt fmt-check generate_fixtures lint release-check render-community-descriptor test_http test_http_debug test_http_release test_http_real test-rust wasm_toolchain
 
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
@@ -101,11 +101,11 @@ ifneq ($(SKIP_TESTS),1)
 test_debug test_release:
 	@if command -v uv >/dev/null 2>&1; then \
 		uv run --with pytest --with 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' \
-			pytest test/test_anndata_edge_cases.py test/test_datatree_compatibility.py \
+			pytest test/test_anndata_edge_cases.py test/test_datatree_compatibility.py test/test_bounds_integration.py \
 			--extension build/$(patsubst test_%,%,$@)/$(EXTENSION_NAME).duckdb_extension -v; \
 	else \
 		$(PYTHON_VENV_BIN) -m pip install --quiet pytest && \
-		$(PYTHON_VENV_BIN) -m pytest test/test_anndata_edge_cases.py test/test_datatree_compatibility.py \
+		$(PYTHON_VENV_BIN) -m pytest test/test_anndata_edge_cases.py test/test_datatree_compatibility.py test/test_bounds_integration.py \
 			--extension build/$(patsubst test_%,%,$@)/$(EXTENSION_NAME).duckdb_extension -v; \
 	fi
 endif
@@ -139,7 +139,10 @@ fmt-check:
 	cargo fmt --all -- --check
 
 clippy:
-	cargo clippy --lib --all-features -- -D warnings
+	cargo clippy --workspace --lib --all-features -- -D warnings
+
+test-rust:
+	cargo test --workspace
 
 lint: fmt-check clippy
 

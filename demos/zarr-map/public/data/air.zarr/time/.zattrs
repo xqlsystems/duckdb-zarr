@@ -1,0 +1,9 @@
+{
+  "standard_name": "time",
+  "long_name": "Time",
+  "units": "hours since 2013-01-01 00:00:00",
+  "calendar": "proleptic_gregorian",
+  "_ARRAY_DIMENSIONS": [
+    "time"
+  ]
+}
