@@ -7,7 +7,7 @@ use crate::list_columns::{ubigint_list, varchar_list, write_string_lists, write_
 use crate::selection::Selection;
 use crate::zarr_reader::anndata;
 use crate::zarr_reader::meta::{
-    array_path_table, extract_file_system, list_array_names, open_store,
+    array_path_table, extract_file_system, is_remote_scheme, list_array_names, open_store,
 };
 use crate::zarr_reader::tree::{self, StoreTree};
 use crate::zarr_reader::types::Table;
@@ -132,8 +132,13 @@ pub(crate) fn catalog_rows(
     let fs = unsafe { extract_file_system(bind) };
     let store = open_store(store_path, Some(fs))?;
     let array_names = match &selection {
-        // Reading one known array does not require a remote store listing.
-        Selection::Array(_) => list_array_names(store_path, &store).unwrap_or_default(),
+        // Reading one known array does not require a remote store listing, but
+        // only a remote store's missing consolidated metadata should be
+        // swallowed; a local store's I/O or parse failure must propagate.
+        Selection::Array(_) if is_remote_scheme(store_path) => {
+            list_array_names(store_path, &store).unwrap_or_default()
+        }
+        Selection::Array(_) => list_array_names(store_path, &store)?,
         Selection::Node(_) | Selection::Store => list_array_names(store_path, &store)?,
     };
     let row = |node: &str, table_name: Option<String>, table: &Table| TableRow {

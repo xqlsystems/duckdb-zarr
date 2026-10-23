@@ -549,7 +549,7 @@ fn parse_dims_param(value: Value) -> Result<Vec<String>, Box<dyn std::error::Err
 
 /// Parse `bounds := [[dim, lo, hi], ...]`; a NULL `lo`/`hi` leaves that side open.
 fn parse_bounds_param(value: Value) -> Result<Vec<RawBound>, Box<dyn std::error::Error>> {
-    const USAGE: &str = "bounds must be a list of [dim, lo, hi] entries, e.g. bounds=[['time','2022-07-01','2022-07-02'],['latitude',30,60]]";
+    const USAGE: &str = "bounds must be a list of [dim, lo, hi] entries with string or NULL endpoints, e.g. bounds=[['time','2022-07-01','2022-07-02'],['latitude','30','60']]";
     let entries = value.to_list().ok_or(USAGE)?;
     entries
         .iter()

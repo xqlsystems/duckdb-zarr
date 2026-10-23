@@ -243,7 +243,7 @@ The code, the docs and the error messages use these terms. Older sections of thi
               └─────────────────────┘
 ```
 
-The root crate follows DuckDB extension conventions: one module per SQL entry point and a thin extension entrypoint, with `duckdb` pinned to `=1.10505.0` in Cargo.toml.
+The root crate follows DuckDB extension conventions: one module per SQL entry point and a thin extension entrypoint, with `duckdb` pinned to `=1.10506.0` in Cargo.toml.
 
 Engine-independent reading lives in `crates/zarr-core`: array metadata, DataTree
 and AnnData layouts, sparse matrices, decoded values, CF-time handling, and
@@ -408,8 +408,6 @@ Because the rest of the reader is built around `ColumnEncoding`/byte-offset math
 - `ColumnValues` (a trait with `FixedValues` and `StringValues` implementations, shared as `Arc<dyn ColumnValues>`) replaces the bare `Vec<u8>` used for a coordinate array's pre-loaded values and a data variable's per-chunk decode buffer. Each implementation writes its own elements into a DuckDB vector, so both paths carry either representation without branching on the dtype.
 - zarrs pads a boundary chunk's *element count* to the full nominal `chunk_shape` for every dtype uniformly (fill-value elements past the array's logical bound), so the existing `zarrs_flat` physical-offset math indexes correctly into a `Vec<String>` with no changes. [string_dtype.test](../test/sql/string_dtype.test) (`string_var_v3_2d`) and [ragged_chunks.test](../test/sql/ragged_chunks.test) cover ragged boundary chunks for 1-D and 2-D string and float arrays.
 - No NULL masking applies: `FillSentinel` only represents numeric sentinels (`Float`/`Int`/`UInt`, see [meta.rs](../crates/zarr-core/src/meta.rs)), so a `_FillValue`/`missing_value` attr on a string variable doesn't parse into a sentinel and every decoded string (including zarrs' own empty-string fill-value substitution) is written through as-is.
-
-`ColumnEncoding::PackedInt` never applies to strings (its trigger condition requires an integer on-disk dtype), and CF-time detection explicitly skips them (a string array carrying a `units` attr is not a time axis), so neither decoding ever intersects string decoding.
 
 `ColumnEncoding::PackedInt` never applies to strings (its trigger condition requires an integer on-disk dtype), and CF-time detection explicitly skips them (a string array carrying a `units` attr is not a time axis), so neither decoding ever intersects string decoding.
 
