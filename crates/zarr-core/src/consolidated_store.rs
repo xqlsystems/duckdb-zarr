@@ -5,7 +5,7 @@ use zarrs::storage::{
     StoreKey,
 };
 
-use super::meta::ZarrStore;
+use crate::meta::ZarrStore;
 
 /// Wraps a remote store with an in-memory cache of its consolidated metadata.
 ///

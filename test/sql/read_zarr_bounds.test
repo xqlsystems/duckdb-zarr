@@ -1,0 +1,190 @@
+# name: test/sql/read_zarr_bounds.test
+# description: read_zarr(bounds=...) coordinate-range pruning and row filtering
+# group: [zarr]
+
+require zarr
+
+# bounds_grid: time 6 hourly steps (chunks of 2), lat 5 descending 60..-60 (chunks of 2),
+# lon 4 values 0,90,180,270 (chunks of 3). value = 100*t + 10*lat_i + lon_i.
+
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid.zarr');
+----
+120
+
+# ── exactly on a chunk seam: hour 2 starts chunk 1, hour 1 ends chunk 0 ─────
+
+query III
+SELECT COUNT(*), MIN(value), MAX(value) FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid.zarr',
+  bounds=[['time', '2020-01-01 02:00:00', '2020-01-01 02:00:00']]);
+----
+20	200.0	243.0
+
+query III
+SELECT COUNT(*), MIN(value), MAX(value) FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid.zarr',
+  bounds=[['time', '2020-01-01 01:00:00', '2020-01-01 01:00:00']]);
+----
+20	100.0	143.0
+
+# A range spanning the seam includes both chunks, each row once.
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid.zarr',
+  bounds=[['time', '2020-01-01 01:00:00', '2020-01-01 02:00:00']]);
+----
+40
+
+# ISO 'T' form and a date-only bound.
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid.zarr',
+  bounds=[['time', '2020-01-01T03:00:00', NULL]]);
+----
+60
+
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid.zarr',
+  bounds=[['time', '2020-01-01', '2020-01-01']]);
+----
+20
+
+# Endpoints are strings; numeric values can be cast.
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid.zarr',
+  bounds=[['lat', CAST(-30 AS VARCHAR), CAST(30 AS VARCHAR)]]);
+----
+72
+
+# ── descending latitude, inclusive both ends ────────────────────────────────
+
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid.zarr',
+  bounds=[['lat', '-30', '30']]);
+----
+72
+
+query I
+SELECT COUNT(DISTINCT lat) FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid.zarr',
+  bounds=[['lat', '-30', '30']]);
+----
+3
+
+# One-sided bounds.
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid.zarr',
+  bounds=[['lon', '180', NULL]]);
+----
+60
+
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid.zarr',
+  bounds=[['lat', NULL, '0']]);
+----
+72
+
+# ── empty results ───────────────────────────────────────────────────────────
+
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid.zarr',
+  bounds=[['lat', '100', NULL]]);
+----
+0
+
+# Inverted range.
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid.zarr',
+  bounds=[['lat', '30', '-30']]);
+----
+0
+
+# Between two coordinate values.
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid.zarr',
+  bounds=[['lon', '10', '80']]);
+----
+0
+
+# Before the first timestamp.
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid.zarr',
+  bounds=[['time', '2019-01-01', '2019-12-31']]);
+----
+0
+
+# ── several dimensions at once ──────────────────────────────────────────────
+
+query IR
+SELECT COUNT(*), SUM(value) FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid.zarr',
+  bounds=[['time', '2020-01-01 02:00:00', '2020-01-01 03:00:00'], ['lat', '0', '0'], ['lon', '90', '180']]);
+----
+4	1086.0
+
+# Same rows as an ordinary WHERE over the full scan.
+query I
+SELECT (SELECT SUM(value) FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid.zarr',
+          bounds=[['time', '2020-01-01 01:00:00', '2020-01-01 04:00:00'], ['lat', '-30', '30'], ['lon', '90', '270']]))
+     = (SELECT SUM(value) FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid.zarr')
+          WHERE time BETWEEN TIMESTAMP '2020-01-01 01:00:00' AND TIMESTAMP '2020-01-01 04:00:00'
+            AND lat BETWEEN -30 AND 30 AND lon BETWEEN 90 AND 270);
+----
+true
+
+# Output spans several vectors: the row cursor must resume correctly after skips.
+query II
+SELECT COUNT(*), COUNT(DISTINCT value) FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid.zarr',
+  bounds=[['lon', '90', '180']]);
+----
+60	60
+
+# ── decode_times=false: the raw hour offsets are numbers ────────────────────
+
+query I
+SELECT COUNT(*) FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid.zarr',
+  decode_times=false, bounds=[['time', '2', '3']]);
+----
+40
+
+# COUNT(value) so the data variable is projected (and therefore decoded).
+# ── pruned chunks are never read ────────────────────────────────────────────
+# The value chunk for hours 2-3 / lat chunk 0 / lon chunk 0 is garbage on disk.
+
+statement error
+SELECT COUNT(value) FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid_poisoned.zarr');
+----
+
+query I
+SELECT COUNT(value) FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid_poisoned.zarr',
+  bounds=[['time', '2020-01-01 04:00:00', NULL]]);
+----
+40
+
+query I
+SELECT COUNT(value) FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid_poisoned.zarr',
+  bounds=[['lat', '-60', '-30']]);
+----
+48
+
+# ── errors ──────────────────────────────────────────────────────────────────
+
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid.zarr', bounds=[['depth', '0', '1']]);
+----
+no dimension 'depth'
+
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid.zarr', bounds=[['time', 'yesterday', NULL]]);
+----
+cannot parse 'yesterday' as a timestamp
+
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid.zarr', bounds=[['lat', 'north', NULL]]);
+----
+is not a number
+
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid.zarr', bounds=[['lat', '0']]);
+----
+bounds must be a list of [dim, lo, hi] entries
+
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid.zarr', bounds=[['lat', '0', '1'], ['lat', '2', '3']]);
+----
+listed more than once

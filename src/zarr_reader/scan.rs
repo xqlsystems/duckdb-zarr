@@ -1,6 +1,10 @@
 use duckdb::core::FlatVector;
 
-use super::types::{ColumnEncoding, FillSentinel, ZarrDtype};
+use zarr_core::decode::{
+    matches_float_sentinel, matches_int_sentinel, read_as_f64_pub, read_int_as_i64_pub,
+};
+
+use super::types::{ColumnEncoding, FillSentinel, WriteElement, ZarrDtype};
 
 /// Copy one scalar element from raw native-endian bytes into a DuckDB vector slot,
 /// applying NULL masking via the sentinel.
@@ -48,62 +52,6 @@ pub fn fill_string_element_pub(
 ) {
     use duckdb::core::Inserter;
     vector.insert(dst_idx, strings[src_idx].as_str());
-}
-
-/// Read any integer dtype from raw bytes at `start` as i64 (for packed-int decoding).
-pub fn read_int_as_i64_pub(bytes: &[u8], dtype: &ZarrDtype, start: usize) -> i64 {
-    match dtype {
-        ZarrDtype::Int8 => bytes[start] as i8 as i64,
-        ZarrDtype::Int16 => i16::from_ne_bytes(bytes[start..start + 2].try_into().unwrap()) as i64,
-        ZarrDtype::Int32 => i32::from_ne_bytes(bytes[start..start + 4].try_into().unwrap()) as i64,
-        ZarrDtype::Int64 => i64::from_ne_bytes(bytes[start..start + 8].try_into().unwrap()),
-        ZarrDtype::UInt8 => bytes[start] as i64,
-        ZarrDtype::UInt16 => u16::from_ne_bytes(bytes[start..start + 2].try_into().unwrap()) as i64,
-        ZarrDtype::UInt32 => u32::from_ne_bytes(bytes[start..start + 4].try_into().unwrap()) as i64,
-        // Bit-preserving reinterpret, not a numeric conversion: values above i64::MAX
-        // land negative here. Callers that do arithmetic on the result (fill_element)
-        // must special-case dtype == UInt64 and recover the true magnitude via
-        // `raw as u64` before using it — this cast alone would silently flip the sign.
-        ZarrDtype::UInt64 => u64::from_ne_bytes(bytes[start..start + 8].try_into().unwrap()) as i64,
-        _ => 0,
-    }
-}
-
-/// Read any numeric dtype from raw bytes at `start` as f64 (for CF-time decoding).
-/// Integers widen losslessly up to 2^53; beyond that the caller should use the
-/// integer path, which CF-time decoding does for every integer dtype.
-pub fn read_as_f64_pub(bytes: &[u8], dtype: &ZarrDtype, start: usize) -> f64 {
-    match dtype {
-        ZarrDtype::Float32 => {
-            f32::from_ne_bytes(bytes[start..start + 4].try_into().unwrap()) as f64
-        }
-        ZarrDtype::Float64 => f64::from_ne_bytes(bytes[start..start + 8].try_into().unwrap()),
-        _ => read_int_as_i64_pub(bytes, dtype, start) as f64,
-    }
-}
-
-/// Whether a raw integer value equals the column's active NULL sentinel.
-pub fn matches_int_sentinel(raw: i64, sentinel: &Option<FillSentinel>) -> bool {
-    match sentinel {
-        Some(FillSentinel::Int(v)) => raw == *v,
-        Some(FillSentinel::UInt(v)) => (raw as u64) == *v,
-        _ => false,
-    }
-}
-
-/// Whether a raw float value equals the column's active NULL sentinel (CF §2.5.1:
-/// exact equality, with `NaN` compared by `is_nan`).
-pub fn matches_float_sentinel(raw: f64, sentinel: &Option<FillSentinel>) -> bool {
-    match sentinel {
-        Some(FillSentinel::Float(v)) => {
-            if v.is_nan() {
-                raw.is_nan()
-            } else {
-                raw == *v
-            }
-        }
-        _ => false,
-    }
 }
 
 // ── Null-check helpers ────────────────────────────────────────────────────────

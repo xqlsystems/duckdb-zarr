@@ -8,15 +8,16 @@ use zarrs::array::ArraySubset;
 
 use crate::selection::Selection;
 use crate::zarr_reader::anndata;
+use crate::zarr_reader::bounds::{chunks_with_kept, index_mask, parse_endpoint, RawBound};
 use crate::zarr_reader::meta::{
-    array_path_table, build_column_defs, build_work_units, extract_file_system, first_chunk_shape,
-    load_coord_array, open_array, open_store, ZarrArray, ZarrStore,
+    array_path_table, build_column_defs, build_work_units_in, extract_file_system,
+    first_chunk_shape, load_coord_array, open_array, open_store, ZarrArray, ZarrStore,
 };
 use crate::zarr_reader::sparse::{decode_block, plan_blocks, MajorRange, SparseBlock, SparseInput};
 use crate::zarr_reader::tree::{self, StoreTree};
 use crate::zarr_reader::types::{
-    ColumnDef, CoordArray, FixedValues, MaskedValues, SharedColumnValues, StringValues, Table,
-    WorkUnit, ZarrDtype,
+    ColumnDef, ColumnEncoding, CoordArray, DuckDbType, FixedValues, MaskedValues,
+    SharedColumnValues, StringValues, Table, WorkUnit, WriteElement, ZarrDtype,
 };
 
 // ---------------------------------------------------------------------------
@@ -39,6 +40,8 @@ pub struct ReadZarrBind {
     /// Sparse matrices, keyed by variable name.
     pub sparse: HashMap<String, SparseInput>,
     pub plan: ScanPlan,
+    /// Per dimension: indices that survive bounds= (None means unrestricted).
+    pub index_masks: Vec<Option<Vec<bool>>>,
     pub next_unit: AtomicUsize,
 }
 
@@ -73,6 +76,8 @@ pub struct CellScan {
     /// The outer axis of the work-unit order. Only matrices with this major
     /// axis use `sparse_ranges`.
     pub cached_major_axis: usize,
+    /// Number of retained minor-axis chunks that consume one cached range.
+    pub cached_range_uses: u64,
 }
 
 impl ReadZarrBind {
@@ -175,6 +180,12 @@ impl VTab for ReadZarrVTab {
             .map(|value| value.is_null() || value.to_bool())
             .unwrap_or(true);
 
+        let bounds: Vec<RawBound> = bind
+            .get_named_parameter("bounds")
+            .map(parse_bounds_param)
+            .transpose()?
+            .unwrap_or_default();
+
         let fs = unsafe { extract_file_system(bind) };
         let store = open_store(&store_path, Some(fs))?;
         let node = match selection {
@@ -197,7 +208,14 @@ impl VTab for ReadZarrVTab {
                         .into());
                     }
                 }
-                return finish_bind(bind, store, &table, decode_times, ColumnNames::ArrayPath);
+                return finish_bind(
+                    bind,
+                    store,
+                    &table,
+                    decode_times,
+                    ColumnNames::ArrayPath,
+                    &bounds,
+                );
             }
             // One node (Zarr group) of the store, the root unless group_path=
             // says otherwise, as in xarray.open_zarr (design decision 8).
@@ -264,7 +282,14 @@ impl VTab for ReadZarrVTab {
             )
             .into());
         }
-        finish_bind(bind, store, table, decode_times, ColumnNames::Basename)
+        finish_bind(
+            bind,
+            store,
+            table,
+            decode_times,
+            ColumnNames::Basename,
+            &bounds,
+        )
     }
 
     fn supports_pushdown() -> bool {
@@ -366,7 +391,7 @@ impl VTab for ReadZarrVTab {
             let cells = match &bind.plan {
                 ScanPlan::Cells(cells) => cells,
                 &ScanPlan::StoredEntries { major_axis, .. } => {
-                    fill_sparse_rows(
+                    let (consumed, written) = fill_sparse_rows(
                         bind,
                         major_axis,
                         &state.current_sparse,
@@ -376,8 +401,8 @@ impl VTab for ReadZarrVTab {
                         can_write,
                         projected,
                     );
-                    state.row_cursor += can_write;
-                    rows_written += can_write;
+                    state.row_cursor += consumed;
+                    rows_written += written;
                     continue;
                 }
             };
@@ -386,12 +411,13 @@ impl VTab for ReadZarrVTab {
 
             // fill_output_chunk writes into output starting at rows_written.
             // It reads from the chunk starting at row_cursor.
-            let written = fill_chunk_slice(
+            let (consumed, written) = fill_chunk_slice(
                 &bind.columns,
                 &bind.coord_arrays,
                 wu,
                 &bind.table_shape,
                 &bind.table_chunk_shape,
+                &bind.index_masks,
                 &state.current_chunk_values,
                 output,
                 rows_written,
@@ -400,7 +426,7 @@ impl VTab for ReadZarrVTab {
                 projected,
             );
 
-            state.row_cursor += written;
+            state.row_cursor += consumed;
             rows_written += written;
         }
 
@@ -421,6 +447,10 @@ impl VTab for ReadZarrVTab {
             ("table_name".to_string(), LogicalTypeId::Varchar.into()),
             ("table".to_string(), LogicalTypeId::Varchar.into()),
             ("decode_times".to_string(), LogicalTypeId::Boolean.into()),
+            (
+                "bounds".to_string(),
+                LogicalTypeHandle::list(&LogicalTypeHandle::list(&LogicalTypeId::Varchar.into())),
+            ),
         ];
         params.extend(Selection::named_parameters());
         Some(params)
@@ -517,6 +547,27 @@ fn parse_dims_param(value: Value) -> Result<Vec<String>, Box<dyn std::error::Err
     Ok(items.iter().map(|item| item.to_string()).collect())
 }
 
+/// Parse `bounds := [[dim, lo, hi], ...]`; a NULL `lo`/`hi` leaves that side open.
+fn parse_bounds_param(value: Value) -> Result<Vec<RawBound>, Box<dyn std::error::Error>> {
+    const USAGE: &str = "bounds must be a list of [dim, lo, hi] entries with string or NULL endpoints, e.g. bounds=[['time','2022-07-01','2022-07-02'],['latitude','30','60']]";
+    let entries = value.to_list().ok_or(USAGE)?;
+    entries
+        .iter()
+        .map(|entry| {
+            let parts = entry.to_list().ok_or(USAGE)?;
+            if parts.len() != 3 || parts[0].is_null() {
+                return Err(USAGE.into());
+            }
+            let endpoint = |v: &Value| (!v.is_null()).then(|| v.to_string());
+            Ok(RawBound {
+                dim: parts[0].to_string(),
+                lo: endpoint(&parts[1]),
+                hi: endpoint(&parts[2]),
+            })
+        })
+        .collect()
+}
+
 /// How data-variable columns are named.
 #[derive(Clone, Copy, PartialEq)]
 enum ColumnNames {
@@ -532,6 +583,7 @@ fn finish_bind(
     table: &Table,
     decode_times: bool,
     names: ColumnNames,
+    bounds: &[RawBound],
 ) -> Result<ReadZarrBind, Box<dyn std::error::Error>> {
     if table.mixes_sparse_storage() {
         let paths = table.variable_paths();
@@ -632,6 +684,63 @@ fn finish_bind(
         }
     }
 
+    // Resolve bounds= into per-index masks, then keep only chunks that can hold a kept row.
+    let mut index_masks: Vec<Option<Vec<bool>>> = vec![None; table.dims.len()];
+    for b in bounds {
+        let k = table.dims.iter().position(|d| *d == b.dim).ok_or_else(|| {
+            format!(
+                "bounds: no dimension '{}'; dimensions are {:?}",
+                b.dim, table.dims
+            )
+        })?;
+        if index_masks[k].is_some() {
+            return Err(format!("bounds: dimension '{}' listed more than once", b.dim).into());
+        }
+        let ca = coord_arrays.get(&b.dim).ok_or_else(|| {
+            format!(
+                "bounds: dimension '{}' has no coordinate array to compare against",
+                b.dim
+            )
+        })?;
+        if ca.dtype == ZarrDtype::String {
+            return Err(format!(
+                "bounds: dimension '{}' has string coordinates; bounds supports numeric or \
+                 time coordinates only. Use WHERE to filter labels",
+                b.dim
+            )
+            .into());
+        }
+        let lo =
+            b.lo.as_deref()
+                .map(|t| parse_endpoint(t, &ca.encoding, &b.dim))
+                .transpose()?;
+        let hi =
+            b.hi.as_deref()
+                .map(|t| parse_endpoint(t, &ca.encoding, &b.dim))
+                .transpose()?;
+        // The stopgap range planner compares f64 keys. Reject integer cases
+        // that could round distinct coordinates or endpoints to the same key.
+        const INTEGER_PRECISION_LIMIT: f64 = 9_007_199_254_740_992.0;
+        if ((ca.dtype.is_integer() && matches!(ca.encoding, ColumnEncoding::Plain))
+            || matches!(ca.encoding, ColumnEncoding::CfTime(_)))
+            && (lo
+                .into_iter()
+                .chain(hi)
+                .any(|v| v.abs() >= INTEGER_PRECISION_LIMIT)
+                || (0..table.shape[k] as usize)
+                    .filter_map(|i| ca.data.key_at(i))
+                    .any(|v| v.abs() >= INTEGER_PRECISION_LIMIT))
+        {
+            return Err(format!(
+                "bounds: dimension '{}' exceeds the exact integer or timestamp precision of the range \
+                 planner; use WHERE for exact comparisons",
+                b.dim
+            )
+            .into());
+        }
+        index_masks[k] = Some(index_mask(ca, table.shape[k] as usize, lo, hi));
+    }
+
     let plan = if table.is_sparse() {
         // One row per stored entry, read in blocks of the major axis. Every
         // matrix is stored the same way (mixes_sparse_storage, above).
@@ -641,7 +750,7 @@ fn finish_bind(
             major_axis: inputs[0].matrix.major_axis,
         }
     } else {
-        ScanPlan::Cells(cell_scan(table, &sparse, subset_reads))
+        ScanPlan::Cells(cell_scan(table, &sparse, subset_reads, &index_masks))
     };
 
     Ok(ReadZarrBind {
@@ -653,6 +762,7 @@ fn finish_bind(
         masks,
         sparse,
         plan,
+        index_masks,
         next_unit: AtomicUsize::new(0),
     })
 }
@@ -663,8 +773,15 @@ fn cell_scan(
     table: &Table,
     sparse: &HashMap<String, SparseInput>,
     subset_reads: HashSet<String>,
+    index_masks: &[Option<Vec<bool>>],
 ) -> CellScan {
-    let mut work_units = build_work_units(table);
+    let chunks_per_dim: Vec<Vec<u64>> = (0..table.dims.len())
+        .map(|k| match &index_masks[k] {
+            Some(mask) => chunks_with_kept(mask, table.shape[k], table.chunk_shape[k]),
+            None => (0..table.shape[k].div_ceil(table.chunk_shape[k])).collect(),
+        })
+        .collect();
+    let mut work_units = build_work_units_in(&chunks_per_dim);
     // Work units run roughly in order, and the decoded range of a sparse matrix
     // is kept until every unit across it has run (`sparse_ranges`). That bounds
     // memory to a few ranges only for a matrix whose major axis is the outer
@@ -682,6 +799,9 @@ fn cell_scan(
         subset_reads,
         sparse_ranges: Mutex::new(HashMap::new()),
         cached_major_axis,
+        cached_range_uses: chunks_per_dim
+            .get(1 - cached_major_axis)
+            .map_or(0, |c| c.len() as u64),
     }
 }
 
@@ -837,7 +957,6 @@ fn sparse_range(
     origin: &[u64],
 ) -> Result<Arc<MajorRange>, Box<dyn std::error::Error>> {
     let major = input.matrix.major_axis;
-    let minor = 1 - major;
     let m0 = origin[major];
     let m1 = (m0 + bind.table_chunk_shape[major]).min(bind.table_shape[major]);
     // Stored the other way from the unit order, the units across one range
@@ -846,7 +965,7 @@ fn sparse_range(
     if major != cells.cached_major_axis {
         return Ok(Arc::new(input.major_range(m0, m1)?));
     }
-    let uses = bind.table_shape[minor].div_ceil(bind.table_chunk_shape[minor]);
+    let uses = cells.cached_range_uses;
     let key = (name.to_string(), m0);
     // Count one use of the cached range; drop it after the last.
     let take = |cache: &mut RangeCache| {
@@ -887,7 +1006,10 @@ fn compute_chunk_rows(wu: &WorkUnit, shape: &[u64], chunk_shape: &[u64]) -> usiz
 ///
 /// `vector_base` = starting row in the DuckDB output vector.
 /// `chunk_row_start` = starting row within the chunk.
-/// `n_rows` = how many rows to write.
+/// `max_rows` = capacity left in the output vector.
+///
+/// Rows whose index is masked out by `bounds=` are skipped. Returns
+/// `(chunk rows consumed, rows written)`; they differ when rows were skipped.
 #[allow(clippy::too_many_arguments)]
 fn fill_chunk_slice(
     col_defs: &[ColumnDef],
@@ -895,13 +1017,14 @@ fn fill_chunk_slice(
     wu: &WorkUnit,
     table_shape: &[u64],
     table_chunk_shape: &[u64],
+    index_masks: &[Option<Vec<bool>>],
     chunk_values: &HashMap<String, UnitValues>,
     output: &mut DataChunkHandle,
     vector_base: usize,
     chunk_row_start: usize,
-    n_rows: usize,
+    max_rows: usize,
     projected: &HashMap<usize, usize>,
-) -> usize {
+) -> (usize, usize) {
     let ndim = wu.chunk_indices.len();
 
     // Logical chunk shape: clipped to array bounds for boundary chunks.
@@ -932,6 +1055,23 @@ fn fill_chunk_slice(
         zarrs_strides[k] = zarrs_strides[k + 1] * zarrs_shape[k + 1];
     }
 
+    // Pick the chunk rows to emit: stop when the output is full or the chunk ends.
+    let chunk_rows: usize = chunk_shape.iter().product();
+    let mut selected: Vec<usize> = Vec::with_capacity(max_rows.min(chunk_rows));
+    let mut flat_row = chunk_row_start;
+    while flat_row < chunk_rows && selected.len() < max_rows {
+        let keep = index_masks.iter().enumerate().all(|(k, mask)| match mask {
+            Some(mask) => mask[chunk_origin[k] + (flat_row / strides[k]) % chunk_shape[k]],
+            None => true,
+        });
+        if keep {
+            selected.push(flat_row);
+        }
+        flat_row += 1;
+    }
+    let consumed = flat_row - chunk_row_start;
+    let n_rows = selected.len();
+
     for (col_idx, col_def) in col_defs.iter().enumerate() {
         let out_vec_idx = match projected.get(&col_idx) {
             Some(&i) => i,
@@ -940,8 +1080,7 @@ fn fill_chunk_slice(
 
         let mut vector = output.flat_vector(out_vec_idx);
 
-        for out_i in 0..n_rows {
-            let flat_row = chunk_row_start + out_i;
+        for (out_i, &flat_row) in selected.iter().enumerate() {
             let dst = vector_base + out_i;
 
             // Map flat logical row → per-dim indices within the logical chunk.
@@ -982,7 +1121,7 @@ fn fill_chunk_slice(
         }
     }
 
-    n_rows
+    (consumed, n_rows)
 }
 
 /// Write rows `row_start..row_start + n_rows` of a sparse table's block into
@@ -995,9 +1134,26 @@ fn fill_sparse_rows(
     output: &mut DataChunkHandle,
     vector_base: usize,
     row_start: usize,
-    n_rows: usize,
+    max_rows: usize,
     projected: &HashMap<usize, usize>,
-) {
+) -> (usize, usize) {
+    let mut selected = Vec::with_capacity(max_rows);
+    let mut row = row_start;
+    while row < block.len() && selected.len() < max_rows {
+        let keep = bind.index_masks.iter().enumerate().all(|(axis, mask)| {
+            let index = if axis == major_axis {
+                block.major[row]
+            } else {
+                block.minor[row]
+            };
+            mask.as_ref().is_none_or(|mask| mask[index as usize])
+        });
+        if keep {
+            selected.push(row);
+        }
+        row += 1;
+    }
+    let consumed = row - row_start;
     let mut var_idx = 0usize;
     for (col_idx, col_def) in bind.columns.iter().enumerate() {
         let this_var = (!col_def.is_coord).then(|| {
@@ -1008,23 +1164,25 @@ fn fill_sparse_rows(
             continue;
         };
         let mut vector = output.flat_vector(out_vec_idx);
-        let rows = row_start..row_start + n_rows;
+
         if let Some(dim_k) = col_def.dim_idx {
             let indices = if dim_k == major_axis {
-                &block.major[rows]
+                &block.major
             } else {
-                &block.minor[rows]
+                &block.minor
             };
             match bind.coord_arrays.get(&col_def.name) {
                 Some(ca) => {
-                    for (i, &index) in indices.iter().enumerate() {
+                    for (i, &row) in selected.iter().enumerate() {
+                        let index = indices[row];
                         ca.data
                             .write_element(&mut vector, index as usize, vector_base + i);
                     }
                 }
                 None => {
                     let slot = unsafe { vector.as_mut_ptr::<i64>() };
-                    for (i, &index) in indices.iter().enumerate() {
+                    for (i, &row) in selected.iter().enumerate() {
+                        let index = indices[row];
                         unsafe { *slot.add(vector_base + i) = index as i64 };
                     }
                 }
@@ -1034,7 +1192,7 @@ fn fill_sparse_rows(
                 .on_disk_dtype
                 .byte_size()
                 .expect("sparse data has a fixed-width dtype");
-            for (i, row) in rows.enumerate() {
+            for (i, &row) in selected.iter().enumerate() {
                 crate::zarr_reader::scan::fill_scalar_element_pub(
                     &mut vector,
                     values,
@@ -1047,4 +1205,5 @@ fn fill_sparse_rows(
             }
         }
     }
+    (consumed, selected.len())
 }
