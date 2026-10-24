@@ -48,3 +48,25 @@ jobs:
       exclude_archs: 'linux_amd64_musl'
       opt_in_archs: 'osx_amd64'
       reduced_ci_mode: 'disabled'
+
+  duckdb-v1-compatibility:
+    name: DuckDB 1.5.6 compatibility
+    needs: [resolve-duckdb-version, duckdb-stable-build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: '3.12'
+      - name: Download the DuckDB 2.0 build's Linux binary
+        uses: actions/download-artifact@v4
+        with:
+          name: zarr-${{ needs.resolve-duckdb-version.outputs.duckdb_version }}-extension-linux_amd64
+          path: build/compatibility
+      - name: Load the same binary in DuckDB 1.5.6
+        run: make test_duckdb_v1 COMPAT_EXTENSION=build/compatibility/zarr.duckdb_extension

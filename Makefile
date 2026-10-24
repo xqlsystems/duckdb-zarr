@@ -1,4 +1,4 @@
-.PHONY: check_anndata clean clean_all clippy fmt fmt-check generate_fixtures lint release-check render-community-descriptor test_http test_http_debug test_http_release test_http_real test-rust wasm_toolchain
+.PHONY: check_anndata clean clean_all clippy fmt fmt-check generate_fixtures lint release-check render-community-descriptor test_http test_http_debug test_http_release test_http_real test-rust wasm_toolchain test_duckdb_v1
 
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
@@ -112,6 +112,15 @@ test_debug test_release:
 			--extension build/$(patsubst test_%,%,$@)/$(EXTENSION_NAME).duckdb_extension -v; \
 	fi
 endif
+
+# Test the already-built binary with the oldest supported runtime. Do not rebuild
+# here: CI uses the release artifact produced by the DuckDB 2.0 build matrix.
+# Override COMPAT_EXTENSION to test a downloaded or release binary.
+COMPAT_EXTENSION ?= build/debug/$(EXTENSION_NAME).duckdb_extension
+test_duckdb_v1:
+	uv run --no-project --with pytest --with 'duckdb==$(DUCKDB_CAPI_VERSION:v%=%)' \
+		python -m pytest test/test_duckdb_compatibility.py -k extension_uses_v1 \
+		--extension "$(COMPAT_EXTENSION)" -v
 
 # HTTP integration tests. Build the extension first (make debug / make release).
 # pytest runs via uv, so no venv setup is needed; duckdb is pinned to the target
