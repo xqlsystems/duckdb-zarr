@@ -12,11 +12,10 @@
 # surfaces that drift.
 #
 # Why the pinned sites: the extension links the `duckdb` crate and the Makefile
-# stamps the extension-metadata version via TARGET_DUCKDB_VERSION; the
-# distribution workflow resolves its `duckdb_version` from the Makefile at run
-# time, so it is not a pin site. With USE_UNSTABLE_C_API=1 the loader requires
-# an EXACT version match, so every site must agree with the runner or
-# `Test extension` fails to load the built extension.
+# selects the tested engine via TARGET_DUCKDB_VERSION; the distribution
+# workflow resolves its `duckdb_version` from the Makefile at run time, so it
+# is not a pin site. The frozen v1 C API floor is independent of engine patch
+# updates and must not be changed by this bot.
 #
 # The bump must not touch files under .github/workflows/ (or any other file
 # GITHUB_TOKEN cannot push): GitHub permanently refuses to let the Actions
@@ -86,10 +85,9 @@ jobs:
         id: crate
         if: steps.drift.outputs.drifted == 'true'
         run: |
-          # duckdb-rs encodes the DuckDB version: v1.5.4 -> 1.10504.0 (1.1<minor:02><patch:02>.0)
-          ver="${{ steps.latest.outputs.version }}"; ver="${ver#v}"
-          IFS=. read -r _maj min pat <<< "$ver"
-          crate=$(printf '1.1%02d%02d.0' "$min" "$pat")
+          # Use the same major-aware mapping as the release consistency check.
+          # v1.5.6 -> 1.10506.0; v2.0.0 -> 1.20000.0.
+          crate=$(python3 -c 'import sys; from scripts.check_release_ready import duckdb_crate_version; print(duckdb_crate_version(sys.argv[1]))' '${{ steps.latest.outputs.version }}')
           echo "version=$crate" >> "$GITHUB_OUTPUT"
           # crates.io requires a User-Agent; verify the matching crate is published.
           if curl -fsSL -H 'User-Agent: duckdb-zarr-drift-bot' \
@@ -107,7 +105,7 @@ jobs:
         run: |
           new="${{ steps.latest.outputs.version }}"
           crate="${{ steps.crate.outputs.version }}"
-          # 1. Makefile target (stamps extension metadata)
+          # 1. Makefile target engine (leave the frozen C API floor alone)
           sed -i -E "s/^TARGET_DUCKDB_VERSION=.*/TARGET_DUCKDB_VERSION=$new/" Makefile
           # 2. Cargo.toml exact crate pin (the only `version = "=...` line) + lockfile.
           #    Never edit files under .github/workflows/ here — GITHUB_TOKEN
@@ -130,8 +128,8 @@ jobs:
             The latest stable pip `duckdb` release (what
             duckdb/community-extensions builds against) moved to
             **${{ steps.latest.outputs.version }}**. This updates the pinned
-            sites that must match it (exact match is required because
-            `USE_UNSTABLE_C_API=1`):
+            sites used for building and testing against that engine (the
+            frozen v1 C API floor stays unchanged):
 
             - `Makefile` → `TARGET_DUCKDB_VERSION=${{ steps.latest.outputs.version }}`
             - `Cargo.toml` → `duckdb = "=${{ steps.crate.outputs.version }}"` (+ `Cargo.lock`)

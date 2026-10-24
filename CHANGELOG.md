@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+- Build and test against DuckDB 2.0.0 (`duckdb` crate `1.20000.0`) using the frozen v1.5.6 C API. The native adapter keeps `zarr_init_c_api` and emits `C_STRUCT` metadata with an API version of `v1.5.6`, rather than selecting DuckDB 2.0's incompatible v2 entrypoint. The same native binary is tested on DuckDB 1.5.6 and 2.0.0; older engines are not supported by this build.
+- Use the `v2.0-cyanoptera` extension CI tools and the explicit `lambda v: ...` SQL syntax supported by both target engines.
+
+### Fixed
+- Include the DuckDB major version when mapping an engine version to its Rust crate pin, including in the patch-update bot.
+- Run the AnnData cross-check with the Makefile's target DuckDB version instead of the script's older standalone pin.
+
 ## [0.2.0] - 2026-10-18
 
 ### Changed

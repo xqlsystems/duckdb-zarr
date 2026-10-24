@@ -123,7 +123,7 @@ x_y	[3, 4]
 # The catalog columns are lists, so they can be searched: which table holds foo?
 query TT
 SELECT group_path, table_name FROM read_zarr_tables('test/fixtures/xarray_tutorial/datatree.zarr')
-WHERE list_contains(list_transform(data_vars, v -> split_part(v, '/', -1)), 'foo')
+WHERE list_contains(list_transform(data_vars, lambda v: split_part(v, '/', -1)), 'foo')
 ORDER BY group_path;
 ----
 /simulation/coarse	x_y

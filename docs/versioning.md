@@ -133,8 +133,8 @@ versioning existed.
 version bumps, changelog generation, and crates.io publishing via release
 PRs. It was considered for this issue but doesn't fit `duckdb-zarr`: this
 crate is never published to crates.io (it's a `cdylib` C API extension, not a
-library), the build is version-locked to an exact DuckDB release
-(`USE_UNSTABLE_C_API=1`, see
+library), its DuckDB engine test pin and C API compatibility floor are managed
+separately (see
 [`docs/community-extension-release.md`](community-extension-release.md#duckdb-version-policy)),
 and the three-file descriptor trio it would still need a custom step for is
 exactly what `sync_release_version.py` already handles. The

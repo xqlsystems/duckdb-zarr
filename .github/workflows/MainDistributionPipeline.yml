@@ -39,10 +39,12 @@ jobs:
   duckdb-stable-build:
     name: Build extension binaries
     needs: resolve-duckdb-version
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v2.0-cyanoptera
     with:
       duckdb_version: ${{ needs.resolve-duckdb-version.outputs.duckdb_version }}
-      ci_tools_version: v1.5-variegata
+      ci_tools_version: v2.0-cyanoptera
       extension_name: zarr
       extra_toolchains: rust;python3
       exclude_archs: 'linux_amd64_musl'
+      opt_in_archs: 'osx_amd64'
+      reduced_ci_mode: 'disabled'
