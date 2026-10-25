@@ -27,8 +27,8 @@ def duckdb_crate_version(duckdb_version: str) -> str:
     match = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)", duckdb_version)
     if match is None:
         raise ValueError(f"invalid DuckDB version {duckdb_version!r}")
-    _major, minor, patch = (int(part) for part in match.groups())
-    return f"1.1{minor:02d}{patch:02d}.0"
+    major, minor, patch = (int(part) for part in match.groups())
+    return f"1.{major}{minor:02d}{patch:02d}.0"
 
 
 def main() -> int:

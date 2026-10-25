@@ -243,7 +243,7 @@ The code, the docs and the error messages use these terms. Older sections of thi
               └─────────────────────┘
 ```
 
-The root crate follows DuckDB extension conventions: one module per SQL entry point and a thin extension entrypoint, with `duckdb` pinned to `=1.10506.0` in Cargo.toml.
+The root crate follows DuckDB extension conventions: one module per SQL entry point and a thin extension entrypoint, with `duckdb` pinned to `=1.20000.0` in Cargo.toml. The adapter uses the frozen v1.5.6 C API (`C_STRUCT` metadata and `zarr_init_c_api`), which also loads on DuckDB 2.0. `TARGET_DUCKDB_VERSION` selects the engine used by tests and CI; `DUCKDB_CAPI_VERSION` selects the ABI version advertised by the binary.
 
 Engine-independent reading lives in `crates/zarr-core`: array metadata, DataTree
 and AnnData layouts, sparse matrices, decoded values, CF-time handling, and
