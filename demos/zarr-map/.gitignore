@@ -1,0 +1,6 @@
+node_modules
+dist
+public/*.wasm
+public/data
+test-results
+playwright-report
