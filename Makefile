@@ -1,23 +1,21 @@
-.PHONY: check_anndata clean clean_all clippy fmt fmt-check generate_fixtures lint release-check render-community-descriptor test_http test_http_debug test_http_release test_http_real
+.PHONY: check_anndata clean clean_all clippy fmt fmt-check generate_fixtures lint release-check render-community-descriptor test_http test_http_debug test_http_release test_http_real test-rust wasm_toolchain test_duckdb_v1
 
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
 EXTENSION_NAME=zarr
 
-# Set to 1 to enable Unstable API (binaries will only work on TARGET_DUCKDB_VERSION, forwards compatibility will be broken)
-# Note: currently extension-template-rs requires this, as duckdb-rs relies on unstable C API functionality
-USE_UNSTABLE_C_API=1
+# DuckDB 1.5.6 froze the v1 C API, including the filesystem functions this
+# adapter uses. Keep the v1 entrypoint on DuckDB 2.0 instead of advertising
+# C_STRUCT_UNSTABLE, which would select the incompatible v2 entrypoint.
+USE_UNSTABLE_C_API=0
+DUCKDB_CAPI_VERSION=v1.5.6
 
-# Target DuckDB version
-TARGET_DUCKDB_VERSION=v1.5.5
+# Engine used by CI and Python tests; distinct from the frozen C API version.
+TARGET_DUCKDB_VERSION=v2.0.0
 
-# The sqllogictest runner (pip `duckdb`) must match the build pin exactly:
-# USE_UNSTABLE_C_API=1 makes the loader reject an extension built for a
-# different DuckDB version. extension-ci-tools' base.Makefile turns
-# DUCKDB_TEST_VERSION into `duckdb==<version>` when creating configure/venv
-# (default otherwise: latest stable on PyPI). Set BEFORE the includes below —
-# their conditional is evaluated at parse time; `v` is stripped for the pip
-# pin. Drift is surfaced daily by .github/workflows/duckdb-version-drift.yml.
+# extension-ci-tools reads this before creating configure/venv. Keep Python
+# tests on the target engine even though the binary advertises the v1 C API.
+# Drift is surfaced daily by .github/workflows/duckdb-version-drift.yml.
 export DUCKDB_TEST_VERSION := $(TARGET_DUCKDB_VERSION:v%=%)
 
 all: configure debug
@@ -26,9 +24,14 @@ all: configure debug
 include extension-ci-tools/makefiles/c_api_extensions/base.Makefile
 include extension-ci-tools/makefiles/c_api_extensions/rust.Makefile
 
-# extension-ci-tools' wasm job installs Rust 1.86.0, but zarrs needs a newer
-# rustc. For wasm platforms only, install and select the stable toolchain with the
-# emscripten target (rustup is a no-op when it is already present).
+# The shared metadata recipes use TARGET_DUCKDB_VERSION for both ABI modes.
+# Scope their version to the C API floor, leaving the engine/test pin above
+# unchanged. Prerequisite cargo recipes inherit the same API floor.
+build_extension_with_metadata_debug build_extension_with_metadata_release: TARGET_DUCKDB_VERSION=$(DUCKDB_CAPI_VERSION)
+
+# Use stable Rust with the emscripten target for wasm builds. The v2 CI tools
+# install it already; local builds may still need the toolchain or target.
+# rustup is a no-op when the requested components are present.
 ifneq ($(filter wasm_%,$(DUCKDB_PLATFORM)),)
 WASM_RUST_TOOLCHAIN := stable
 # Defer the toolchain install check to a build prerequisite (not parse time):
@@ -101,14 +104,23 @@ ifneq ($(SKIP_TESTS),1)
 test_debug test_release:
 	@if command -v uv >/dev/null 2>&1; then \
 		uv run --with pytest --with 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' \
-			pytest test/test_anndata_edge_cases.py test/test_datatree_compatibility.py \
+			pytest test/test_anndata_edge_cases.py test/test_datatree_compatibility.py test/test_bounds_integration.py test/test_duckdb_compatibility.py \
 			--extension build/$(patsubst test_%,%,$@)/$(EXTENSION_NAME).duckdb_extension -v; \
 	else \
 		$(PYTHON_VENV_BIN) -m pip install --quiet pytest && \
-		$(PYTHON_VENV_BIN) -m pytest test/test_anndata_edge_cases.py test/test_datatree_compatibility.py \
+		$(PYTHON_VENV_BIN) -m pytest test/test_anndata_edge_cases.py test/test_datatree_compatibility.py test/test_bounds_integration.py test/test_duckdb_compatibility.py \
 			--extension build/$(patsubst test_%,%,$@)/$(EXTENSION_NAME).duckdb_extension -v; \
 	fi
 endif
+
+# Test the already-built binary with the oldest supported runtime. Do not rebuild
+# here: CI uses the release artifact produced by the DuckDB 2.0 build matrix.
+# Override COMPAT_EXTENSION to test a downloaded or release binary.
+COMPAT_EXTENSION ?= build/debug/$(EXTENSION_NAME).duckdb_extension
+test_duckdb_v1:
+	uv run --no-project --with pytest --with 'duckdb==$(DUCKDB_CAPI_VERSION:v%=%)' \
+		python -m pytest test/test_duckdb_compatibility.py -k extension_uses_v1 \
+		--extension "$(COMPAT_EXTENSION)" -v
 
 # HTTP integration tests. Build the extension first (make debug / make release).
 # pytest runs via uv, so no venv setup is needed; duckdb is pinned to the target
@@ -139,7 +151,10 @@ fmt-check:
 	cargo fmt --all -- --check
 
 clippy:
-	cargo clippy --lib --all-features -- -D warnings
+	cargo clippy --workspace --lib --all-features -- -D warnings
+
+test-rust:
+	cargo test --workspace
 
 lint: fmt-check clippy
 
@@ -156,7 +171,7 @@ render-community-descriptor:
 # Compare the extension's AnnData tables with anndata.read_zarr (design decision 9).
 # Build the extension and the fixtures first (make debug generate_fixtures).
 check_anndata:
-	uv run scripts/check_anndata_tables.py build/debug/$(EXTENSION_NAME).duckdb_extension
+	uv run --with 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' scripts/check_anndata_tables.py build/debug/$(EXTENSION_NAME).duckdb_extension
 
 generate_fixtures:
 	@if command -v uv >/dev/null 2>&1; then \

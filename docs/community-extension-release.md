@@ -70,10 +70,10 @@ version and it is emitted as `repo.ref_next` in the rendered descriptor — see
 
 ## Staying Current With DuckDB Releases
 
-Because `USE_UNSTABLE_C_API=1` binds each binary to an exact DuckDB version (see
-[DuckDB Version Policy](#duckdb-version-policy)), the community extension goes
-stale the moment DuckDB ships a version this extension has not been rebuilt for.
-Three pieces of automation keep that window small:
+The native adapter uses DuckDB's frozen v1.5.6 C API (see
+[DuckDB Version Policy](#duckdb-version-policy)). A version bump no longer
+necessarily requires a different binary, but every supported engine still needs
+build and query tests. Three pieces of automation support that process:
 
 - **CI guard** — the `Release metadata consistency` job in
   `.github/workflows/rust-quality.yml` runs `scripts/check_release_ready.py` on
@@ -135,11 +135,18 @@ LOAD zarr;
 ## DuckDB Version Policy
 
 DuckDB community extensions are distributed for DuckDB's latest stable release.
-This extension currently sets `USE_UNSTABLE_C_API=1`, so the produced binary is
-not forward-compatible across DuckDB patch releases: the loader expects the exact
-DuckDB version stamped into the extension metadata.
+This adapter sets `USE_UNSTABLE_C_API=0` and `DUCKDB_CAPI_VERSION=v1.5.6`.
+DuckDB 2.0 stabilized the formerly unstable v1 functions at that API version.
+The binary therefore advertises `C_STRUCT` with `v1.5.6` metadata and exports
+`zarr_init_c_api`. Advertising `C_STRUCT_UNSTABLE` on DuckDB 2.0 instead selects
+the incompatible `zarr_init_c_api_v2` entrypoint.
 
-That means a DuckDB bump must update all version pins in one reviewed change:
+`TARGET_DUCKDB_VERSION=v2.0.0` is the engine used by CI and Python tests, not
+the binary's API floor. The same native build has been tested on DuckDB 1.5.6
+and 2.0.0. Older engines are below its declared API floor. Other engines and
+platforms need their own validation; accepting the metadata is not a query test.
+
+A target-engine bump must update these pins in one reviewed change:
 
 - `Makefile` `TARGET_DUCKDB_VERSION`
 - `Cargo.toml` exact `duckdb` crate pin
@@ -157,12 +164,16 @@ push changes to files under `.github/workflows/` under any `permissions` grant
 — so the drift bot's bump PRs would fail to push and the literal would silently
 go stale. One pin site, the Makefile, keeps the automated path working.
 
-The `duckdb` crate version used here encodes the DuckDB version. For the current
-pin, DuckDB `v1.5.4` maps to:
+The `duckdb` crate version encodes the engine's major, minor and patch numbers:
+`v1.5.6` maps to `1.10506.0`, and the current `v2.0.0` maps to:
 
 ```toml
-duckdb = { version = "=1.10504.0", features = ["loadable-extension"] }
+duckdb = { version = "=1.20000.0", features = ["loadable-extension"] }
 ```
+
+Do not bump `DUCKDB_CAPI_VERSION` with a routine engine update. It describes the
+API this adapter needs, not the installed engine. If that requirement changes,
+update the version requested in `src/lib.rs` and the compatibility tests too.
 
 Use the automated `DuckDB Version Drift` workflow for routine patch-line bumps.
 Treat major or minor DuckDB bumps as manual migrations: update the pins, rebuild,
@@ -187,11 +198,10 @@ Use `ref` for the commit that works with the latest stable DuckDB release. Use
 the stable build yet. After DuckDB releases, the community repository can promote
 the `ref_next` commit to `ref`.
 
-For a version-locked (Rust / `USE_UNSTABLE_C_API=1`) extension this is the one
-mechanism that closes the availability gap entirely: because a single commit can
-only build against one DuckDB version, `ref` covers today's stable and `ref_next`
-covers the upcoming release, so the community rebuild has a working binary the
-**moment** the new DuckDB version ships — no reactive catch-up.
+The current frozen-v1 adapter can use the same source and binary on the two
+validated engine versions. `ref_next` is only needed when a future engine needs
+source or ABI changes that cannot serve the current stable release. Validate
+both refs before publication; `ref_next` by itself does not establish support.
 
 Render a descriptor carrying both refs with:
 

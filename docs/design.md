@@ -126,6 +126,29 @@ Named arguments stay close to xarray's vocabulary (`variables`, `coords`, `chunk
 
 `array_path` adds an unambiguous selector for multiscale OME-Zarr levels and nested labels. The same selector is accepted by `read_zarr_metadata` and `read_zarr_tables`. A quoted `"array"` alias is also registered; the quotes are required because `ARRAY` is a DuckDB keyword. `table_name` selects a table by the name `read_zarr_tables` gives it, ignoring case like DuckDB identifiers; its quoted alias is `"table"`, because `TABLE` is a keyword too. It is the same as the table's `dims` list, which stays available, and a table whose name is `NULL` in the catalog (decision 8) can only be read by `dims`.
 
+### Coordinate bounds
+
+`bounds := [[dim, lo, hi], ...]` selects inclusive ranges of stored numeric or
+CF-time coordinates. Endpoints are strings; `NULL` leaves that end unrestricted.
+It works with `group_path :=`, `table_name :=` and `array_path :=` selection:
+
+```sql
+SELECT time, lat, lon, value
+FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid.zarr',
+  bounds := [['time', '2020-01-01 02:00:00', '2020-01-01 02:00:00'],
+             ['lat', '-30', '30']]);
+```
+
+The dense scan skips chunks with no matching coordinates, then filters rows
+within the retained chunks. This is an explicit pruning parameter, not automatic
+pushdown of SQL `WHERE` predicates. Bounds need a stored coordinate array;
+string labels (including AnnData observation and variable names) are rejected.
+Use `WHERE` to filter labels. Plain integer coordinates and endpoints whose
+absolute values reach `2^53` are also rejected because the current range planner
+uses `f64` keys. The same limit applies to decoded timestamp microseconds and
+timestamp endpoints. Use `WHERE` for exact large-integer or timestamp comparisons. With
+`decode_times := false`, time bounds use the raw numeric offsets instead.
+
 ### 3. Mounting multi-table stores: `ATTACH` and `read_zarr_views`
 
 ```sql
@@ -209,20 +232,26 @@ The code, the docs and the error messages use these terms. Older sections of thi
               │  read_zarr_metadata │
               │  read_zarr_tables   │
               │  read_zarr_views    │
-              │  ATTACH (TYPE ZARR) │
+              │  DuckDB store I/O    │
               │  replacement scan   │
               └──────────┬──────────┘
                          │  no DuckDB types cross this seam
               ┌──────────▼──────────┐
-              │   zarr_reader mod   │  pure Rust; zarrs + ndarray
+              │   zarr-core crate   │  engine-independent; zarrs
               │  open / metadata /  │
               │  decode / storage   │
               └─────────────────────┘
 ```
 
-We follow DuckDB extension conventions: a flat top-level layout with one Rust module per registered SQL entry point and a thin extension entrypoint that wires them in (against `duckdb` pinned to `=1.10504.0` in Cargo.toml).
+The root crate follows DuckDB extension conventions: one module per SQL entry point and a thin extension entrypoint, with `duckdb` pinned to `=1.20000.0` in Cargo.toml. The adapter uses the frozen v1.5.6 C API (`C_STRUCT` metadata and `zarr_init_c_api`), which also loads on DuckDB 2.0. `TARGET_DUCKDB_VERSION` selects the engine used by tests and CI; `DUCKDB_CAPI_VERSION` selects the ABI version advertised by the binary.
 
-The `zarr_reader` module is the natural seam — it depends on [`zarrs`](https://lib.rs/crates/zarrs) and `ndarray` and exposes a small interface (open store, read schema, decode chunk into `ndarray::ArrayD`, storage adapter trait) that has no DuckDB types in its public API. Keeping that seam clean costs us nothing today and means the reader could be lifted into a shared crate later if it becomes useful to other Rust projects (e.g. zarr-datafusion). We're not designing for that reuse up front — DataFusion is async-first and DuckDB is sync-with-morsels, and trying to factor across that boundary on day one is more design overhead than it's worth.
+Engine-independent reading lives in `crates/zarr-core`: array metadata, DataTree
+and AnnData layouts, sparse matrices, decoded values, CF-time handling, and
+coordinate pruning. Its public types contain no DuckDB or Arrow types. The root
+`src/zarr_reader` modules are adapters: they open stores through DuckDB's file
+system, map core types to DuckDB types (including ENUMs), and write decoded values
+into DuckDB vectors. Both crates are workspace members, so `cargo test --workspace`
+and the workspace Clippy target cover the shared core as well as the adapter.
 
 ### Bind phase
 
@@ -356,7 +385,7 @@ A coordinate whose `units` attr reads `"<step> since <reference>"` is a time axi
 
 Decoding is gated on the `calendar` attr, which is where the AGPL problem from decision 3 dissolves:
 
-- **`proleptic_gregorian`, and `standard`/`gregorian` with a reference date on or after the 1582-10-15 reform** (absent `calendar` means `standard`, per CF §4.4.1) — decoded. These are ordinary civil-date arithmetic: `chrono::NaiveDate` for calendar validation and day arithmetic, plus a rational step size for the UDUNITS unit, in `src/zarr_reader/cftime.rs`. `chrono` is already in the dependency tree transitively via `duckdb → arrow → arrow-arith`, so taking it directly costs nothing new.
+- **`proleptic_gregorian`, and `standard`/`gregorian` with a reference date on or after the 1582-10-15 reform** (absent `calendar` means `standard`, per CF §4.4.1) — decoded. These are ordinary civil-date arithmetic: `chrono::NaiveDate` for calendar validation and day arithmetic, plus a rational step size for the UDUNITS unit, in `crates/zarr-core/src/cftime.rs`. `chrono` is already in the dependency tree transitively via `duckdb → arrow → arrow-arith`, so taking it directly costs nothing new.
 - **Everything else** — `noleap`/`365_day`, `all_leap`/`366_day`, `360_day`, `julian`, and pre-reform `standard` references — left as the raw on-disk dtype. These calendars have years that do not exist on a wall clock; there is no correct `TIMESTAMP` to emit, and emitting a plausible-looking wrong one is worse than emitting the number.
 
 The reform gate is enforced *per value*, not just on the reference: a `standard` axis can perfectly well have a post-reform reference and negative offsets that reach back past 1582-10-15, and those instants are Julian in the file's own terms. They decode to `NULL` rather than to a date ~10 days off; `decode_times := false` recovers the raw offsets for anyone who actually has such data.
@@ -378,7 +407,7 @@ Because the rest of the reader is built around `ColumnEncoding`/byte-offset math
 - Decoding uses `retrieve_chunk::<Vec<String>>` / `retrieve_array_subset::<Vec<String>>` (zarrs' `ElementOwned` API) instead of `ArrayBytes::into_fixed()`, yielding one `String` per element directly.
 - `ColumnValues` (a trait with `FixedValues` and `StringValues` implementations, shared as `Arc<dyn ColumnValues>`) replaces the bare `Vec<u8>` used for a coordinate array's pre-loaded values and a data variable's per-chunk decode buffer. Each implementation writes its own elements into a DuckDB vector, so both paths carry either representation without branching on the dtype.
 - zarrs pads a boundary chunk's *element count* to the full nominal `chunk_shape` for every dtype uniformly (fill-value elements past the array's logical bound), so the existing `zarrs_flat` physical-offset math indexes correctly into a `Vec<String>` with no changes. [string_dtype.test](../test/sql/string_dtype.test) (`string_var_v3_2d`) and [ragged_chunks.test](../test/sql/ragged_chunks.test) cover ragged boundary chunks for 1-D and 2-D string and float arrays.
-- No NULL masking applies: `FillSentinel` only represents numeric sentinels (`Float`/`Int`/`UInt`, see [meta.rs](../src/zarr_reader/meta.rs)), so a `_FillValue`/`missing_value` attr on a string variable doesn't parse into a sentinel and every decoded string (including zarrs' own empty-string fill-value substitution) is written through as-is.
+- No NULL masking applies: `FillSentinel` only represents numeric sentinels (`Float`/`Int`/`UInt`, see [meta.rs](../crates/zarr-core/src/meta.rs)), so a `_FillValue`/`missing_value` attr on a string variable doesn't parse into a sentinel and every decoded string (including zarrs' own empty-string fill-value substitution) is written through as-is.
 
 `ColumnEncoding::PackedInt` never applies to strings (its trigger condition requires an integer on-disk dtype), and CF-time detection explicitly skips them (a string array carrying a `units` attr is not a time axis), so neither decoding ever intersects string decoding.
 
@@ -553,7 +582,7 @@ A Zarr store can nest groups, as an `xarray.DataTree` written with `DataTree.to_
 >
 > **Why not keep flattening:** flattening only works when no two nodes reuse a dimension name, and DataTree stores reuse them by design (multiscale levels, ensembles, AnnData's `obs` and `var` against `X`). Scoping per node is the xarray data model; matching it is what lets xarray-sql and this extension agree.
 
-**Implementation notes** (`src/zarr_reader/tree.rs`):
+**Implementation notes** (`crates/zarr-core/src/tree.rs`):
 
 - `group_path` is the node path as `DataTree` writes it (`/`, `/simulation/fine`); `group_path :=` accepts it with or without slashes. `schema_name` is `main` for the root and the path without the leading slash otherwise, so a one-level group needs no quoting (`sim.simulation.…`). A top-level Zarr group named `main` would collide with the root's schema; mount it under another name.
 - `table_name` is `NULL` when `read_zarr(store, group_path := g, dims := d)` would fail for that row: the node is not aligned with its ancestors, or the node has arrays with the same dims but different shapes (multiscale levels). Such rows are still listed, one per shape, and stay readable with `array_path=`. It is also `NULL` for groups whose names collide after case folding, which `read_zarr` can still read with `dims :=`.
@@ -574,7 +603,7 @@ The mounting statements come from `read_zarr_views` (section 3 of the SQL surfac
 
 Decision 8 reads any nested store as a tree of tables, but an AnnData store needs more before its tables mean anything. AnnData writes no dimension names, so every array was left out of every table. AnnData stores several kinds of variable as a group of arrays (its [on-disk format](https://anndata.readthedocs.io/en/stable/fileformat-prose.html)): a categorical is `codes` plus `categories`, a nullable column is `values` plus `mask`, and a sparse matrix is `data`, `indices` and `indptr`. Read as plain arrays, these give codes instead of labels, `''` instead of NULL, and three unaligned arrays instead of a matrix. And the groups on disk are not the shape users think in: `obs` as a node of its own gives a table `obs.obs` whose rows are joined to `X` through an `_index` column. The issue #40 thread showed that users can decode all of it in SQL, but the queries are long, and two easy mistakes return wrong data with no error: reading a nullable column's `values` without its `mask` gives `''` for NULL, and an `ASOF JOIN` to `indptr` picks arbitrarily between the tied offsets of empty rows.
 
-> **Decision:** In every AnnData object, apply an AnnData layer on top of decision 8 (`src/zarr_reader/anndata.rs`). An AnnData object is a group with `encoding-type: anndata`: the root of a store that `AnnData.write_zarr()` wrote, or a group inside another store, such as a SpatialData table at `tables/<name>` or a MuData modality at `mod/<name>`. Element paths below are relative to that group, and its own node takes the place of the root: `tables/cells/obs` reads as `"tables/cells".obs`. Groups outside every AnnData object read as plain Zarr. One schema per group, tables named by dims, inherited coordinates and the catalog in `read_zarr_tables` all stay. A store whose root is an AnnData object costs one metadata read more; any other store reads each group's attributes once to find AnnData objects, which consolidated metadata serves from memory.
+> **Decision:** In every AnnData object, apply an AnnData layer on top of decision 8 (`crates/zarr-core/src/anndata.rs`). An AnnData object is a group with `encoding-type: anndata`: the root of a store that `AnnData.write_zarr()` wrote, or a group inside another store, such as a SpatialData table at `tables/<name>` or a MuData modality at `mod/<name>`. Element paths below are relative to that group, and its own node takes the place of the root: `tables/cells/obs` reads as `"tables/cells".obs`. Groups outside every AnnData object read as plain Zarr. One schema per group, tables named by dims, inherited coordinates and the catalog in `read_zarr_tables` all stay. A store whose root is an AnnData object costs one metadata read more; any other store reads each group's attributes once to find AnnData objects, which consolidated metadata serves from memory.
 >
 > - **Name the axes by element.** An element that declares no dimension names gets them from its place in the object:
 >

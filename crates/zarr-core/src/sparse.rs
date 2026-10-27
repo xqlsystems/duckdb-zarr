@@ -50,6 +50,9 @@ impl SparseInput {
         let indices = open_array(store, &matrix.indices)?;
         let indptr_arr = open_array(store, &matrix.indptr)?;
         let dtype = parse_dtype(&data, &matrix.data)?;
+        if dtype.byte_size().is_none() {
+            return Err(format!("sparse matrix '{name}': data has a variable-length dtype").into());
+        }
         if matrix.shape.len() != 2 || matrix.major_axis > 1 {
             return Err(format!("sparse matrix '{name}' is not 2-D").into());
         }
@@ -240,6 +243,10 @@ impl SparseBlock {
     pub fn len(&self) -> usize {
         self.major.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.major.is_empty()
+    }
 }
 
 /// Decode the major range `m0..m1` of a sparse table: one row per position
@@ -371,7 +378,7 @@ fn read_index_range(
     bytes
         .chunks_exact(size)
         .map(|b| {
-            let v = super::scan::read_int_as_i64_pub(b, &dtype, 0);
+            let v = super::decode::read_int_as_i64_pub(b, &dtype, 0);
             if v < 0 && !dtype.is_unsigned() {
                 Err(format!("'{name}' holds a negative index").into())
             } else {
@@ -612,6 +619,38 @@ mod tests {
         let mut v = 1.5f64.to_ne_bytes();
         add_value(&ZarrDtype::Float64, &mut v, &2.25f64.to_ne_bytes());
         assert_eq!(f64::from_ne_bytes(v), 3.75);
+    }
+
+    #[test]
+    fn sparse_data_must_have_a_fixed_width_dtype() {
+        for major_axis in [0, 1] {
+            let inner = Arc::new(MemoryStore::new());
+            let mut matrix = csr(&inner, "bad", [2, 2], &[]);
+            matrix.major_axis = major_axis;
+            let store: ZarrStore = inner.clone();
+            // An empty numeric CSR or CSC matrix is still valid.
+            assert!(SparseInput::open(&store, "bad", &matrix).is_ok());
+
+            let key = StoreKey::new("bad/data/zarr.json").unwrap();
+            let doc = serde_json::json!({
+                "zarr_format": 3, "node_type": "array", "shape": [0],
+                "data_type": "string", "fill_value": "",
+                "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [1]}},
+                "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+                "codecs": [{"name": "vlen-utf8", "configuration": {}}],
+                "attributes": {}
+            });
+            inner
+                .set(&key, Bytes::from(serde_json::to_vec(&doc).unwrap()))
+                .unwrap();
+            let result = SparseInput::open(&store, "bad", &matrix);
+            assert!(result.is_err(), "variable-length sparse data was accepted");
+            let error = result.err().unwrap().to_string();
+            assert!(
+                error.contains("bad") && error.contains("variable-length"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

@@ -5,15 +5,18 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "playwright test --grep-invert @remote",
+    "test:remote": "playwright test --grep @remote"
   },
   "dependencies": {
     "@deck.gl/core": "^9.1.0",
     "@deck.gl/layers": "^9.1.0",
-    "@duckdb/duckdb-wasm": "^1.33.1-dev57.0",
+    "@duckdb/duckdb-wasm": "1.33.1-dev110.0",
     "apache-arrow": "^21.0.0"
   },
   "devDependencies": {
+    "@playwright/test": "1.64.1",
     "vite": "^7.0.0"
   }
 }

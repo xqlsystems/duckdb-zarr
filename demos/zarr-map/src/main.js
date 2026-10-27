@@ -1,6 +1,6 @@
 import * as duckdb from "@duckdb/duckdb-wasm";
-import duckdbWasm from "@duckdb/duckdb-wasm/dist/duckdb-eh.wasm?url";
-import duckdbWorker from "@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js?url";
+import duckdbWasm from "@duckdb/duckdb-wasm/dist/duckdb-base.wasm?url";
+import duckdbWorker from "@duckdb/duckdb-wasm/dist/duckdb-browser-base.worker.js?url";
 import { Deck, MapView } from "@deck.gl/core";
 import { ScatterplotLayer } from "@deck.gl/layers";
 
@@ -21,32 +21,31 @@ const setStatus = (msg, isError = false) => {
 
 $("url").value = new URLSearchParams(location.search).get("url") ?? DEFAULT_URL;
 $("sql").value = `-- ERA5 2m temperature (K) at one hour, thinned to a 2 degree grid.
--- lon/lat are coordinate columns; only the chunk for this hour is read.
+-- bounds prunes time chunks before reading; WHERE only thins the spatial grid.
 SELECT longitude AS lon, latitude AS lat, "2m_temperature" AS value
-FROM read_zarr('{url}', dims=['time','latitude','longitude'])
-WHERE time = TIMESTAMP '2022-07-01 12:00:00'
-  AND round(latitude * 4)::INT % 8 = 0
+FROM read_zarr('{url}', dims := ['time','latitude','longitude'],
+  bounds := [['time','2021-07-01 12:00:00','2021-07-01 12:00:00']])
+WHERE round(latitude * 4)::INT % 8 = 0
   AND round(longitude * 4)::INT % 8 = 0`;
 
-const db = await (async () => {
-  const worker = new Worker(duckdbWorker);
-  const instance = new duckdb.AsyncDuckDB(new duckdb.ConsoleLogger(), worker);
-  await instance.instantiate(duckdbWasm);
-  // The locally built extension is unsigned.
-  await instance.open({ allowUnsignedExtensions: true });
-  return instance;
-})();
-const conn = await db.connect();
-
+let conn;
+$("run").disabled = true;
 try {
+  const worker = new Worker(duckdbWorker);
+  const db = new duckdb.AsyncDuckDB(new duckdb.ConsoleLogger(), worker);
+  await db.instantiate(duckdbWasm);
+  // The locally built extension is unsigned.
+  await db.open({ allowUnsignedExtensions: true });
+  conn = await db.connect();
   const [{ v }] = (await conn.query("SELECT version() AS v")).toArray();
   await conn.query(`LOAD '${EXTENSION_URL}'`);
   setStatus(`DuckDB ${v}; zarr extension loaded.`);
+  $("run").disabled = false;
 } catch (e) {
   setStatus(
-    `Could not load the zarr extension from ${EXTENSION_URL}\n${e.message}\n\n` +
-      "Copy a wasm_mvp build into public/ (see README) and check that the\n" +
-      "extension was built for this duckdb-wasm's DuckDB version.",
+    `Could not initialize DuckDB/zarr from ${EXTENSION_URL}\n${e.message ?? e}\n\n` +
+      "Copy a current wasm_eh build into public/ (see README).\n" +
+      "The browser runtime must support C API v1.5.6.",
     true,
   );
 }
@@ -60,12 +59,22 @@ const deck = new Deck({
 });
 
 async function run() {
+  if (!conn || $("run").disabled) return;
+  $("run").disabled = true;
   const url = $("url").value.trim();
   const sql = $("sql").value.replaceAll("{url}", url.replaceAll("'", "''"));
   setStatus("Running…");
   const t0 = performance.now();
   try {
     const table = await conn.query(sql);
+    if (!["lon", "lat", "value"].every((name) => table.getChild(name))) {
+      throw new Error("Query must return lon, lat and value columns.");
+    }
+    if (table.numRows === 0) {
+      deck.setProps({ layers: [] });
+      setStatus("0 rows; no data to display.");
+      return;
+    }
     const lon = table.getChild("lon").toArray();
     const lat = table.getChild("lat").toArray();
     const value = Float64Array.from(table.getChild("value").toArray(), Number);
@@ -94,7 +103,9 @@ async function run() {
         `(value ${min.toFixed(2)}…${max.toFixed(2)})`,
     );
   } catch (e) {
-    setStatus(e.message, true);
+    setStatus(e.message ?? String(e), true);
+  } finally {
+    $("run").disabled = false;
   }
 }
 

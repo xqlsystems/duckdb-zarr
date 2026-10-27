@@ -15,7 +15,7 @@ unsafe fn zarr_init_c_api_internal(
     access: *const duckdb::ffi::duckdb_extension_access,
 ) -> Result<bool, Box<dyn Error>> {
     unsafe {
-        if !duckdb::ffi::duckdb_rs_extension_api_init(info, access, "v1.2.0")? {
+        if !duckdb::ffi::duckdb_rs_extension_api_init(info, access, "v1.5.6")? {
             return Ok(false);
         }
 

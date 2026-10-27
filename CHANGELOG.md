@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+- Build and test against DuckDB 2.0.0 (`duckdb` crate `1.20000.0`) using the frozen v1.5.6 C API. The native adapter keeps `zarr_init_c_api` and emits `C_STRUCT` metadata with an API version of `v1.5.6`, rather than selecting DuckDB 2.0's incompatible v2 entrypoint. The same native binary is tested on DuckDB 1.5.6 and 2.0.0; older engines are not supported by this build.
+- Use the `v2.0-cyanoptera` extension CI tools and the explicit `lambda v: ...` SQL syntax supported by both target engines.
+
+### Fixed
+- Include the DuckDB major version when mapping an engine version to its Rust crate pin, including in the patch-update bot.
+- Run the AnnData cross-check with the Makefile's target DuckDB version instead of the script's older standalone pin.
+
 ## [0.2.0] - 2026-10-18
 
 ### Changed
@@ -22,6 +30,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `read_zarr` fails on a table that holds an array zarrs cannot open, naming it, instead of returning the table without that column. The group's other tables still read, and `read_zarr_tables` gives such a table a `NULL` `table_name`.
 
 ### Added
+- Engine-independent reading is shared through `crates/zarr-core`, including DataTree/AnnData layouts and sparse decoding; DuckDB types and vector writes remain in the root adapter.
+- `read_zarr(bounds := [[dim, lo, hi], ...])` selects inclusive numeric or CF-time coordinate ranges and prunes dense chunks with no matching coordinates. It supports group, table, and array selection. Unsupported string-label bounds and potentially lossy large-integer or timestamp bounds fail explicitly rather than silently returning incorrect rows.
 - **`read_zarr_views(store, database)`** returns the SQL that mounts a store's tables as views, one statement per row: `ATTACH ':memory:' AS database`, a `CREATE SCHEMA` per group, and a `CREATE OR REPLACE VIEW` per table. The client runs them; the C API cannot run DDL from an extension. `view_names := MAP {'time_lat_lon': 'surface'}` renames views, like xarray-sql's `table_names`.
 - **`table_name=` named parameter** on `read_zarr` (quoted alias `"table" :=`, because `TABLE` is a DuckDB keyword): reads a table by the name `read_zarr_tables` gives it, `read_zarr('era5.zarr', table_name := 'time_lat_lon')`, as an alternative to its `dims := [...]` list.
 - **`group_path=` named parameter** on `read_zarr`, `read_zarr_tables` and `read_zarr_metadata`, with the meaning of xarray's `group=`: `read_zarr('sim.zarr', group_path := 'simulation/fine')`. Leading and trailing slashes are ignored, and a group that does not exist is an error. `"group" :=` is an alias; the quotes are required because `GROUP` is a DuckDB keyword.
