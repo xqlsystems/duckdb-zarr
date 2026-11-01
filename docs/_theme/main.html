@@ -1,0 +1,65 @@
+{% macro guide_links(items) -%}
+<ul>
+  {% for item in items %}
+  <li>{% if item.children %}
+    <span class="guide-group">{{ item.title }}</span>
+    {{ guide_links(item.children) }}
+    {% else %}
+    <a href="{{ item.url | url }}"{% if item.active %} aria-current="page"{% endif %}>{{ item.title }}</a>
+    {% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{%- endmacro %}
+{% macro contents(items) -%}
+<ul>{% for item in items %}<li><a href="{{ item.url }}">{{ item.title }}</a>{% if item.children %}{{ contents(item.children) }}{% endif %}</li>{% endfor %}</ul>
+{%- endmacro %}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="{{ config.site_description }}">
+  <title>{% if page and not page.is_homepage %}{{ page.title }} · {% endif %}{{ config.site_name }} documentation</title>
+  <link rel="stylesheet" href="{{ 'site.css' | url }}">
+  <script src="{{ 'site.js' | url }}" data-site-root="{{ base_url }}/" data-search-url="{{ 'search/search_index.json' | url }}" defer></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to content</a>
+<header class="project-header">
+  <a class="wordmark" href="{{ base_url }}/">duckdb-zarr <span>/ field guide</span></a>
+  <nav class="project-links" aria-label="Project navigation">
+    <a href="{{ base_url }}/" aria-current="true">Documentation</a>
+    <a href="{{ 'biology/' | url }}">Biologists examples</a>
+    <a href="{{ config.repo_url }}">GitHub ↗</a>
+  </nav>
+</header>
+<div class="docs-tools">
+  <button type="button" class="guides-toggle" aria-expanded="false" aria-controls="guide-nav">Browse guides</button>
+  <form class="docs-search" role="search">
+    <label class="sr-only" for="docs-search-input">Search documentation</label>
+    <input id="docs-search-input" type="search" placeholder="Search the documentation…" autocomplete="off" aria-controls="search-results">
+    <div id="search-results" class="search-results" role="region" aria-label="Search results" aria-live="polite" hidden></div>
+  </form>
+</div>
+<div class="docs-layout">
+  <aside id="guide-nav" class="guide-nav">
+    <nav aria-label="Documentation guides">
+      <p class="nav-heading">In this guide</p>
+      {{ guide_links(nav) }}
+      <a class="biology-link" href="{{ 'biology/' | url }}">Try the biology examples ↗</a>
+    </nav>
+  </aside>
+  <main id="main-content" class="docs-content" tabindex="-1">
+    <p class="eyebrow">{% if page and page.is_homepage %}Documentation{% else %}The field guide{% endif %}</p>
+    {% block content %}{{ page.content }}{% endblock %}
+    <footer class="page-footer">
+      {% if page and page.previous_page %}<a href="{{ page.previous_page.url | url }}">← {{ page.previous_page.title }}</a>{% endif %}
+      {% if page and page.next_page %}<a href="{{ page.next_page.url | url }}">{{ page.next_page.title }} →</a>{% endif %}
+      <a href="{{ 'biology/' | url }}">Biologists examples</a>
+    </footer>
+  </main>
+  {% if page and page.toc %}<aside class="page-toc"><nav aria-label="On this page"><p class="nav-heading">On this page</p>{{ contents(page.toc) }}</nav></aside>{% endif %}
+</div>
+</body>
+</html>

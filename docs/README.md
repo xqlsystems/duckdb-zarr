@@ -31,7 +31,11 @@ This project is related to [xarray-sql](https://github.com/alxmrs/xarray-sql) an
 
 - **Biology:** [AnnData annotated matrices](anndata.md), with a cell-by-gene
   example and a section on AnnData tables in SpatialData stores;
-  [OME-Zarr bioimages](ome-zarr.md).
+  [OME-Zarr bioimages](ome-zarr.md). Try the single-page
+  [duckdb-zarr for biologists browser example](../demos/biology/README.md):
+  editable SQL over a real single-cell RNA-seq UMAP and a rotatable 3D
+  fluorescence volume, both backed by a Zarr-URL box you can repoint at your
+  own S3/HTTPS store.
 - **Climate and geoscience:** [gridded-data quick start](#basic-usage) below;
   [tested atmospheric and ocean datasets](domains.md#climate-and-geoscience).
 - **General reference:** [design and SQL interfaces](design.md) and

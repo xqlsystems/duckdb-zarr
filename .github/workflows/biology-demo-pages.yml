@@ -1,0 +1,122 @@
+#
+# Builds the existing Markdown guides and browser biology examples as one
+# cohesive documentation site, then publishes the combined GitHub Pages artifact.
+#
+# The extension is never rebuilt here: this workflow reuses the wasm_eh
+# artifact already produced by the Main Extension Distribution Pipeline.
+# Documentation changes on main deploy independently of Rust builds; manual
+# dispatch can select a specific successful run's artifact.
+#
+name: Documentation Pages
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - "scripts/build_docs.py"
+      - "demos/biology/**"
+      - ".github/workflows/biology-demo-pages.yml"
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: >-
+          Main Extension Distribution Pipeline run ID to pull the wasm_eh
+          extension artifact from. Leave empty to use the latest successful
+          run on main.
+        required: false
+
+concurrency:
+  group: documentation-pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    name: Build documentation and biology examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22'
+
+      - name: Resolve the Main Distribution Pipeline run to pull from
+        id: source-run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REQUESTED_RUN: ${{ inputs.run_id }}
+        run: |
+          if [ -n "$REQUESTED_RUN" ]; then
+            run_id="$REQUESTED_RUN"
+          else
+            run_id=$(gh run list --repo "$GH_REPO" \
+              --workflow MainDistributionPipeline.yml --branch main \
+              --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+          fi
+          if [ -z "$run_id" ]; then
+            echo "::error::No successful 'Main Extension Distribution Pipeline' run found on main. Run it first (push to main, or 'gh workflow run MainDistributionPipeline.yml'), then re-run this workflow with that run's ID."
+            exit 1
+          fi
+          if ! [[ "$run_id" =~ ^[0-9]+$ ]]; then
+            echo "::error::Run ID must contain only digits."
+            exit 1
+          fi
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Download that run's wasm_eh extension artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: '*-extension-wasm_eh'
+          run-id: ${{ steps.source-run.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: demos/biology/public
+          merge-multiple: true
+
+      - name: Confirm exactly one wasm_eh extension binary was retrieved
+        env:
+          SOURCE_RUN_ID: ${{ steps.source-run.outputs.run_id }}
+        run: |
+          count=$(find demos/biology/public -maxdepth 1 -name 'zarr.duckdb_extension.wasm' | wc -l)
+          if [ "$count" != "1" ]; then
+            echo "::error::Expected exactly one demos/biology/public/zarr.duckdb_extension.wasm from run $SOURCE_RUN_ID. Found: $(ls demos/biology/public 2>/dev/null || echo '(nothing)')"
+            exit 1
+          fi
+
+      - name: Install JS dependencies
+        working-directory: demos/biology
+        run: npm ci --ignore-scripts
+
+      - name: Build the combined static docsite
+        run: uv run scripts/build_docs.py
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
+        with:
+          path: site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5
