@@ -16,7 +16,7 @@ def on_page_markdown(markdown, *, page, config, files):
         parts = urlsplit(href)
         target = posixpath.normpath(str(PurePosixPath('docs') / PurePosixPath(page.file.src_uri).parent / parts.path))
         if target == 'demos/biology/README.md':
-            destination = get_relative_url('biology/index.html', page.file.src_uri)
+            destination = get_relative_url('biology/index.md', page.file.src_uri)
         elif not target.startswith('docs/') and not target.startswith('../'):
             destination = f"{config.repo_url.rstrip('/')}/blob/main/{quote(target, safe='/')}"
         else:

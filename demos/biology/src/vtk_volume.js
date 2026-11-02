@@ -347,9 +347,7 @@ export function createVolume(container) {
     return opacity;
   }
 
-  /** Label source channel colors and mark only channel IDs actually present in the SQL result as
-   * shown.
-   */
+  /** Label source channel colors; preserve active-channel state through opacity and attributes. */
   function buildLegend(channels, channelIds) {
     legend.replaceChildren();
     for (const [index, channel] of channels.entries()) {
@@ -359,7 +357,7 @@ export function createVolume(container) {
       item.dataset.color = channel.color;
       const swatch = element('span', { width: '10px', height: '10px', borderRadius: '50%', background: channel.color });
       swatch.setAttribute('aria-hidden', 'true');
-      item.append(swatch, document.createTextNode(`${channel.name}${channelIds.includes(index) ? ' · shown' : ''}`));
+      item.append(swatch, document.createTextNode(channel.name));
       legend.appendChild(item);
     }
   }

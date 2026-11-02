@@ -43,6 +43,14 @@ async function htmlFiles(directory) {
   return all;
 }
 
+/** Compare the shared navigation's typography and spacing across guide and app pages. */
+async function navigationStyles(page) {
+  return page.evaluate(() => ['.project-header', '.docs-tools', '.docs-search input', '#guide-nav .nav-heading', '.guides-toggle'].map((selector) => {
+    const style = getComputedStyle(document.querySelector(selector));
+    return [selector, ...['fontSize', 'fontWeight', 'lineHeight', 'margin', 'padding'].map((property) => style[property])];
+  }));
+}
+
 try {
   const files = await htmlFiles(site);
   let checked = 0;
@@ -77,6 +85,10 @@ try {
   await page.goto(base);
   assert.equal((await page.locator('main h1').textContent()).replace(/¶$/, ''), 'duckdb-zarr');
   const docsPalette = await page.evaluate(() => ({ color: getComputedStyle(document.documentElement).color, background: getComputedStyle(document.documentElement).backgroundColor, heading: getComputedStyle(document.querySelector('h1')).fontFamily }));
+  const docsNavigation = await navigationStyles(page);
+  await page.setViewportSize({ width: 390, height: 844 });
+  const mobileNavigation = await navigationStyles(page);
+  await page.setViewportSize({ width: 1440, height: 1100 });
   await mkdir(evidence, { recursive: true });
   await page.screenshot({ path: join(evidence, 'docs-desktop.png'), fullPage: false });
   await page.getByRole('searchbox', { name: 'Search documentation' }).fill('AnnData');
@@ -89,8 +101,27 @@ try {
   assert.equal((await page.locator('main h1').textContent()).replace(/¶$/, ''), 'Examples');
   assert.equal(await page.getByRole('navigation', { name: 'Project navigation', exact: true }).getByRole('link', { name: 'Examples', exact: true }).getAttribute('aria-current'), 'page');
   assert.equal(await page.locator('main canvas').count(), 0, 'The index should not load interactive datasets.');
-  await page.locator('main').getByRole('link', { name: 'For biologists', exact: true }).click();
+  const biologyExample = page.getByRole('navigation', { name: 'Documentation guides', exact: true }).getByRole('link', { name: 'Biology', exact: true });
+  assert.equal(await biologyExample.count(), 1, 'Biology must be a sidebar example, not only an index link.');
+  assert.equal(await biologyExample.evaluate((link) => link.closest('ul').previousElementSibling.textContent.trim()), 'Examples');
+  assert.deepEqual(await biologyExample.evaluate((link) => [...link.closest('ul').querySelectorAll(':scope > li > a')].map((item) => item.textContent.trim())), ['Overview', 'Climate and geoscience', 'Biology']);
+  const guideLinks = await page.locator('#guide-nav a').evaluateAll((links) => links.map((link) => [link.textContent.trim(), link.href]));
+  await page.locator('main').getByRole('link', { name: 'Climate and geoscience', exact: true }).click();
+  assert.equal(page.url(), base + 'examples/climate/');
+  assert.equal((await page.locator('main h1').textContent()).replace(/¶$/, ''), 'Climate and geoscience');
+  assert.equal(await page.locator('main pre code').count(), 3);
+  assert.equal(await page.locator('main canvas').count(), 0, 'The climate walkthrough is Markdown, not a second interactive app.');
+  assert.equal(await page.getByRole('navigation', { name: 'Project navigation', exact: true }).getByRole('link', { name: 'Examples', exact: true }).getAttribute('aria-current'), 'page');
+  await page.getByRole('navigation', { name: 'Project navigation', exact: true }).getByRole('link', { name: 'Examples', exact: true }).click();
+  await biologyExample.click();
   assert.equal(page.url(), base + 'biology/');
+  assert.equal(await page.getByRole('navigation', { name: 'Documentation guides', exact: true }).count(), 1, 'Biology must retain the docsite sidebar.');
+  assert.deepEqual(await page.locator('#guide-nav a').evaluateAll((links) => links.map((link) => [link.textContent.trim(), link.href])), guideLinks);
+  assert.equal(await biologyExample.getAttribute('aria-current'), 'page');
+  assert.equal(await page.getByRole('searchbox', { name: 'Search documentation' }).count(), 1);
+  assert.equal(await page.locator('.wordmark').count(), 1, 'Do not retain the standalone header alongside the shared header.');
+  assert.equal(await page.locator('main').count(), 1, 'Do not nest the standalone document inside the docsite.');
+  assert.deepEqual(await navigationStyles(page), docsNavigation, 'The app stylesheet must not change shared navigation styles.');
   assert.equal(await page.getByRole('navigation', { name: 'Project navigation', exact: true }).getByRole('link', { name: 'Examples', exact: true }).getAttribute('href'), '../examples/');
   const appPalette = await page.evaluate(() => ({ color: getComputedStyle(document.documentElement).color, background: getComputedStyle(document.documentElement).backgroundColor, heading: getComputedStyle(document.querySelector('h1')).fontFamily }));
   assert.deepEqual(appPalette, docsPalette, 'The docs and app should retain the same palette and heading font.');
@@ -101,7 +132,27 @@ try {
   assert.ok(status.includes('35,175,800 rows') && status.includes('plot updated'), status);
   assert.ok((await page.locator('#anndata-status').textContent()).includes('700 rows'));
   assert.equal(await page.locator('#ome-plot .biology-visualization').getAttribute('data-channel-ids'), '0,1');
-  await page.getByRole('link', { name: 'OME-Zarr guide', exact: true }).click();
+  assert.deepEqual(await page.getByRole('list', { name: 'Channel colors' }).getByRole('listitem').allTextContents(), ['LaminB1', 'Dapi']);
+  await page.getByRole('searchbox', { name: 'Search documentation' }).fill('Air temperature for a map');
+  await page.locator('#search-results a').first().waitFor();
+  assert.ok((await page.locator('#search-results a').first().getAttribute('href')).startsWith(base + 'examples/climate/'));
+  await page.keyboard.press('Escape');
+  assert.equal(await page.locator('#search-results').isHidden(), true);
+  await page.screenshot({ path: join(evidence, 'biology-desktop.png'), fullPage: false });
+  await page.setViewportSize({ width: 390, height: 844 });
+  assert.deepEqual(await navigationStyles(page), mobileNavigation, 'Biology must use the same mobile navigation styles as the guides.');
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), 'Shared navigation must not overflow the biology page on mobile.');
+  const biologyGuides = page.getByRole('button', { name: 'Browse guides', exact: true });
+  assert.equal(await biologyGuides.getAttribute('aria-expanded'), 'false');
+  assert.equal(await page.locator('#guide-nav').isHidden(), true);
+  await biologyGuides.click();
+  assert.equal(await biologyGuides.getAttribute('aria-expanded'), 'true');
+  assert.equal(await biologyExample.isVisible(), true);
+  await page.screenshot({ path: join(evidence, 'biology-mobile-navigation.png'), fullPage: false });
+  await page.getByRole('navigation', { name: 'Documentation guides', exact: true }).getByRole('link', { name: 'Climate and geoscience', exact: true }).click();
+  assert.equal(page.url(), base + 'examples/climate/');
+  await page.setViewportSize({ width: 1440, height: 1100 });
+  await page.getByRole('navigation', { name: 'Documentation guides', exact: true }).getByRole('link', { name: 'OME-Zarr', exact: true }).click();
   assert.equal(page.url(), base + 'ome-zarr/');
   await page.getByRole('navigation', { name: 'Project navigation', exact: true }).getByRole('link', { name: 'Documentation', exact: true }).click();
   assert.equal(page.url(), base);
@@ -118,6 +169,9 @@ try {
   await page.screenshot({ path: join(evidence, 'docs-mobile.png'), fullPage: false });
   await page.getByRole('navigation', { name: 'Project navigation', exact: true }).getByRole('link', { name: 'Examples', exact: true }).click();
   assert.equal(page.url(), base + 'examples/');
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
+  await page.locator('main').getByRole('link', { name: 'Climate and geoscience', exact: true }).click();
+  assert.equal(page.url(), base + 'examples/climate/');
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
   await page.goto(origin + '/');
   assert.equal((await page.locator('main h1').textContent()).replace(/¶$/, ''), 'duckdb-zarr');

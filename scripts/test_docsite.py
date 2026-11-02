@@ -51,18 +51,45 @@ class ReusedBuildTests(unittest.TestCase):
             root = Path(temporary)
             biology = root / 'demos/biology'
             (biology / 'dist').mkdir(parents=True)
-            (biology / 'dist/index.html').write_text('<h1>Static build test fixture</h1>')
+            (biology / 'dist/index.html').write_text('<main id="top"><h1>Static build test fixture</h1></main>')
             extension = b'presence-test-only-not-a-real-wasm-module'
             (biology / 'dist/zarr.duckdb_extension.wasm').write_bytes(extension)
             (root / 'docs').mkdir()
             (root / 'docs/index.md').write_text('# Static build test fixture\n')
-            (root / 'mkdocs.yml').write_text('site_name: Build test\n')
+            theme = root / 'theme'
+            theme.mkdir()
+            (theme / 'biology.html').write_text('{{ config.extra.biology.body | safe }}')
+            (root / 'mkdocs.yml').write_text('site_name: Build test\ntheme:\n  name: mkdocs\n  custom_dir: theme\n')
             output = root / 'site'
             with patch.multiple(BUILD, ROOT=root, BIOLOGY=biology), patch('sys.argv', ['build_docs.py', '--skip-demo-build', '--site-dir', str(output)]), contextlib.redirect_stdout(io.StringIO()):
                 BUILD.main()
             self.assertEqual((output / 'biology/zarr.duckdb_extension.wasm').read_bytes(), extension)
             self.assertTrue((output / BUILD.MARKER).is_file())
             self.assertFalse((biology / 'public').exists())
+
+
+class BiologyHTMLTests(unittest.TestCase):
+    """Keep compiled application markup independent of its standalone navigation."""
+
+    def test_main_and_assets_are_preserved_without_the_standalone_shell(self):
+        """Extract exact control IDs, entities and Vite asset paths for the shared template."""
+        body = '<section id="anndata"><p>RNA &amp; DNA &#181;m</p><input id="source"/><textarea>SELECT 1 &lt; 2;</textarea></section>'
+        app = BUILD.BiologyHTML()
+        app.feed(
+            '<html><head><title>Standalone title</title>'
+            '<script type="module" crossorigin src="./assets/app.js"></script>'
+            '<link rel="stylesheet" href="./assets/app.css"></head>'
+            '<body><header>Standalone navigation</header><main id="top">'
+            + body + '</main></body></html>'
+        )
+        app.close()
+        self.assertEqual(app.main_count, 1)
+        self.assertFalse(app.in_main)
+        self.assertEqual(''.join(app.body), body)
+        self.assertEqual(app.assets, [
+            '<script type="module" crossorigin src="./assets/app.js"></script>',
+            '<link rel="stylesheet" href="./assets/app.css">',
+        ])
 
 
 class DeploymentPinTests(unittest.TestCase):

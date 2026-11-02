@@ -22,6 +22,8 @@ nav:
   - Start here: README.md
   - Examples:
       - Overview: examples/index.md
+      - Climate and geoscience: examples/climate.md
+      - Biology: biology/index.md
   - Biology:
       - AnnData: anndata.md
       - OME-Zarr: ome-zarr.md

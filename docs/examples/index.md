@@ -1,7 +1,12 @@
 # Examples
 
-Explore Zarr data with DuckDB and SQL. Choose an example to run queries in your
-browser and see the results in an interactive visualization.
+Explore Zarr data with DuckDB and SQL. Choose a written SQL walkthrough or an
+interactive browser example.
+
+## Climate and geoscience
+
+[Climate and geoscience](climate.md) — existing SQL examples for an
+air-temperature map, monthly means, and public precipitation data.
 
 ## Biology
 

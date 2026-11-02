@@ -21,16 +21,19 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="{{ config.site_description }}">
   <title>{% if page and not page.is_homepage %}{{ page.title }} · {% endif %}{{ config.site_name }} documentation</title>
+  {% block extra_head %}{% endblock %}
   <link rel="stylesheet" href="{{ 'site.css' | url }}">
   <script src="{{ 'site.js' | url }}" data-site-root="{{ base_url }}/" data-search-url="{{ 'search/search_index.json' | url }}" defer></script>
 </head>
 <body>
+{% set is_biology = page and page.file.src_uri == 'biology/index.md' %}
+{% set in_examples = page and (page.url.startswith('examples/') or is_biology) %}
 <a class="skip-link" href="#main-content">Skip to content</a>
 <header class="project-header">
   <a class="wordmark" href="{{ base_url }}/">duckdb-zarr <span>/ field guide</span></a>
   <nav class="project-links" aria-label="Project navigation">
-    <a href="{{ base_url }}/"{% if not page or not page.url.startswith('examples/') %} aria-current="true"{% endif %}>Documentation</a>
-    <a href="{{ 'examples/' | url }}"{% if page and page.url.startswith('examples/') %} aria-current="page"{% endif %}>Examples</a>
+    <a href="{{ base_url }}/"{% if not in_examples %} aria-current="true"{% endif %}>Documentation</a>
+    <a href="{{ 'examples/' | url }}"{% if in_examples %} aria-current="page"{% endif %}>Examples</a>
     <a href="{{ config.repo_url }}">GitHub ↗</a>
   </nav>
 </header>
@@ -42,7 +45,7 @@
     <div id="search-results" class="search-results" role="region" aria-label="Search results" aria-live="polite" hidden></div>
   </form>
 </div>
-<div class="docs-layout">
+<div class="docs-layout{% if is_biology %} biology-layout{% endif %}">
   <aside id="guide-nav" class="guide-nav">
     <nav aria-label="Documentation guides">
       <p class="nav-heading">In this guide</p>
@@ -50,7 +53,7 @@
       <a class="biology-link" href="{{ 'examples/' | url }}">Browse examples ↗</a>
     </nav>
   </aside>
-  <main id="main-content" class="docs-content" tabindex="-1">
+  <main id="main-content" class="{% block main_class %}docs-content{% endblock %}" tabindex="-1">
     <p class="eyebrow">{% if page and page.is_homepage %}Documentation{% else %}The field guide{% endif %}</p>
     {% block content %}{{ page.content }}{% endblock %}
     <footer class="page-footer">

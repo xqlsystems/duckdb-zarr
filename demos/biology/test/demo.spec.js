@@ -78,8 +78,7 @@ test('original remote datasets, native-resolution composite, SQL and interaction
     await expect(volume).toHaveAttribute('data-channel-ids', '0,1');
     const key = page.getByRole('list', { name: 'Channel colors' });
     await expect(key.locator('[data-active="true"]')).toHaveCount(2);
-    await expect(key).toContainText('LaminB1');
-    await expect(key).toContainText('Dapi');
+    await expect(key.getByRole('listitem')).toHaveText(['LaminB1', 'Dapi']);
     await expect(page.locator('.volume-label-legend, #ome-plot input, #ome-plot select')).toHaveCount(0);
     const pixels = await pixelColors(canvas);
     expect(pixels.blue).toBeGreaterThan(100);

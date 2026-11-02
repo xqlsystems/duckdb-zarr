@@ -15,6 +15,8 @@ or maintained in a second format.
 
 The documentation and examples share the green-and-cream palette, serif
 headings, wordmark, and top links: Documentation, Examples, GitHub.
+The published biology page also uses the same sidebar, search, and mobile
+Browse guides menu, with Biology marked as the active example.
 The examples also link directly to their corresponding format guides. Links
 remain relative, including when GitHub Pages hosts the whole site below a
 project prefix such as `/duckdb-zarr/`.
@@ -38,6 +40,11 @@ build, and combines everything under ignored `site/`. It stages files only
 temporarily; it does not edit the source Markdown. It does not download or
 bundle scientific datasets. The biology app still fetches its original remote
 sources only when someone opens the interactive page.
+
+For biology, the builder stages `biology/index.md` using the compiled app's
+main content and asset links. Its `biology.html` template extends the shared
+`main.html`, so navigation comes from `mkdocs.yml` rather than a copied menu
+or an iframe. The standalone Vite build remains unchanged.
 
 `npm run dev` inside `demos/biology` remains useful for editing that app alone.
 It is not the combined documentation preview, so its parent-documentation links
