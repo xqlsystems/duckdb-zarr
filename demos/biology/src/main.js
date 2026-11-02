@@ -17,7 +17,9 @@ const sourceHandles = {};
 const sourceMetadata = {};
 let conn, db, busy = false;
 const pendingResets = {};
+/** Cancel a queued automatic query before an explicit user action supersedes it. */
 function cancelReset(kind) { clearTimeout(pendingResets[kind]); delete pendingResets[kind]; }
+/** Debounce filter edits and retry after an active query, so the latest bounds are not lost. */
 function scheduleReset(kind) {
   cancelReset(kind);
   pendingResets[kind] = setTimeout(() => {
@@ -30,6 +32,7 @@ const status = (id, text, error = false) => {
   $(id).textContent = text;
   $(id).classList.toggle('error', error);
 };
+/** Serialize queries while keeping failed-source recovery controls usable when unlocked. */
 function lock(locked) {
   for (const kind of kinds) {
     for (const control of document.querySelectorAll(`#${kind} button, #${kind} select, #${kind} input`)) {
@@ -38,6 +41,7 @@ function lock(locked) {
     }
   }
 }
+/** Build SQL from the active source metadata and controls, validating the selected depth. */
 function defaultSQL(kind, statistics = false) {
   if (kind === 'ome') {
     const cfg = sourceMetadata.ome;
@@ -51,6 +55,7 @@ function defaultSQL(kind, statistics = false) {
   if (statistics) return `SELECT cell_type AS annotation, COUNT(*) AS cells\nFROM pbmc_obs\nGROUP BY ALL ORDER BY cells DESC`;
   return scatterSQL(kind, { filter: $(`${kind}-filter`).value });
 }
+/** Show at most twelve Arrow rows as text without materializing the full result. */
 function resultTable(kind, table) {
   const host = $(`${kind}-results`);
   host.replaceChildren();
@@ -75,6 +80,7 @@ function resultTable(kind, table) {
   caption.textContent = `${table.numRows.toLocaleString()} rows; showing the first ${Math.min(12, table.numRows)}.`;
   host.append(el);
 }
+/** Execute the editor verbatim, render supported result shapes, and clear stale plots on errors. */
 async function run(kind) {
   if (!conn || busy) return;
   cancelReset(kind);
@@ -112,6 +118,7 @@ async function run(kind) {
     lock(false);
   }
 }
+/** Replace filter values while retaining the leading all-values option. */
 function fillOptions(id, values) {
   $(id).replaceChildren($(id).firstElementChild);
   for (const value of values) {
@@ -121,6 +128,7 @@ function fillOptions(id, values) {
     $(id).append(option);
   }
 }
+/** Replace the editor with control-derived SQL, queuing rather than losing edits while busy. */
 function reset(kind, stats = false) {
   cancelReset(kind);
   if (busy) { scheduleReset(kind); return; }
@@ -131,6 +139,9 @@ function reset(kind, stats = false) {
     status(`${kind}-status`, error.message, true);
   }
 }
+/** Load a validated remote source, replace views transactionally, and retire prior RAM handles
+ * only after success.
+ */
 async function loadSource(kind) {
   if (!conn || busy) return;
   cancelReset(kind);

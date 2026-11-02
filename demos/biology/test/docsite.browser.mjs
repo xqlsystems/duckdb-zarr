@@ -33,6 +33,7 @@ const origin = `http://127.0.0.1:${server.address().port}`;
 const base = `${origin}${prefix}`;
 let browser;
 
+/** List generated HTML pages recursively for internal-link and fragment validation. */
 async function htmlFiles(directory) {
   const all = [];
   for (const entry of await readdir(directory, { withFileTypes: true })) {
@@ -83,8 +84,14 @@ try {
   await page.locator('#search-results a').first().click();
   assert.ok(page.url().startsWith(base + 'anndata/'), `Search lost the prefix: ${page.url()}`);
   assert.ok((await page.locator('main h1').textContent()).includes('AnnData'));
-  await page.getByRole('navigation', { name: 'Project navigation', exact: true }).getByRole('link', { name: 'Biologists examples', exact: true }).click();
+  await page.getByRole('navigation', { name: 'Project navigation', exact: true }).getByRole('link', { name: 'Examples', exact: true }).click();
+  assert.equal(page.url(), base + 'examples/');
+  assert.equal((await page.locator('main h1').textContent()).replace(/¶$/, ''), 'Examples');
+  assert.equal(await page.getByRole('navigation', { name: 'Project navigation', exact: true }).getByRole('link', { name: 'Examples', exact: true }).getAttribute('aria-current'), 'page');
+  assert.equal(await page.locator('main canvas').count(), 0, 'The index should not load interactive datasets.');
+  await page.locator('main').getByRole('link', { name: 'For biologists', exact: true }).click();
   assert.equal(page.url(), base + 'biology/');
+  assert.equal(await page.getByRole('navigation', { name: 'Project navigation', exact: true }).getByRole('link', { name: 'Examples', exact: true }).getAttribute('href'), '../examples/');
   const appPalette = await page.evaluate(() => ({ color: getComputedStyle(document.documentElement).color, background: getComputedStyle(document.documentElement).backgroundColor, heading: getComputedStyle(document.querySelector('h1')).fontFamily }));
   assert.deepEqual(appPalette, docsPalette, 'The docs and app should retain the same palette and heading font.');
   assert.equal(await page.getByRole('link', { name: 'AnnData guide', exact: true }).getAttribute('href'), '../anndata/');
@@ -109,10 +116,16 @@ try {
   assert.equal(page.url(), base + 'ome-zarr/');
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
   await page.screenshot({ path: join(evidence, 'docs-mobile.png'), fullPage: false });
+  await page.getByRole('navigation', { name: 'Project navigation', exact: true }).getByRole('link', { name: 'Examples', exact: true }).click();
+  assert.equal(page.url(), base + 'examples/');
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
   await page.goto(origin + '/');
   assert.equal((await page.locator('main h1').textContent()).replace(/¶$/, ''), 'duckdb-zarr');
+  await page.getByRole('navigation', { name: 'Project navigation', exact: true }).getByRole('link', { name: 'Examples', exact: true }).click();
+  assert.equal(page.url(), origin + '/examples/');
+  assert.equal(await page.locator('main').getByRole('link', { name: 'For biologists', exact: true }).getAttribute('href'), '../biology/');
   assert.deepEqual(errors, []);
-  console.log('Passed: docs search, matched theme, docs → live remote biology → format guide → docs, mobile guide navigation, root and project-prefix hosting.');
+  console.log('Passed: docs search, examples index → live remote biology → format guide → docs, matched theme, mobile navigation, root and project-prefix hosting.');
   console.log(`Screenshot evidence: ${evidence}`);
 } finally {
   await browser?.close();

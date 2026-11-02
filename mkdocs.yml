@@ -20,6 +20,8 @@ markdown_extensions:
       permalink: true
 nav:
   - Start here: README.md
+  - Examples:
+      - Overview: examples/index.md
   - Biology:
       - AnnData: anndata.md
       - OME-Zarr: ome-zarr.md

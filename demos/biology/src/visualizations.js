@@ -7,6 +7,7 @@ const MUTED = '#8fa7bd';
 const MAX_SCATTER_ROWS = 300_000;
 const PALETTE = ['#62d9c6', '#8aa8ff', '#f6b86b', '#ef85ad', '#c0a0f5', '#a4d66d', '#65c6ef', '#f1d56c', '#df9390', '#89c8ab', '#dca4ed', '#b7c4d1'];
 
+/** Create an owned DOM node with styles and text-only labels, never interpolated HTML. */
 function element(tag, style, text) {
   const node = document.createElement(tag);
   Object.assign(node.style, style);
@@ -14,6 +15,9 @@ function element(tag, style, text) {
   return node;
 }
 
+/** Coerce supported numeric values while rejecting nulls, booleans, blanks and extreme
+ * magnitudes.
+ */
 function number(value) {
   if (value == null || typeof value === 'boolean' || (typeof value === 'string' && !value.trim())) return NaN;
   if (!['number', 'string', 'bigint'].includes(typeof value)) return NaN;
@@ -21,10 +25,12 @@ function number(value) {
   return Number.isFinite(result) && Math.abs(result) <= 1e150 ? result : NaN;
 }
 
+/** Format finite display measurements and use a dash for unavailable values. */
 function format(value) {
   return Number.isFinite(value) ? value.toLocaleString(undefined, { maximumSignificantDigits: 5 }) : '—';
 }
 
+/** Mount an independently owned drawing stage and status area without replacing parent controls. */
 function frame(container, name, hint) {
   if (!container || typeof container.appendChild !== 'function') throw new TypeError('A visualization needs a DOM container.');
   const root = element('section', { display: 'flex', flexDirection: 'column', width: '100%', height: '100%', minHeight: '320px', minWidth: '0', overflow: 'hidden', background: BACKGROUND, color: INK, font: '12px/1.5 system-ui, sans-serif', borderRadius: '10px' });
@@ -42,6 +48,7 @@ function frame(container, name, hint) {
   return { root, stage, footer, status };
 }
 
+/** Watch stage size with a window-resize fallback and return the matching cleanup callback. */
 function observeSize(target, callback) {
   if (typeof ResizeObserver !== 'undefined') {
     const observer = new ResizeObserver(callback);
@@ -52,6 +59,7 @@ function observeSize(target, callback) {
   return () => window.removeEventListener('resize', callback);
 }
 
+/** Choose a deterministic palette color from a category label, independent of SQL row order. */
 function categoryColor(label) {
   let hash = 2166136261;
   for (let i = 0; i < label.length; i += 1) hash = Math.imul(hash ^ label.charCodeAt(i), 16777619);
@@ -102,6 +110,9 @@ export function createScatter(container, { spatial = false, invertY = spatial } 
   const on = (type, fn, options = {}) => canvas.addEventListener(type, fn, { ...options, signal: events.signal });
   const plot = () => ({ x: 58, y: 20, w: Math.max(1, width - 78), h: Math.max(1, height - 67) });
 
+  /** Map data to canvas pixels while preserving spatial aspect ratio and the selected Y
+   * orientation.
+   */
   function transform() {
     const box = plot();
     let sx = box.w / bounds.dx;
@@ -110,6 +121,9 @@ export function createScatter(container, { spatial = false, invertY = spatial } 
     return { ...box, sx: sx * zoom, sy: sy * zoom * (invertY ? 1 : -1), cx: box.x + box.w / 2 + panX, cy: box.y + box.h / 2 + panY };
   }
 
+  /** Draw axes, cells and source polygons, then rebuild screen-space bins for bounded hover
+   * lookup.
+   */
   function draw() {
     pending = 0;
     if (disposed) return;
@@ -211,10 +225,12 @@ export function createScatter(container, { spatial = false, invertY = spatial } 
     context.restore();
   }
 
+  /** Coalesce repeated plot updates into one pending animation frame. */
   function requestDraw() {
     if (!disposed && !pending) pending = requestAnimationFrame(draw);
   }
 
+  /** Hide stale point details and cancel a pending hover lookup. */
   function hideTooltip() {
     tooltip.style.display = 'none';
     hoverPoint = null;
@@ -222,6 +238,7 @@ export function createScatter(container, { spatial = false, invertY = spatial } 
     hoverFrame = 0;
   }
 
+  /** Restore fit-to-data zoom and pan while clearing stale hover state. */
   function reset() {
     zoom = 1;
     panX = panY = 0;
@@ -229,6 +246,7 @@ export function createScatter(container, { spatial = false, invertY = spatial } 
     requestDraw();
   }
 
+  /** Clamp zoom and adjust pan so the cursor remains anchored to the same plotted coordinate. */
   function zoomAt(factor, x, y) {
     const box = plot();
     const next = Math.max(0.1, Math.min(1000, zoom * factor));
@@ -240,6 +258,7 @@ export function createScatter(container, { spatial = false, invertY = spatial } 
     requestDraw();
   }
 
+  /** Find the nearest point in neighboring screen bins and show its details as plain text. */
   function showTooltip() {
     hoverFrame = 0;
     if (!hoverPoint || drag || disposed) return;
@@ -286,6 +305,7 @@ export function createScatter(container, { spatial = false, invertY = spatial } 
       if (!hoverFrame) hoverFrame = requestAnimationFrame(showTooltip);
     }
   });
+  /** Release only the active pointer capture and restore the idle cursor. */
   function endDrag(event) {
     if (!drag || drag.id !== event.pointerId) return;
     if (canvas.hasPointerCapture(drag.id)) canvas.releasePointerCapture(drag.id);
@@ -320,6 +340,7 @@ export function createScatter(container, { spatial = false, invertY = spatial } 
   const stopObserving = observeSize(stage, requestDraw);
   requestDraw();
 
+  /** Discard points, polygons and legends while keeping the interactive canvas mounted. */
   function clear() {
     if (disposed) return;
     points = [];
@@ -336,6 +357,9 @@ export function createScatter(container, { spatial = false, invertY = spatial } 
   }
 
   return {
+    /** Validate and bound SQL rows and source polygons, then render category or expression-value
+     * colors.
+     */
     render(rows, { polygons = [] } = {}) {
       if (disposed) return;
       clear();
@@ -413,6 +437,9 @@ export function createScatter(container, { spatial = false, invertY = spatial } 
       requestDraw();
     },
     clear,
+    /** Idempotently release pointer events, observers and queued frames, removing only this
+     * plot's DOM.
+     */
     dispose() {
       if (disposed) return;
       clear();

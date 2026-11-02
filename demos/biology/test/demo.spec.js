@@ -2,6 +2,7 @@ import { test, expect } from '@playwright/test';
 import { PBMC_SOURCE_URL } from '../src/remote_anndata.js';
 import { OME_URL } from '../src/remote_ome.js';
 
+/** Wait for actual remote example startup and verify loaded data plus unlocked query controls. */
 async function ready(page) {
   await page.goto('/');
   await page.waitForFunction(() => document.querySelector('#runtime').classList.contains('error') || document.querySelector('#ome-status').textContent.includes('plot updated') || document.querySelector('#ome-status').classList.contains('error'), null, { timeout: 180_000 });
@@ -10,11 +11,13 @@ async function ready(page) {
   await expect(page.locator('#ome-status')).toContainText('plot updated', { timeout: 1000 });
   await expect(page.locator('#ome-run')).toBeEnabled();
 }
+/** Run SQL through the real editor and wait until the query controls are unlocked. */
 async function query(page, kind, sql) {
   await page.locator(`#${kind}-sql`).fill(sql);
   await page.locator(`#${kind}-run`).click();
   await expect(page.locator(`#${kind}-run`)).toBeEnabled();
 }
+/** Read channel hues from a synchronously redrawn WebGL buffer before it is discarded. */
 async function pixelColors(canvas) {
   // Trigger a synchronous VTK render and read its original drawing buffer in
   // the same task, before a non-preserved WebGL buffer can be discarded.
@@ -186,7 +189,7 @@ test('remote AnnData failure is explicit, with no local fallback', async ({ page
   expect(local).toEqual([]);
 });
 
-test('a missing remote image chunk is reported rather than rendered as invented zeros', async ({ page }) => {
+test('a remote chunk network failure is reported rather than rendered as invented zeros', async ({ page }) => {
   test.setTimeout(120_000);
   await page.route(`${OME_URL}/0/0/0/0/0`, (route) => route.abort('failed'));
   await page.goto('/');

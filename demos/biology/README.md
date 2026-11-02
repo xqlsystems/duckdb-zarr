@@ -137,6 +137,12 @@ bounds are budgeted. CORS is required for both metadata and chunks. Use the
 bucket's public HTTPS endpoint rather than an authenticated `s3://` URL. This
 page neither asks for nor handles storage credentials.
 
+A chunk-key HTTP 404 can represent a valid omitted fill-value chunk. The
+prefetcher leaves that object absent, without retrying it or registering
+fabricated bytes, so `read_zarr` applies its normal fill handling (including
+SQL NULL for nonzero fill sentinels). Metadata 404s, other HTTP errors and
+network failures still fail the load and clean up prior registrations.
+
 SpatialData/tissue remains paused and is not loaded or shown on the page.
 
 ## Static deployment

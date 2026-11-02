@@ -6,6 +6,9 @@ const MAX_VOXELS = 20_000_000;
 const MAX_TEXTURE_BYTES = 256 * 1024 * 1024;
 const HISTOGRAM_BINS = 4096;
 
+/** Visit finite Arrow coordinates batchwise, preserving SQL null gaps and clamping negative
+ * signal only for display.
+ */
 function visit(table, callback) {
   for (const batch of table.batches) {
     const columns = ['c', 'x', 'y', 'z', 'value'].map((name) => batch.getChild(name));
@@ -24,6 +27,9 @@ function visit(table, callback) {
   }
 }
 
+/** Estimate a normalized nonzero-signal quantile from a fixed histogram without sorting millions
+ * of values.
+ */
 function quantile(histogram, samples, fraction) {
   if (!samples) return 0;
   const target = Math.max(1, Math.ceil(samples * fraction));
@@ -35,6 +41,9 @@ function quantile(histogram, samples, fraction) {
   return 1;
 }
 
+/** Reconstruct bounded interleaved channel textures from Arrow batches; preserve coordinate gaps
+ * and physical spacing, and return display windows plus geometry statistics.
+ */
 export function buildVolumeGrid(table, { spacing }) {
   if (!table.getChild('c')) throw new Error('Return the channel column c alongside x, y, z, value.');
   for (const name of ['x', 'y', 'z', 'value']) if (!table.getChild(name)) throw new Error(`Missing volume column ${name}.`);

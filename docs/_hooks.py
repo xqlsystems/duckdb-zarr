@@ -11,6 +11,7 @@ from mkdocs.utils import get_relative_url
 def on_page_markdown(markdown, *, page, config, files):
     """Keep demo links on the site and send repository-only files to GitHub."""
     def replace(match):
+        """Adapt one repository-relative Markdown link, retaining its label and fragment."""
         label, href = match.groups()
         parts = urlsplit(href)
         target = posixpath.normpath(str(PurePosixPath('docs') / PurePosixPath(page.file.src_uri).parent / parts.path))

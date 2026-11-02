@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 import { unpackStoredZip, loadRemoteAnnData, remoteAnnDataViewSQL, PBMC_SOURCE_URL, PBMC_SOURCE_SHA256 } from '../src/remote_anndata.js';
 
 // ZIP container fixtures only: no biological values, annotations or SQL results.
+/** Build a minimal stored-ZIP test archive for entry ordering, path validation and header-bound
+ * checks.
+ */
 function storedZip(entries) {
   const parts = [], directory = [];
   let offset = 0;

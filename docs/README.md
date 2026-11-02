@@ -27,6 +27,11 @@ Scientific datasets are often stored in Zarr format because it handles multi-ter
 
 This project is related to [xarray-sql](https://github.com/alxmrs/xarray-sql) and [zarr-datafusion](https://github.com/alxmrs/zarr-datafusion), which provide similar functionality for other query engines.
 
+## Examples
+
+[Browse examples](examples/index.md) to explore Zarr data with executable SQL
+and interactive visualizations, starting with **duckdb-zarr for biologists**.
+
 ## Guides by domain
 
 - **Biology:** [AnnData annotated matrices](anndata.md), with a cell-by-gene

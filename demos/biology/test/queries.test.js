@@ -39,6 +39,15 @@ test('the value column is aliased for any purely-numeric or slashed level basena
   assert.match(volumeSQL('x', { channel: 0, zmin: 0, zmax: 0, level: 'labels/0/0' }), /, value AS value\n/);
   assert.match(volumeSQL('x', { channel: 0, zmin: 0, zmax: 0, level: 's2' }), /, "s2" AS value\n/);
 });
+test('nonnumeric nested image and label paths use value, not the basename', () => {
+  const image = volumeSQL('x', { channel: 0, zmin: 0, zmax: 0, level: 'pyramid/full' });
+  assert.match(image, /, value AS value\n/);
+  const labels = labelsSQL('x', { zmin: 0, zmax: 1, arrayPath: 'labels/nuclei' });
+  assert.match(labels, /, value AS value\n/);
+  assert.match(labelsSQL('x', { zmin: 0, zmax: 1, arrayPath: 'labels/nuclei', statistics: true }), /COUNT\(DISTINCT value\)/);
+  assert.match(volumeSQL('x', { channel: 0, zmin: 0, zmax: 0, level: 'stain"blue' }), /"stain""blue" AS value/);
+});
+
 test('invalid depth bounds are rejected', () => {
   for (const args of [{ channel: -1, zmin: 0, zmax: 2 }, { channel: 0, zmin: 4, zmax: 2 }, { channel: 0, zmin: 0.1, zmax: 4 }]) assert.throws(() => volumeSQL('x', args));
 });

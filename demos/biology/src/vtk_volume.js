@@ -28,6 +28,7 @@ const BACKGROUND = '#08121f';
 const BACKGROUND_RGB = [0.03, 0.07, 0.12];
 const INK = '#c7d7e6';
 const MUTED = '#8fa7bd';
+/** Create an owned styled DOM node whose label is plain text rather than HTML. */
 function element(tag, style, text) {
   const node = document.createElement(tag);
   Object.assign(node.style, style);
@@ -35,10 +36,14 @@ function element(tag, style, text) {
   return node;
 }
 
+/** Format finite measurements for captions and use a dash for missing values. */
 function format(value) {
   return Number.isFinite(value) ? value.toLocaleString(undefined, { maximumSignificantDigits: 5 }) : '—';
 }
 
+/** Mount an owned volume stage and live status footer without replacing surrounding query
+ * controls.
+ */
 function frame(container, name, hint) {
   if (!container || typeof container.appendChild !== 'function') throw new TypeError('A visualization needs a DOM container.');
   const root = element('section', { display: 'flex', flexDirection: 'column', width: '100%', height: '100%', minHeight: '320px', minWidth: '0', overflow: 'hidden', background: BACKGROUND, color: INK, font: '12px/1.5 system-ui, sans-serif', borderRadius: '10px' });
@@ -56,6 +61,7 @@ function frame(container, name, hint) {
   return { root, stage, footer, status };
 }
 
+/** Observe stage resizing with a window fallback and return a cleanup callback. */
 function observeSize(target, callback) {
   if (typeof ResizeObserver !== 'undefined') {
     const observer = new ResizeObserver(callback);
@@ -66,6 +72,7 @@ function observeSize(target, callback) {
   return () => window.removeEventListener('resize', callback);
 }
 
+/** Return normalized RGB for a six-digit source color, or null when the color is invalid. */
 function hexToRGB(hex) {
   const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || '').trim());
   if (!m) return null;
@@ -127,6 +134,7 @@ export function createVolume(container) {
   let rotationFrame = null;
   let lastRotationTime = 0;
 
+  /** Cancel the pending animation frame and reset elapsed-time and rotation-state markers. */
   function stopRotation() {
     if (rotationFrame !== null) cancelAnimationFrame(rotationFrame);
     rotationFrame = null;
@@ -134,6 +142,7 @@ export function createVolume(container) {
     root.dataset.rotationState = 'empty';
   }
 
+  /** Gate automatic motion on loaded data, user preference and actual page visibility. */
   function rotationState() {
     if (!currentBounds || disposed || !renderer) return 'empty';
     if (!rotationEnabled) return 'paused';
@@ -141,6 +150,9 @@ export function createVolume(container) {
     return 'running';
   }
 
+  /** Advance the camera at a bounded cadence, yielding during and briefly after manual
+   * interaction.
+   */
   function rotate(time) {
     rotationFrame = null;
     if (rotationState() !== 'running') return;
@@ -159,6 +171,9 @@ export function createVolume(container) {
     rotationFrame = requestAnimationFrame(rotate);
   }
 
+  /** Reconcile the pause button and the single animation loop after a visibility or preference
+   * change.
+   */
   function syncRotation() {
     stopRotation();
     const state = rotationState();
@@ -169,6 +184,7 @@ export function createVolume(container) {
     if (state === 'running') rotationFrame = requestAnimationFrame(rotate);
   }
 
+  /** Postpone automatic motion so it does not fight a user's orbit or zoom gesture. */
   function suspendRotation() {
     resumeAfter = performance.now() + 1800;
   }
@@ -191,6 +207,7 @@ export function createVolume(container) {
   visibilityObserver.observe(stage);
   syncRotation();
 
+  /** Draw the current scene and expose the resulting camera position for browser verification. */
   function render() {
     if (!disposed && genericRenderWindow) {
       genericRenderWindow.getRenderWindow().render();
@@ -198,10 +215,12 @@ export function createVolume(container) {
     }
   }
 
+  /** Keep the VTK framebuffer matched to its stage dimensions. */
   function resize() {
     if (genericRenderWindow) genericRenderWindow.resize();
   }
 
+  /** Derive normalized view and right vectors for camera-relative panning. */
   function cameraVectors(camera) {
     const pos = camera.getPosition();
     const fp = camera.getFocalPoint();
@@ -218,6 +237,7 @@ export function createVolume(container) {
     return { pos, fp, up, direction, right: right.map((v) => v / rightLen) };
   }
 
+  /** Translate camera and focal point together without changing the physical voxel geometry. */
   function panCamera(dx, dy) {
     if (!renderer || !currentBounds) return;
     const camera = renderer.getActiveCamera();
@@ -230,6 +250,9 @@ export function createVolume(container) {
     render();
   }
 
+  /** Fit a named camera direction to the current physical bounds and update clipping and
+   * orientation.
+   */
   function applyView(view) {
     selectedView = view;
     if (!renderer || !currentBounds) return;
@@ -251,6 +274,7 @@ export function createVolume(container) {
     orientation.textContent = '3D fluorescence';
   }
 
+  /** Remember manual-orbit mode and temporarily defer automatic rotation. */
   function startOrbit() {
     selectedView = 'custom';
     orientation.textContent = '3D fluorescence';
@@ -305,6 +329,9 @@ export function createVolume(container) {
     status.textContent = unavailable;
   }
 
+  /** Construct a display-only opacity curve that suppresses dim haze while retaining brighter
+   * structure.
+   */
   function buildOpacity(low, high) {
     const opacity = vtkPiecewiseFunction.newInstance();
     const upper = Math.max(high, low + 1e-4);
@@ -320,6 +347,9 @@ export function createVolume(container) {
     return opacity;
   }
 
+  /** Label source channel colors and mark only channel IDs actually present in the SQL result as
+   * shown.
+   */
   function buildLegend(channels, channelIds) {
     legend.replaceChildren();
     for (const [index, channel] of channels.entries()) {
@@ -334,6 +364,7 @@ export function createVolume(container) {
     }
   }
 
+  /** Free scene resources and animation state while retaining the renderer and viewer controls. */
   function releaseVolume() {
     if (volumeActor) { renderer?.removeVolume(volumeActor); volumeActor.delete(); volumeActor = null; }
     if (outlineActor) { renderer?.removeActor(outlineActor); outlineActor.getMapper()?.delete(); outlineActor.delete(); outlineActor = null; }
@@ -358,6 +389,7 @@ export function createVolume(container) {
     render();
   }
 
+  /** Reset to the empty view without destroying the renderer or parent DOM. */
   function clear() {
     if (disposed) return;
     releaseVolume();
@@ -366,6 +398,7 @@ export function createVolume(container) {
     status.textContent = unavailable || 'No SQL rows to display.';
   }
 
+  /** Display a render failure and return null so the calling query can report it. */
   function reject(message) {
     status.textContent = message;
     empty.textContent = message;
@@ -374,6 +407,9 @@ export function createVolume(container) {
   }
 
   return {
+    /** Rebuild a bounded, physically spaced multichannel scene from Arrow results; return
+     * geometry statistics or null on failure.
+     */
     render(table, { spacing = [1, 1, 1], channels = [] } = {}) {
       if (disposed) return null;
       clear();
@@ -466,6 +502,9 @@ export function createVolume(container) {
       const camera = renderer.getActiveCamera();
       return { view: selectedView, position: camera.getPosition(), up: camera.getViewUp(), target: camera.getFocalPoint() };
     },
+    /** Idempotently stop animation, observers and events, release VTK resources, and remove the
+     * owned DOM.
+     */
     dispose() {
       if (disposed) return;
       releaseVolume();

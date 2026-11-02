@@ -1,12 +1,16 @@
 // Metadata are fetched from the upstream OME-NGFF store, never a bundled copy.
 export const OME_URL = 'https://uk1s3.embassy.ebi.ac.uk/idr/zarr/v0.4/idr0062A/6001240.zarr';
 
+/** Fetch original JSON metadata with a deadline and explicit HTTP status failures. */
 async function json(url) {
   const response = await fetch(url, { cache: 'no-store', signal: AbortSignal.timeout(30_000) });
   if (!response.ok) throw new Error(`Remote metadata returned HTTP ${response.status}: ${url}`);
   return response.json();
 }
 
+/** Validate a public CZYX OME-NGFF level and return original chunking, channel colors and XYZ
+ * micrometer spacing within browser budgets.
+ */
 export async function loadOME(url, { level = '0' } = {}) {
   const source = new URL(url);
   if (!['https:', 'http:'].includes(source.protocol) || source.username || source.password) throw new Error('Use a public HTTP(S) Zarr URL without credentials.');

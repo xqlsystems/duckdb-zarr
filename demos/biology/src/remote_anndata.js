@@ -17,6 +17,7 @@ const sqlString = (value) => `'${String(value).replaceAll("'", "''")}'`;
 export function unpackStoredZip(bytes) {
   if (!(bytes instanceof Uint8Array) || bytes.byteLength > MAX_BYTES) throw new Error('Invalid or oversized AnnData ZIP.');
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  /** Reject any archive-buffer overrun before a header or entry is read. */
   const range = (offset, size) => {
     if (offset < 0 || size < 0 || offset + size > bytes.byteLength) throw new Error('Truncated AnnData ZIP.');
   };
@@ -92,6 +93,7 @@ export async function loadRemoteAnnData(db, {
   const digest = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map((v) => v.toString(16).padStart(2, '0')).join('');
   if (digest !== sha256) throw new Error(`AnnData ZIP SHA-256 mismatch: ${digest}.`);
   const files = unpackStoredZip(bytes);
+  /** Decode a required metadata entry from the integrity-checked archive. */
   const json = (path) => {
     if (!files.has(path)) throw new Error(`AnnData ZIP is missing ${path}.`);
     return JSON.parse(text.decode(files.get(path)));
@@ -108,6 +110,7 @@ export async function loadRemoteAnnData(db, {
   // every real entry is registered below, so data reads resolve in memory.
   const storeURL = `https://duckdb-wasm-memory.invalid/remote-pbmc-${crypto.randomUUID()}.zarr`;
   const registered = new Set();
+  /** Release registered entries; retain failed names so cleanup can be retried safely. */
   const dispose = async () => {
     for (const name of [...registered]) {
       try { await db.dropFile(name); }

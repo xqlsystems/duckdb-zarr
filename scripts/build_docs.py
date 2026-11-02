@@ -22,6 +22,7 @@ MARKER = '.duckdb-zarr-docsite'
 
 
 def main():
+    """Build the staged static site without editing guides or clearing foreign output directories."""
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     from mkdocs.commands.build import build
     from mkdocs.config import load_config

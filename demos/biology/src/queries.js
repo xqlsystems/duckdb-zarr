@@ -6,11 +6,17 @@ export const sqlString = (value) => `'${String(value).replaceAll("'", "''")}'`;
 // containing '/' (see needs_value_alias() in src/read_zarr.rs). Match that rule exactly,
 // or querying a level whose basename is a number (every array_path here, e.g. '2')
 // fails with "Referenced column ... not found" because the real column is `value`, not `"2"`.
+/** Choose the extension value alias for numeric or nested paths; quote ordinary variable names
+ * safely.
+ */
 function valueColumn(path) {
   const basename = path.split('/').at(-1);
-  return /^\d+$/.test(basename) ? 'value' : `"${basename.replaceAll('"', '""')}"`;
+  return path.includes('/') || /^\d+$/.test(basename) ? 'value' : `"${basename.replaceAll('"', '""')}"`;
 }
 
+/** Join observation IDs to stored embedding components, with optional annotation and expression
+ * filtering.
+ */
 export function scatterSQL(kind, { filter = '', gene = '' } = {}) {
   const spatial = kind === 'spatialdata';
   const prefix = spatial ? 'tissue' : 'pbmc';
@@ -32,6 +38,7 @@ WHERE o.${spatial ? 'polygon_layer' : 'cell_type'} = ${sqlString(filter)}` : ''}
 ORDER BY cell_id`;
 }
 
+/** Select channel/depth voxels or grouped channel statistics after validating integer bounds. */
 export function volumeSQL(url, { channel = 'all', zmin, zmax, level = '0', statistics = false }) {
   for (const value of channel === 'all' ? [zmin, zmax] : [channel, zmin, zmax]) {
     if (!Number.isSafeInteger(Number(value)) || Number(value) < 0) {
@@ -45,9 +52,7 @@ FROM read_zarr(${sqlString(url)}, array_path := ${sqlString(level)})
 WHERE ${channel === 'all' ? '' : `c = ${Number(channel)}\n  AND `}z BETWEEN ${Number(zmin)} AND ${Number(zmax)}${statistics ? '\nGROUP BY c ORDER BY c' : ''}`;
 }
 
-// Second real read_zarr query (not a side-channel fetch) for the aligned, nearest-neighbor
-// resized label mask array stored alongside the image in the same local OME-Zarr store.
-// The labels array has no channel ('c') axis, so there is no channel filter here.
+/** Query a channel-free label array over a validated Z interval; preserve the reader's value alias. */
 export function labelsSQL(url, { zmin, zmax, arrayPath = 'labels', statistics = false }) {
   for (const value of [zmin, zmax]) {
     if (!Number.isSafeInteger(Number(value)) || Number(value) < 0) {
@@ -61,6 +66,9 @@ FROM read_zarr(${sqlString(url)}, array_path := ${sqlString(arrayPath)})
 WHERE z BETWEEN ${Number(zmin)} AND ${Number(zmax)}`;
 }
 
+/** Build view definitions for AnnData observations and stored UMAP components without executing
+ * SQL.
+ */
 export function anndataViewSQL(url) {
   const store = sqlString(url);
   return [
@@ -69,8 +77,7 @@ export function anndataViewSQL(url) {
   ];
 }
 
-// Kept for when the SpatialData/tissue example returns to the page; unused
-// while that section is hidden (see demos/biology/README.md).
+/** Build the paused SpatialData table views without executing SQL or loading an extra dataset. */
 export function spatialdataViewSQL(url) {
   const store = sqlString(url);
   return [
