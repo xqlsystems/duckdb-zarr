@@ -62,17 +62,28 @@ test files outside `docs/` go to GitHub. Code examples are left untouched.
 
 `.github/workflows/biology-demo-pages.yml` now publishes the entire `site/`
 artifact, not just the demo. Its display name is **Documentation Pages**. It
-reuses a compatible extension artifact from the successful main distribution
-pipeline; the deploy job does not rebuild the Rust extension. GitHub Pages
+reuses the checksum-pinned, browser-tested extension artifact from distribution
+run `40233921996`; the deploy job does not rebuild the Rust extension. GitHub Pages
 must use the GitHub Actions build method.
 
 The workflow runs for documentation/example changes on `main`, or by manual
-dispatch. A successful extension distribution run must already exist in the
-same repository; its artifact is reused rather than rebuilt. A local build does
-not publish anything; changes still need to be
-reviewed and merged before the workflow can deploy them.
+dispatch. The pinned artifact must still be available in the same repository;
+if it expires, deployment fails instead of falling back to an untested binary.
+The optional `run_id` input can point to another run, but its artifact must
+have the pinned name and the digest in `demos/biology/extension.sha256`.
+To adopt a new binary, browser-test it with the pinned DuckDB-Wasm package,
+then update the workflow's run ID, artifact name and checksum together.
+CI verifies the checksum and runs helper tests plus a real WASM-reader query
+against a synthetic format fixture before uploading the Pages artifact.
+A local build does not publish anything; changes still need to be reviewed
+and merged before the workflow can deploy them.
+
+`--skip-demo-build` reuses `demos/biology/dist` and requires both its
+`index.html` and `zarr.duckdb_extension.wasm`. A copy of the extension under
+`public/` cannot repair an incomplete existing build.
 
 ```sh
+uv run --no-project --with mkdocs==1.6.1 python -m unittest discover -s scripts -p test_docsite.py
 uv run scripts/build_docs.py
 node demos/biology/test/docsite.browser.mjs site
 ```

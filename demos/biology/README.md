@@ -14,6 +14,7 @@ npm ci --ignore-scripts
 # Tested wasm_eh extension from main at 473cb3b, compatible with this WASM engine.
 gh run download 40233921996 --repo xqlsystems/duckdb-zarr \
   --name zarr-v2.0.0-extension-wasm_eh --dir public
+shasum -a 256 --check extension.sha256
 npm run dev
 ```
 
@@ -160,8 +161,14 @@ the repository root and serve `site/`. The docs live at `/` and this app at
 
 `.github/workflows/biology-demo-pages.yml` downloads an existing compatible
 wasm_eh artifact, installs JS dependencies, builds the combined site, and deploys
-`site/` with GitHub's Pages artifact actions. It runs for documentation/example changes on `main`
-or via manual dispatch, reusing a successful main extension distribution run. It does not download or rehost datasets.
+`site/` with GitHub's Pages artifact actions. It runs for documentation/example
+changes on `main` or via manual dispatch. It pins the tested run above and
+verifies `extension.sha256`, rather than selecting the latest successful Rust
+build. A replacement run must supply the same artifact name and binary digest;
+a new binary requires updating the run/name/checksum pins after browser tests.
+Before publishing, CI runs the helper tests and a real WASM-reader query
+against a clearly synthetic format fixture in the production browser build.
+It does not download or rehost biological datasets.
 `public/.nojekyll` is retained for other static deployment methods.
 
 ## Verify

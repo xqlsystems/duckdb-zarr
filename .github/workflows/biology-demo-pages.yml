@@ -4,8 +4,8 @@
 #
 # The extension is never rebuilt here: this workflow reuses the wasm_eh
 # artifact already produced by the Main Extension Distribution Pipeline.
-# Documentation changes on main deploy independently of Rust builds; manual
-# dispatch can select a specific successful run's artifact.
+# Documentation changes deploy independently of Rust builds using the tested
+# run and checksum below, never a potentially incompatible "latest" artifact.
 #
 name: Documentation Pages
 
@@ -16,15 +16,16 @@ name: Documentation Pages
       - "docs/**"
       - "mkdocs.yml"
       - "scripts/build_docs.py"
+      - "scripts/test_docsite.py"
       - "demos/biology/**"
       - ".github/workflows/biology-demo-pages.yml"
   workflow_dispatch:
     inputs:
       run_id:
         description: >-
-          Main Extension Distribution Pipeline run ID to pull the wasm_eh
-          extension artifact from. Leave empty to use the latest successful
-          run on main.
+          Optional replacement run containing the exact checksum-pinned wasm_eh
+          artifact. Leave empty to use tested run 40233921996. New binary versions
+          require updating the pin and checksum after browser verification.
         required: false
 
 concurrency:
@@ -52,24 +53,13 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Resolve the Main Distribution Pipeline run to pull from
+      - name: Select the tested Main Distribution Pipeline run
         id: source-run
         env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
+          PINNED_RUN: '40233921996' # main at 473cb3b, tested with the pinned DuckDB-Wasm
           REQUESTED_RUN: ${{ inputs.run_id }}
         run: |
-          if [ -n "$REQUESTED_RUN" ]; then
-            run_id="$REQUESTED_RUN"
-          else
-            run_id=$(gh run list --repo "$GH_REPO" \
-              --workflow MainDistributionPipeline.yml --branch main \
-              --status success --limit 1 --json databaseId --jq '.[0].databaseId')
-          fi
-          if [ -z "$run_id" ]; then
-            echo "::error::No successful 'Main Extension Distribution Pipeline' run found on main. Run it first (push to main, or 'gh workflow run MainDistributionPipeline.yml'), then re-run this workflow with that run's ID."
-            exit 1
-          fi
+          run_id="${REQUESTED_RUN:-$PINNED_RUN}"
           if ! [[ "$run_id" =~ ^[0-9]+$ ]]; then
             echo "::error::Run ID must contain only digits."
             exit 1
@@ -79,28 +69,38 @@ jobs:
       - name: Download that run's wasm_eh extension artifact
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
-          pattern: '*-extension-wasm_eh'
+          name: zarr-v2.0.0-extension-wasm_eh
           run-id: ${{ steps.source-run.outputs.run_id }}
           github-token: ${{ github.token }}
           path: demos/biology/public
-          merge-multiple: true
 
-      - name: Confirm exactly one wasm_eh extension binary was retrieved
-        env:
-          SOURCE_RUN_ID: ${{ steps.source-run.outputs.run_id }}
-        run: |
-          count=$(find demos/biology/public -maxdepth 1 -name 'zarr.duckdb_extension.wasm' | wc -l)
-          if [ "$count" != "1" ]; then
-            echo "::error::Expected exactly one demos/biology/public/zarr.duckdb_extension.wasm from run $SOURCE_RUN_ID. Found: $(ls demos/biology/public 2>/dev/null || echo '(nothing)')"
-            exit 1
-          fi
+      - name: Verify the tested extension checksum
+        working-directory: demos/biology
+        run: sha256sum --check extension.sha256
 
       - name: Install JS dependencies
         working-directory: demos/biology
         run: npm ci --ignore-scripts
 
+      - name: Test build inputs and artifact selection
+        run: uv run --no-project --with mkdocs==1.6.1 python -m unittest discover -s scripts -p test_docsite.py
+
+      - name: Test biology helpers
+        working-directory: demos/biology
+        run: npm run test:unit
+
       - name: Build the combined static docsite
         run: uv run scripts/build_docs.py
+
+      - name: Install Chromium for the real WASM reader smoke test
+        working-directory: demos/biology
+        run: npx playwright install --with-deps chromium
+
+      - name: Query the downloaded extension in the production browser build
+        working-directory: demos/biology
+        env:
+          DEMO_PREVIEW: '1'
+        run: npm test -- --grep 'real WASM reader'
 
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
         with:

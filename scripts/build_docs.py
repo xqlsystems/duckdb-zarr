@@ -34,12 +34,13 @@ def main():
     output = args.site_dir.resolve()
     if output.exists() and any(output.iterdir()) and not (output / MARKER).exists():
         parser.error(f'Refusing to clear non-docsite output directory: {output}')
-    if not (BIOLOGY / 'public/zarr.duckdb_extension.wasm').is_file():
-        parser.error('Missing biology WASM extension. Follow demos/biology/README.md before building the combined site.')
     if not args.skip_demo_build:
+        if not (BIOLOGY / 'public/zarr.duckdb_extension.wasm').is_file():
+            parser.error('Missing biology WASM extension. Follow demos/biology/README.md before building the combined site.')
         subprocess.run(['npm', 'run', 'build'], cwd=BIOLOGY, check=True, timeout=120)
-    if not (BIOLOGY / 'dist/index.html').is_file():
-        parser.error('Biology dist is missing. Build it first or omit --skip-demo-build.')
+    for name in ('index.html', 'zarr.duckdb_extension.wasm'):
+        if not (BIOLOGY / 'dist' / name).is_file():
+            parser.error(f'Missing biology dist/{name}. Build it first or omit --skip-demo-build.')
     if (BIOLOGY / 'dist/data').exists():
         parser.error('The biology app must not ship a local scientific dataset.')
 

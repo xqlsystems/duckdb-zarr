@@ -19,6 +19,7 @@ test/fixtures/anndata
 # Node artifacts from demos (e.g. demos/zarr-map from #58); never commit these
 demos/*/node_modules/
 demos/*/dist/
+demos/*/test-results/
 
 # Generated documentation site
 /site/
