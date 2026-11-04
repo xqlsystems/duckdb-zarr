@@ -876,8 +876,9 @@ that created the views through a second connection was prototyped and
 rejected: the extra connection kept DuckDB from ever releasing the database,
 which left database files locked after closing, for every user of the
 extension. `read_zarr_views` returns the statements instead, which costs the
-user one extra step and avoids the problem. This can be revisited if the C API
-gains storage extensions or a way to run SQL on a connection.
+user one extra step and avoids the problem. DuckDB 2.0's v2 C API adds
+neither hook, and `read_zarr_views` is the supported way to mount a store;
+`ATTACH ... (TYPE ZARR)` is not planned.
 
 ### 9. AnnData: named axes, decoded encodings, stored entries
 
@@ -1064,13 +1065,13 @@ only the v1 API, so the port means calling the v2 functions directly.
 
 ### Blocked on DuckDB
 
-- `ATTACH 'store.zarr' (TYPE ZARR)`. Neither C API lets an extension add a
-  kind of database to `ATTACH` or create views on the caller's connection, so
-  `read_zarr_views` remains the way to mount a store (decision 8).
 - Column statistics, above.
 
 ### Not planned
 
+- `ATTACH 'store.zarr' (TYPE ZARR)`. Neither C API lets an extension add a
+  kind of database to `ATTACH`, and `read_zarr_views` already mounts a store
+  as views (decision 8).
 - Substrait, a format for passing query plans between engines. A `read_zarr`
   call is specific to DuckDB, so plans that use it cannot run elsewhere;
   mounted views, which other engines could resolve by name, are a closer fit.
