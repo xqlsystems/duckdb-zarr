@@ -235,8 +235,8 @@ group whose dimension lengths disagree with its parent's is *misaligned*, and
 its tables cannot be read as tables (single arrays in it still can, through
 `array_path :=`).
 
-When a store is mounted as a DuckDB database (see [Mounting a
-store](#mounting-a-store-as-views)), each group becomes a schema: the root is
+When a store is mounted as a DuckDB database (see [Giving tables
+names](#giving-tables-names)), each group becomes a schema: the root is
 `main`, and a nested group is a schema named by its path, quoted because it
 contains a slash: `sim."simulation/fine".x_y`.
 
@@ -407,12 +407,40 @@ Both functions accept `group_path :=` and `array_path :=` to narrow the
 listing. `read_zarr_groups` is the older name of `read_zarr_tables` and still
 works.
 
-### Mounting a store as views
+### Giving tables names
 
-For repeated queries it is convenient to give each table a short, stable
-name. `read_zarr_views(store, database)` does not mount anything itself.
-Like the other functions here, it returns a table, and each row holds one SQL
-statement as text, in a column named `sql`:
+For repeated queries it is convenient to give each table a short, stable name.
+xarray-sql does this in one call, `ctx.from_dataset('era5', ds,
+table_names=...)`, after which `era5.surface` is a table. The design we want
+for this extension is the same: one call that registers a store under a name,
+then plain table names in queries. It is planned for DuckDB 2.0 (see [A named
+store, the planned design](#a-named-store-the-planned-design) below). The C
+API the extension uses today cannot do it, because it gives an extension no
+way to create views or schemas on the caller's connection. Until then there
+are two workarounds.
+
+#### Workaround: create the views yourself
+
+A view is one line per table:
+
+```sql
+CREATE VIEW surface AS
+  SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/era5_like.zarr',
+                          table_name := 'time_latitude_longitude');
+
+SELECT AVG("2m_temperature") FROM surface;
+```
+
+For a nested group, create a schema for it first, or pick any name you like.
+The view stores no data; it calls `read_zarr` each time it is queried. In a
+database file, views persist across sessions.
+
+#### Workaround: generate the views with `read_zarr_views`
+
+For a store with many tables, `read_zarr_views(store, database)` writes those
+statements for you. It does not run them. Like the other functions here, it
+returns a table, and each row holds one SQL statement as text, in a column
+named `sql`:
 
 | Column | Type | Meaning |
 |---|---|---|
@@ -422,9 +450,8 @@ statement as text, in a column named `sql`:
 
 Run the statements in order and the store is mounted as a DuckDB database:
 one `ATTACH` of an in-memory database, one `CREATE SCHEMA` per nested group
-that has a named table, and one `CREATE VIEW` per named table. The views store
-no data; each one calls `read_zarr` when queried. The query below selects just
-the `sql` column; the comments show the rows it returns:
+that has a named table, and one `CREATE VIEW` per named table. The query below
+selects just the `sql` column; the comments show the rows it returns:
 
 ```sql
 SELECT sql FROM read_zarr_views('test/fixtures/xarray_tutorial/era5_like.zarr', 'era5',
@@ -435,12 +462,12 @@ SELECT sql FROM read_zarr_views('test/fixtures/xarray_tutorial/era5_like.zarr', 
 -- CREATE OR REPLACE VIEW "era5"."main"."atmosphere" AS SELECT * FROM read_zarr('...', table_name := 'time_level_latitude_longitude');
 ```
 
-`view_names` renames views. Its keys are table names for tables in the root
-group and `group/path/table_name` for the others. A key that names no table,
-or a rename that gives two views in one schema the same name, is an error.
-Tables with a `NULL` `table_name` get no view. The `ATTACH` fails if the
-database name is already in use; detach the old mount first or pick another
-name.
+`view_names` renames views, like xarray-sql's `table_names`. Its keys are
+table names for tables in the root group and `group/path/table_name` for the
+others. A key that names no table, or a rename that gives two views in one
+schema the same name, is an error. Tables with a `NULL` `table_name` get no
+view. The `ATTACH` fails if the database name is already in use; detach the
+old mount first or pick another name.
 
 From Python, run each returned row:
 
@@ -468,6 +495,47 @@ SELECT sql FROM read_zarr_views('test/fixtures/xarray_tutorial/era5_like.zarr', 
 After mounting, `SELECT level, AVG(temperature) FROM era5.atmosphere GROUP BY
 level` works like a query on any other table. Without `view_names`, the same
 view is `era5.main.time_level_latitude_longitude`.
+
+#### A named store, the planned design
+
+Not built yet. On DuckDB 2.0's v2 C API, mounting becomes one call and needs
+no generated SQL:
+
+```sql
+SELECT * FROM zarr_mount('era5.zarr', 'era5',
+  table_names := MAP {'time_latitude_longitude': 'surface'});
+
+SELECT AVG("2m_temperature") FROM era5.surface;
+```
+
+`zarr_mount` records the name `era5`, the store, and its table names in the
+extension's memory, and returns the tables it registered. Nothing is added to
+DuckDB's catalog. When a query names `era5.surface`, DuckDB does not find it
+in the catalog and offers the name to the extension's replacement scan (see
+[Querying a path directly](#querying-a-path-directly)), which turns it into
+`read_zarr('era5.zarr', table_name := 'time_latitude_longitude')`. Nested
+groups work the same way: `era5."simulation/fine".x_y`.
+
+DuckDB 2.0.0 already routes such names to replacement scans. In a test
+with the current extension, a reference DuckDB could not find in its catalog
+reached the replacement scan whether it was qualified by a schema or database
+that did not exist, by an attached database or existing schema of the same
+name, by three parts, or by a quoted nested schema, and it did so from a
+second connection to the same database too. A real view with the same name
+took precedence.
+
+What the design needs from the v2 API is the full name. Its replacement scan
+receives the whole table reference (`era5.surface`), where the v1 API passes
+only the last part (`surface`), which cannot tell two mounted stores apart.
+The port to the v2 API is planned anyway for filter pushdown.
+
+The design has costs of its own. Mounted tables do not appear in `SHOW
+TABLES`, `information_schema` or autocompletion, so a `zarr_mounts()` function
+would list them. A real table or view with the same name takes precedence,
+because DuckDB tries replacement scans only when its lookup fails. Mounts
+would be shared by every connection to the database and last as long as it is
+open, not across sessions; views in a database file remain the way to persist
+names.
 
 ### Selecting coordinate ranges
 
@@ -883,16 +951,27 @@ to database, group to schema and table to table, the same catalog shape that
 DataFusion, the engine under xarray-sql, uses. `read_zarr_tables` publishes
 that mapping, and it is the whole contract between the two projects.
 
-The natural way to mount a store would be `ATTACH 'era5.zarr' AS era5 (TYPE
-ZARR)`. The C API has no hook for adding a new kind of database to `ATTACH`,
-and no way for an extension to run SQL on the caller's connection. A procedure
-that created the views through a second connection was prototyped and
-rejected: the extra connection kept DuckDB from ever releasing the database,
-which left database files locked after closing, for every user of the
-extension. `read_zarr_views` returns the statements instead, which costs the
-user one extra step and avoids the problem. DuckDB 2.0's v2 C API adds
-neither hook, and `read_zarr_views` is the supported way to mount a store;
-`ATTACH ... (TYPE ZARR)` is not planned.
+The design we want for naming tables is xarray-sql's: one call registers a
+store under a name, and its tables are then queried as `era5.surface`. Three
+ways to get there were considered:
+
+- `ATTACH 'era5.zarr' AS era5 (TYPE ZARR)`, the most natural spelling. Neither
+  DuckDB C API lets an extension add a kind of database to `ATTACH`, so this
+  is not planned.
+- A procedure that creates the schemas and views. The C API cannot run SQL on
+  the caller's connection, so a prototype ran it through a second connection
+  opened when the extension loaded. That connection kept DuckDB from ever
+  releasing the database, which left database files locked after closing, for
+  every user of the extension. It was rejected.
+- A mount registry with a replacement scan, `zarr_mount`, described in [A
+  named store, the planned design](#a-named-store-the-planned-design). It
+  creates nothing in DuckDB's catalog, so it needs neither of the missing
+  hooks, only a replacement scan that sees full table names. That arrives with
+  DuckDB 2.0's v2 C API. This is the planned design.
+
+Until then, both ways of naming tables are workarounds for the limits of the
+C API the extension uses today: creating views by hand, and `read_zarr_views`,
+which writes the view statements for the user to run.
 
 ### 9. AnnData: named axes, decoded encodings, stored entries
 
@@ -1040,6 +1119,10 @@ only the v1 API, so the port means calling the v2 functions directly.
   which removes the shared lock described in [Threads](#threads). On the v2
   API the scan can also declare that its rows have no particular order, which
   lets DuckDB run its output in parallel.
+- Named stores with `zarr_mount` (v2 API), replacing `read_zarr_views` and
+  hand-written views as the way to give tables names, as decision 8 and [A
+  named store, the planned design](#a-named-store-the-planned-design)
+  describe.
 - Grouped aggregates by coordinate (v2 API). The v2 API lets a scan tell
   DuckDB that its rows are already partitioned by some columns, so `GROUP BY`
   on a coordinate could skip hashing. zarr-datafusion goes further and answers
@@ -1087,8 +1170,8 @@ only the v1 API, so the port means calling the v2 functions directly.
 ### Not planned
 
 - `ATTACH 'store.zarr' (TYPE ZARR)`. Neither C API lets an extension add a
-  kind of database to `ATTACH`, and `read_zarr_views` already mounts a store
-  as views (decision 8).
+  kind of database to `ATTACH`; `zarr_mount` is the planned alternative
+  (decision 8).
 - Substrait, a format for passing query plans between engines. A `read_zarr`
   call is specific to DuckDB, so plans that use it cannot run elsewhere;
   mounted views, which other engines could resolve by name, are a closer fit.
