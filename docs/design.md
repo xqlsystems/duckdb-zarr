@@ -316,7 +316,7 @@ array`.
 | `dims := ['time', 'lat', 'lon']` | Read the table with these dimension names, in this order. An alternative to `table_name`; do not pass both. |
 | `group_path := 'simulation/fine'` | Read from this group instead of the root. Slashes at either end are optional. Alias `"group"`. |
 | `array_path := 'labels/nuclei/0'` | Read one array by its path in the store. Its dimensions are its own, an OME-Zarr image's axes, AnnData's axis names, or `dim_0`, `dim_1`, .... Alias `"array"`. Cannot be combined with `group_path` or `table_name`. |
-| `bounds := [['lat', '-30', '30'], ...]` | Read only coordinate ranges. See [Selecting coordinate ranges](#selecting-coordinate-ranges). |
+| `bounds := [['lat', '-30', '30'], ...]` | Read only coordinate ranges. A workaround until `WHERE` is pushed down; see [Selecting coordinate ranges](#selecting-coordinate-ranges). |
 | `decode_times := false` | Leave CF time coordinates as their stored numbers instead of `TIMESTAMP`. The default is `true`, as in `xarray.open_zarr`. |
 
 The aliases `"table"`, `"group"` and `"array"` need double quotes because
@@ -462,10 +462,15 @@ view is `era5.main.time_level_latitude_longitude`.
 
 ### Selecting coordinate ranges
 
-A `WHERE` clause on a coordinate column gives the right answer, but it does
-not make the read smaller: the extension reads every chunk and DuckDB discards
-the rows that do not match (see [Filters and pruning](#filters-and-pruning)).
-To read less, pass the ranges to `read_zarr` with `bounds :=`:
+`bounds :=` is a workaround. The C API the extension is built on gives a
+table function no access to a query's `WHERE` conditions, so a `WHERE` clause
+on a coordinate column gives the right answer without making the read
+smaller: the extension reads every chunk and DuckDB discards the rows that do
+not match (see [Filters and pruning](#filters-and-pruning)). Until the
+extension moves to an API with filter pushdown (see [Roadmap](#roadmap)),
+pass the ranges to `read_zarr` with `bounds :=` to read less. Once pushdown
+ships, the same `WHERE` clause will skip the same chunks, and `bounds :=` will
+not be needed.
 
 ```sql
 SELECT time, lat, lon, value
@@ -943,7 +948,10 @@ That second group includes `BETWEEN` and other two-sided ranges, which the v2
 API passes without saying whether their ends are inclusive
 ([duckdb/duckdb#25391](https://github.com/duckdb/duckdb/issues/25391), open
 as of November 2026).
-`bounds :=` stays as an alias for at least one release after pushdown ships.
+With pushdown in place, a `WHERE` clause does everything `bounds :=` does, so
+the parameter is no longer needed. It stays for at least one release after
+pushdown ships, so that existing queries keep working, and is then
+deprecated.
 
 ### 11. Keep the Zarr reader independent of DuckDB
 
