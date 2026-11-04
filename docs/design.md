@@ -410,12 +410,21 @@ works.
 ### Mounting a store as views
 
 For repeated queries it is convenient to give each table a short, stable
-name. `read_zarr_views(store, database)` returns the SQL statements that
-mount a store as a DuckDB database: one `ATTACH` of an in-memory database, one
-`CREATE SCHEMA` per nested group that has a named table, and one `CREATE
-VIEW` per named table. You
-run the statements yourself. The views store no data; each one calls
-`read_zarr` when queried.
+name. `read_zarr_views(store, database)` does not mount anything itself.
+Like the other functions here, it returns a table, and each row holds one SQL
+statement as text, in a column named `sql`:
+
+| Column | Type | Meaning |
+|---|---|---|
+| `schema_name` | `VARCHAR` | The schema the statement creates or adds to (`NULL` for the `ATTACH`) |
+| `view_name` | `VARCHAR` | The view the statement creates (`NULL` for `ATTACH` and `CREATE SCHEMA`) |
+| `sql` | `VARCHAR` | The statement |
+
+Run the statements in order and the store is mounted as a DuckDB database:
+one `ATTACH` of an in-memory database, one `CREATE SCHEMA` per nested group
+that has a named table, and one `CREATE VIEW` per named table. The views store
+no data; each one calls `read_zarr` when queried. The query below selects just
+the `sql` column; the comments show the rows it returns:
 
 ```sql
 SELECT sql FROM read_zarr_views('test/fixtures/xarray_tutorial/era5_like.zarr', 'era5',
