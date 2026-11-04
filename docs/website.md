@@ -8,13 +8,14 @@ or maintained in a second format.
 
 - `/` — the documentation overview, rendered from `docs/README.md`.
 - `/anndata/` and `/ome-zarr/` — the existing biology guides.
-- `/examples/` — the examples index, rendered from `docs/examples/index.md`.
+- `/examples/climate/` and `/examples/geoscience/` — the Markdown field guides.
+  There is no separate field-guide index page; use the direct sidebar links.
 - `/biology/` — the first example page: interactive single-cell and 3D images.
   Its existing URL stays unchanged.
 - The remaining guides stay in the sidebar, with search and section navigation.
 
 The documentation and examples share the green-and-cream palette, serif
-headings, wordmark, and top links: Documentation, Examples, GitHub.
+headings, wordmark, and top links: Documentation and GitHub.
 The published biology page also uses the same sidebar, search, and mobile
 Browse guides menu, with Biology marked as the active example.
 The examples also link directly to their corresponding format guides. Links
@@ -32,7 +33,7 @@ uv run scripts/build_docs.py
 python3 -m http.server 4178 --bind 127.0.0.1 --directory site
 ```
 
-Open `http://127.0.0.1:4178/` for the docs, then **Examples → For biologists**.
+Open `http://127.0.0.1:4178/` for the docs, then choose **Biology** under the sidebar's **Field guides** heading.
 Use a different port if another preview is already listening on 4178.
 
 The build script carries a pinned MkDocs dependency, invokes the existing Vite
@@ -55,11 +56,14 @@ require the combined site above.
 - Edit the existing `.md` guide files as usual.
 - Change sidebar organization in `mkdocs.yml`.
 - Change the thin site shell in `docs/_theme/`.
+- Set `example_title: true` in a Markdown example's front matter to use the
+  same title typography and spacing as biology, with a green `title-accent`
+  span on the second line.
 - Keep demo-only rendering and SQL in `demos/biology/`.
-- Add future example pages under `docs/examples/`, link them from
-  `docs/examples/index.md`, and add them to the **Examples** section in
-  `mkdocs.yml`. Separately built interactive apps can keep their own URLs and
-  link from the same index; only those apps need additional build staging.
+- Add future example pages under `docs/examples/` and add direct links to the
+  **Field guides** section in `mkdocs.yml`. The section heading is not a link.
+  Separately built interactive apps can keep their own URLs; only those apps
+  need additional build staging.
 
 The site-only link hook keeps Markdown links useful in both contexts: links to
 the demo README become links to the running examples, and links to source or
@@ -92,10 +96,17 @@ and merged before the workflow can deploy them.
 ```sh
 uv run --no-project --with mkdocs==1.6.1 python -m unittest discover -s scripts -p test_docsite.py
 uv run scripts/build_docs.py
+node demos/biology/test/docsite.browser.mjs site --layout-only
 node demos/biology/test/docsite.browser.mjs site
 ```
 
-The browser check follows docs → examples index → live biology app → docs,
+The `--layout-only` check verifies identical sidebars, example-title styles,
+search and mobile menus without starting the biology query engine. It blocks
+only the app module, preserves its real compiled CSS/HTML, and is not a test
+of scientific queries or rendering. The full command without that flag still
+loads and checks the real datasets.
+
+The full browser check follows docs → individual field guides → live biology app → docs,
 exercises search and mobile navigation, checks generated internal links, and
 loads the real remote data under a GitHub Pages-style project prefix. It uses
 the existing Playwright installation (`npx playwright install chromium` from

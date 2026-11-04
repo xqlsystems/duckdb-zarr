@@ -5,6 +5,12 @@ use_directory_urls: true
 strict: true
 docs_dir: docs
 site_dir: site
+# Internal working notes stay in the repository, not the published site or search.
+exclude_docs: |
+  /filter-pushdown-learnings.md
+  **/*handoff*.md
+  **/HANDOFF*.md
+  /internal/
 theme:
   name: null
   custom_dir: docs/_theme
@@ -20,18 +26,17 @@ markdown_extensions:
       permalink: true
 nav:
   - Start here: README.md
-  - Examples:
-      - Overview: examples/index.md
-      - Climate and geoscience: examples/climate.md
+  - Field guides:
+      - Climate: examples/climate.md
+      - Geoscience: examples/geoscience.md
       - Biology: biology/index.md
-  - Biology:
+  - Formats:
       - AnnData: anndata.md
       - OME-Zarr: ome-zarr.md
-  - Scientific domains: domains.md
   - Reference:
       - SQL and design: design.md
+      - Scientific domains: domains.md
   - Development:
       - Documentation website: website.md
       - Versioning: versioning.md
       - Release guide: community-extension-release.md
-      - Filter pushdown notes: filter-pushdown-learnings.md

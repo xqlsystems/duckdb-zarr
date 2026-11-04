@@ -47,7 +47,8 @@ export function volumeSQL(url, { channel = 'all', zmin, zmax, level = '0', stati
   }
   if (Number(zmin) > Number(zmax)) throw new Error('First Z plane must not exceed last Z plane.');
   const column = valueColumn(level);
-  return `SELECT ${statistics ? `c, COUNT(*) AS voxels, MIN(${column}) AS minimum,\n       MAX(${column}) AS maximum, AVG(${column}) AS mean_intensity,\n       STDDEV_POP(${column}) AS stddev_intensity` : `c::UTINYINT AS c, x::USMALLINT AS x, y::USMALLINT AS y,\n       z::USMALLINT AS z, ${column} AS value`}
+  return `SELECT
+  ${statistics ? `c,\n  COUNT(*) AS voxels,\n  MIN(${column}) AS minimum,\n  MAX(${column}) AS maximum,\n  AVG(${column}) AS mean_intensity,\n  STDDEV_POP(${column}) AS stddev_intensity` : `c,\n  x,\n  y,\n  z,\n  ${column}${column === 'value' ? '' : ' AS value'}`}
 FROM read_zarr(${sqlString(url)}, array_path := ${sqlString(level)})
 WHERE ${channel === 'all' ? '' : `c = ${Number(channel)}\n  AND `}z BETWEEN ${Number(zmin)} AND ${Number(zmax)}${statistics ? '\nGROUP BY c ORDER BY c' : ''}`;
 }
@@ -61,7 +62,7 @@ export function labelsSQL(url, { zmin, zmax, arrayPath = 'labels', statistics = 
   }
   if (Number(zmin) > Number(zmax)) throw new Error('First Z plane must not exceed last Z plane.');
   const column = valueColumn(arrayPath);
-  return `SELECT ${statistics ? `COUNT(*) AS voxels, MIN(${column}) AS minimum,\n       MAX(${column}) AS maximum, COUNT(DISTINCT ${column}) AS distinct_labels` : `x, y, z, ${column} AS value`}
+  return `SELECT ${statistics ? `COUNT(*) AS voxels, MIN(${column}) AS minimum,\n       MAX(${column}) AS maximum, COUNT(DISTINCT ${column}) AS distinct_labels` : `x, y, z, ${column}${column === 'value' ? '' : ' AS value'}`}
 FROM read_zarr(${sqlString(url)}, array_path := ${sqlString(arrayPath)})
 WHERE z BETWEEN ${Number(zmin)} AND ${Number(zmax)}`;
 }

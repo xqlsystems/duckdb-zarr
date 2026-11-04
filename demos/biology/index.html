@@ -8,10 +8,9 @@
 </head>
 <body>
   <header>
-    <a class="wordmark" href="../">duckdb-zarr <span>/ field guide</span></a>
+    <a class="wordmark" href="../"><img id="project-logo" class="brand-logo" alt="" width="32" height="32">duckdb-zarr</a>
     <nav class="project-links" aria-label="Project navigation">
-      <a href="../">Documentation</a>
-      <a href="../examples/" aria-current="true">Examples</a>
+      <a href="../" aria-current="true">Documentation</a>
       <a href="https://github.com/xqlsystems/duckdb-zarr">GitHub ↗</a>
     </nav>
   </header>
@@ -19,9 +18,8 @@
     <section class="intro">
       <div class="intro-opening">
         <div class="intro-copy">
-          <p class="eyebrow">A small, hands-on introduction</p>
           <h1>duckdb-zarr<br><span>for biologists.</span></h1>
-          <p class="lead">From single cells to a 3D fluorescence image. Ask a question in SQL, run it in your browser, and see what changes.</p>
+          <p class="example-subtitle">Explore single-cell RNA-seq and multichannel 3D fluorescence using SQL in your browser.</p>
         </div>
         <nav class="contents" aria-label="On this page">
           <p class="contents-heading">On this page</p>
@@ -38,7 +36,8 @@
     <section id="anndata" class="demo" aria-labelledby="anndata-title">
       <div class="section-heading"><p class="eyebrow">01 / AnnData</p><h2 id="anndata-title">Explore single cells</h2><p>PBMC 68k reduced · 700 cells · 765 genes · single-cell RNA-seq</p></div>
       <p>This is single-cell RNA sequencing (scRNA-seq) data: each row is one blood cell, each column a gene, and each value is that gene's measured expression in that cell. Join a cell's annotation in <code>obs</code> to its UMAP coordinates in <code>obsm/X_umap</code>, then decide which cells to show.</p>
-      <p class="source"><a href="../anndata/">AnnData guide</a> · <a href="https://scanpy.readthedocs.io/en/stable/api/generated/scanpy.datasets.pbmc68k_reduced.html">Scanpy dataset ↗</a> · <span id="anndata-provenance">Loading provenance…</span></p>
+      <p class="source dataset-source">Sample data: <a href="https://scanpy.readthedocs.io/en/latest/api/generated/scanpy.datasets.pbmc68k_reduced.html">Scanpy PBMC 68k reduced ↗</a>, a processed subset of 10x Genomics blood-cell data from <a href="https://doi.org/10.1038/ncomms14049">Zheng et al. (2017) ↗</a>.</p>
+      <p class="source"><a href="../anndata/">AnnData guide</a> · <span id="anndata-provenance">Loading provenance…</span></p>
       <div class="workspace"><div class="query-pane">
         <div class="controls"><div><label for="anndata-source">Data source (remote AnnData Zarr or Scanpy ZIP)</label><input id="anndata-source" type="text" placeholder="https://…/dataset.zarr or the pinned Scanpy ZIP" disabled></div></div>
         <div class="actions compact"><button id="anndata-load-source" class="secondary" disabled>Load source</button><button id="anndata-source-reset" class="secondary" disabled>Reset to sample</button></div>
@@ -55,7 +54,8 @@
     <section id="ome" class="demo" aria-labelledby="ome-title">
       <div class="section-heading"><p class="eyebrow">02 / OME-Zarr</p><h2 id="ome-title">Explore a 3D fluorescence volume</h2><p id="ome-dataset-label">Loading dataset…</p></div>
       <p>Both fluorescence channels are loaded together: blue marks LaminB1 and yellow marks Dapi. Choose a depth range or isolate one channel to explore it. The volume turns gently on its own; drag to explore, scroll to zoom, or pause the rotation for a closer look.</p>
-      <p class="source"><a href="../ome-zarr/">OME-Zarr guide</a> · <a href="https://github.com/WayScience/ome-arrow">ome-arrow ↗</a> · <a href="https://idr.openmicroscopy.org/webclient/?show=project-402">IDR idr0062A ↗</a> · <span id="ome-provenance">Loading provenance…</span></p>
+      <p class="source dataset-source">Sample data: <a href="https://idr.openmicroscopy.org/webclient/img_detail/6001240/">IDR image 6001240 (idr0062) ↗</a> from the NesSys study by <a href="https://doi.org/10.1371/journal.pbio.3000388">Blin et al. (2019) ↗</a> · <a href="https://doi.org/10.17867/10000125">Dataset DOI ↗</a> · <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0 ↗</a>.</p>
+      <p class="source"><a href="../ome-zarr/">OME-Zarr guide</a> · <span id="ome-provenance">Loading provenance…</span></p>
       <div class="workspace"><div class="query-pane">
         <div class="controls"><div><label for="ome-source">Data source (OME-Zarr URL)</label><input id="ome-source" type="text" placeholder="https://…/image.ome.zarr" disabled></div></div>
         <div class="actions compact"><button id="ome-load-source" class="secondary" disabled>Load source</button><button id="ome-source-reset" class="secondary" disabled>Reset to sample</button></div>
@@ -68,7 +68,7 @@
       <div id="ome-results" class="results" tabindex="0" aria-label="OME-Zarr query results"></div>
       <details><summary>What am I querying?</summary><p id="ome-detail">Loading provenance…</p></details>
     </section>
-    <footer><h2>Bring your own question.</h2><p>Zarr holds the arrays. DuckDB makes them tables. SQL connects the two.</p><p><a href="https://github.com/xqlsystems/duckdb-zarr">Project & SQL reference ↗</a> · <a href="https://github.com/xqlsystems/duckdb-zarr/blob/main/docs/anndata.md">AnnData guide ↗</a></p><p id="provenance" class="note"></p></footer>
+    <footer><h2>Bring your own questions.<br><span class="closing-answer">duckdb-zarr for the answers.</span></h2><p><a href="https://github.com/xqlsystems/duckdb-zarr">Project & SQL reference ↗</a> · <a href="https://github.com/xqlsystems/duckdb-zarr/blob/main/docs/anndata.md">AnnData guide ↗</a></p><p id="provenance" class="note"></p></footer>
   </main>
   <script type="module" src="./src/main.js"></script>
 </body>

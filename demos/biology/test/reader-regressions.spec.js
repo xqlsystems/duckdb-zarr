@@ -37,5 +37,19 @@ test('the real WASM reader handles omitted chunks and named nested arrays', asyn
     await expect(page.locator('#ome-status')).not.toHaveClass('error');
     const labels = await page.locator('#ome-results tbody tr').evaluateAll((rows) => rows.map((row) => Number(row.cells[3].textContent)));
     expect(labels).toEqual(readerFixture.expected.labels);
+
+    await page.locator('#ome-sql').fill(sql + '\nLIMIT 0');
+    await page.locator('#ome-run').click();
+    await expect(page.locator('#ome-run')).toBeEnabled();
+    await expect(page.locator('#ome-status')).toContainText('0 rows');
+    await expect(page.locator('#ome-plot .biology-visualization')).toHaveAttribute('data-rotation-state', 'empty');
+
+    await page.locator('#ome-sql').fill('SELECT * FROM absent_ome_table');
+    await page.locator('#ome-run').click();
+    await expect(page.locator('#ome-run')).toBeEnabled();
+    await expect(page.locator('#ome-status')).toHaveClass('error');
+    await page.locator('#ome-reset').click();
+    await expect(page.locator('#ome-status')).toContainText('8 rows');
+    await expect(page.locator('#ome-status')).toContainText('plot updated');
   } finally { await store.close(); }
 });

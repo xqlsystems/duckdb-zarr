@@ -12,14 +12,31 @@ test('UMAP pivots components and joins by cell name', () => {
   assert.match(sql, /JOIN positions p USING \(obs\)/);
   assert.doesNotMatch(sql, /WHERE o.cell_type/);
 });
+test('volume SELECT lists put each column on its own indented line', () => {
+  for (const statistics of [false, true]) {
+    const sql = volumeSQL('https://example.org/image.zarr', { zmin: 0, zmax: 235, statistics });
+    const select = sql.split('\nFROM ')[0].split('\n');
+    assert.equal(select[0], 'SELECT');
+    assert.equal(select.length, statistics ? 7 : 6);
+    for (const [index, column] of select.slice(1).entries()) {
+      assert.match(column, /^  \S/);
+      assert.equal(column.endsWith(','), index < select.length - 2);
+      assert.doesNotMatch(column, /,\s*\S/);
+    }
+  }
+});
+test('volume examples use plain coordinate columns without casts', () => {
+  const sql = volumeSQL('https://example.org/image.zarr', { zmin: 0, zmax: 235 });
+  assert.equal(sql.split('\nFROM ')[0], 'SELECT\n  c,\n  x,\n  y,\n  z,\n  value');
+  assert.doesNotMatch(sql, /::|CAST\s*\(/i);
+});
 test('all channels are returned together and statistics stay separated by channel', () => {
   const sql = volumeSQL('https://example.org/image.zarr', { channel: 'all', zmin: 0, zmax: 235 });
-  assert.match(sql, /SELECT c::UTINYINT AS c, x::USMALLINT AS x/);
-  assert.match(sql, /z::USMALLINT AS z, value AS value/);
+  assert.match(sql, /SELECT\s+c,\s+x,\s+y,\s+z,\s+value/);
   assert.doesNotMatch(sql, /c =/);
   assert.match(sql, /WHERE z BETWEEN 0 AND 235/);
   const statistics = volumeSQL('x', { channel: 'all', zmin: 0, zmax: 235, statistics: true });
-  assert.match(statistics, /SELECT c, COUNT/);
+  assert.match(statistics, /SELECT\s+c,\s+COUNT/);
   assert.match(statistics, /GROUP BY c ORDER BY c/);
 });
 
@@ -35,15 +52,15 @@ test('the value column is aliased for any purely-numeric or slashed level basena
   // Mirrors needs_value_alias() in the Rust extension: a bare numeric level name
   // (array_path '0', '2', 'labels/0/0') can't be a valid unquoted/quoted identifier
   // the same way, so duckdb-zarr exposes it as the generic column `value` instead.
-  assert.match(volumeSQL('x', { channel: 0, zmin: 0, zmax: 0, level: '0' }), /, value AS value\n/);
-  assert.match(volumeSQL('x', { channel: 0, zmin: 0, zmax: 0, level: 'labels/0/0' }), /, value AS value\n/);
-  assert.match(volumeSQL('x', { channel: 0, zmin: 0, zmax: 0, level: 's2' }), /, "s2" AS value\n/);
+  assert.match(volumeSQL('x', { channel: 0, zmin: 0, zmax: 0, level: '0' }), /,\s+value\n/);
+  assert.match(volumeSQL('x', { channel: 0, zmin: 0, zmax: 0, level: 'labels/0/0' }), /,\s+value\n/);
+  assert.match(volumeSQL('x', { channel: 0, zmin: 0, zmax: 0, level: 's2' }), /,\s+"s2" AS value\n/);
 });
 test('nonnumeric nested image and label paths use value, not the basename', () => {
   const image = volumeSQL('x', { channel: 0, zmin: 0, zmax: 0, level: 'pyramid/full' });
-  assert.match(image, /, value AS value\n/);
+  assert.match(image, /,\s+value\n/);
   const labels = labelsSQL('x', { zmin: 0, zmax: 1, arrayPath: 'labels/nuclei' });
-  assert.match(labels, /, value AS value\n/);
+  assert.match(labels, /,\s+value\n/);
   assert.match(labelsSQL('x', { zmin: 0, zmax: 1, arrayPath: 'labels/nuclei', statistics: true }), /COUNT\(DISTINCT value\)/);
   assert.match(volumeSQL('x', { channel: 0, zmin: 0, zmax: 0, level: 'stain"blue' }), /"stain""blue" AS value/);
 });

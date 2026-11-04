@@ -52,6 +52,7 @@ test('original remote datasets, native-resolution composite, SQL and interaction
     await expect(page.locator('#ome-status')).toContainText('35,175,800 rows');
     await expect(page.locator('#ome-dataset-label')).toContainText('271×275×236');
     await expect(page.locator('#ome-channel')).toHaveValue('all');
+    expect(await page.locator('#ome-sql').inputValue()).not.toMatch(/::|CAST\s*\(/i);
     await expect(page.getByRole('button', { name: 'Image statistics', exact: true })).toHaveCount(0);
     await expect(page.locator('#anndata-stats')).toBeEnabled();
     expect(remoteChunks.size).toBe(472);
@@ -210,6 +211,11 @@ test('quiet two-item index, visible logos and biology copy work on mobile', asyn
   await page.route('**/zarr.duckdb_extension.wasm', (route) => route.abort('failed'));
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto('/');
+  await expect(page.locator('.wordmark')).toHaveText('duckdb-zarr');
+  const headerLogo = page.locator('.wordmark .brand-logo');
+  await expect(headerLogo).toBeVisible();
+  expect(await headerLogo.evaluate((image) => image.complete && image.naturalWidth > 0)).toBe(true);
+  expect(await headerLogo.boundingBox()).toMatchObject({ width: 32, height: 32 });
   const links = page.getByRole('navigation', { name: 'On this page', exact: true }).getByRole('link');
   await expect(links).toHaveCount(2);
   const layout = await links.evaluateAll((items) => items.map((el) => ({ height: el.getBoundingClientRect().height, background: getComputedStyle(el).backgroundColor, radius: getComputedStyle(el).borderRadius })));

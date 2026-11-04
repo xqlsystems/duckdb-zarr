@@ -94,16 +94,20 @@ seconds; subsequent queries reuse registered RAM buffers.
 Source: Blin et al. (2019), *NesSys: a novel method for accurate nuclear
 segmentation in 3D*, PLoS Biology 17(8), e3000388,
 DOI `10.1371/journal.pbio.3000388`; IDR dataset DOI `10.17867/10000125`,
-CC BY 4.0. The page links to IDR and the ome-arrow VTK-rendering inspiration.
+CC BY 4.0. The page links to the original image, dataset and study.
 
 ## Volume display
 
 vtk.js reconstructs an interleaved multi-channel texture directly from Arrow
 record batches. Avoiding `table.toArray()` prevents millions of retained JS row
-objects. Compact SQL coordinate types keep the full 35,175,800 intensity rows
-manageable. Channel identity comes from the returned `c` column, not a possibly
-stale selector value. Channels share a single physical grid and additively mix;
-SQL gaps remain zero rather than being compacted into the wrong positions.
+objects. OME queries execute the editor unchanged through `connection.send`,
+transferring Arrow batches individually rather than exporting one full-image IPC
+buffer. An Arrow table retains those batches for reconstruction; this is batched
+transfer, not a constant-memory renderer. Native coordinate types are preserved,
+so the example needs no SQL casts. Channel identity comes from the returned `c`
+column, not a possibly stale selector value. Channels share a single physical grid
+and additively mix; SQL gaps remain zero rather than being compacted into the
+wrong positions.
 
 Full native XY resolution, linear texture interpolation, and fixed full-pixel
 ray rendering replace the coarse default. Per-channel 70th/99.5th-percentile

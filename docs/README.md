@@ -1,3 +1,5 @@
+<img class="homepage-logo" src="images/logo.png" alt="duckdb-zarr logo" width="240" height="240">
+
 # duckdb-zarr
 
 A DuckDB extension for querying Zarr-format scientific arrays with SQL.
@@ -16,6 +18,41 @@ With this extension, you can:
 
 Zarr arrays are n-dimensional gridded data (like satellite imagery, climate model outputs, or sensor readings). This extension "pivots" these multi-dimensional arrays into relational tables—treating each cell in the array as a row, with coordinates as columns. This lets you use familiar SQL to query data that would otherwise require specialized array-processing tools.
 
+### Thinking in arrays and SQL
+
+The array-to-table approach explored by
+[xarray-sql](https://github.com/xqlsystems/xarray-sql) provides a useful way to
+think about these queries:
+
+- **Coordinates become columns:** a dense array has one row per coordinate
+  combination, with measurements as value columns.
+- **`WHERE` selects a region:** filter by time, location, channel, or depth.
+- **`GROUP BY` chooses the dimensions you keep:** grouping by latitude and
+  longitude while averaging a measurement reduces over time.
+- **Compatible variables share a table:** variables with matching dimensions
+  and shape in one Zarr group can be queried together. Join separate tables
+  explicitly.
+
+For example, average air temperature over the selected year at each location.
+After loading the extension, run this from the repository root with the tutorial
+fixtures generated (`make generate_fixtures`):
+
+```sql
+SELECT
+  lat,
+  lon,
+  AVG(air) AS mean_air
+FROM read_zarr('test/fixtures/xarray_tutorial/air_temperature.zarr')
+WHERE time >= TIMESTAMP '2014-01-01'
+  AND time < TIMESTAMP '2015-01-01'
+GROUP BY lat, lon;
+```
+
+These are shared principles, not an xarray-sql API compatibility layer:
+duckdb-zarr reads Zarr directly inside DuckDB, without a Python layer. Sparse
+AnnData tables can contain only stored entries rather than every coordinate
+combination. A `WHERE` filter does not by itself guarantee that chunks are skipped.
+
 ### Why This Is Useful
 
 Scientific datasets are often stored in Zarr format because it handles multi-terabyte to petabyte-scale arrays efficiently through chunking and compression. However, traditional SQL databases don't understand Zarr. This extension bridges that gap—allowing data scientists and engineers to:
@@ -25,12 +62,13 @@ Scientific datasets are often stored in Zarr format because it handles multi-ter
 - Use DuckDB's fast SQL engine to filter and aggregate chunked array data
 - Integrate Zarr data pipelines with existing SQL-based workflows
 
-This project is related to [xarray-sql](https://github.com/alxmrs/xarray-sql) and [zarr-datafusion](https://github.com/alxmrs/zarr-datafusion), which provide similar functionality for other query engines.
+This project is related to [xarray-sql](https://github.com/alxmrs/xarray-sql) and [zarr-datafusion](https://github.com/alxmrs/zarr-datafusion), which offer related SQL interfaces to scientific arrays.
 
-## Examples
+## Field guides
 
-[Browse examples](examples/index.md) to explore Zarr data with executable SQL
-and interactive visualizations, starting with **duckdb-zarr for biologists**.
+- [Climate](examples/climate.md) — temperature summaries and precipitation.
+- [Geoscience](examples/geoscience.md) — geographic grids and location queries.
+- [Biology](../demos/biology/README.md) — interactive single-cell and 3D image queries.
 
 ## Guides by domain
 

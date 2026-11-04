@@ -1,4 +1,6 @@
 import * as duckdb from '@duckdb/duckdb-wasm';
+import { Table } from 'apache-arrow';
+import projectLogoURL from '../../../docs/images/logo.png?url';
 import duckdbWasm from '@duckdb/duckdb-wasm/dist/duckdb-base.wasm?url';
 import duckdbWorker from '@duckdb/duckdb-wasm/dist/duckdb-browser-base.worker.js?url';
 import { createScatter } from './visualizations.js';
@@ -9,6 +11,8 @@ import { OME_URL, loadOME } from './remote_ome.js';
 import { prefetchOME } from './prefetch_ome.js';
 
 const $ = (id) => document.getElementById(id);
+// Vite resolves the shared artwork in both standalone dev and production builds.
+if ($('project-logo')) $('project-logo').src = projectLogoURL;
 const kinds = ['anndata', 'ome'];
 const plots = {};
 const sourceURLs = {};
@@ -89,7 +93,16 @@ async function run(kind) {
   status(`${kind}-status`, 'Running SQL in your browser…');
   const start = performance.now();
   try {
-    const table = await conn.query($(`${kind}-sql`).value);
+    let table;
+    if (kind === 'ome') {
+      // Transfer batches individually instead of one full-image IPC buffer.
+      // Keep native coordinate types and execute the editor without rewriting SQL.
+      const reader = await conn.send($(`${kind}-sql`).value, true);
+      const schema = reader.schema;
+      const batches = [];
+      for await (const batch of reader) batches.push(batch);
+      table = new Table(schema, batches);
+    } else table = await conn.query($(`${kind}-sql`).value);
     resultTable(kind, table);
     const needed = kind === 'ome' ? ['c', 'x', 'y', 'z', 'value'] : ['x', 'y', 'label'];
     const hasCoordinates = needed.every((name) => table.getChild(name));
