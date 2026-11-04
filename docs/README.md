@@ -66,9 +66,9 @@ This project is related to [xarray-sql](https://github.com/alxmrs/xarray-sql) an
 
 ## Field guides
 
-- [Climate](examples/climate.md) — temperature summaries and precipitation.
-- [Geoscience](examples/geoscience.md) — geographic grids and location queries.
 - [Biology](../demos/biology/README.md) — interactive single-cell and 3D image queries.
+- [Climate](examples/climate.md) — temperature summaries and precipitation.
+- [Geoscience](examples/geoscience.md) — Landsat composites and vegetation indices.
 
 ## Guides by domain
 

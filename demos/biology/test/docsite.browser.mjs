@@ -194,6 +194,7 @@ try {
   page.on('pageerror', (error) => errors.push(error.message));
   await page.goto(base);
   assert.equal((await page.locator('main h1').textContent()).replace(/¶$/, ''), 'duckdb-zarr');
+  assert.deepEqual(await page.locator('main #field-guides + ul a').allTextContents(), ['Biology', 'Climate', 'Geoscience']);
   assert.equal(await page.locator('main #thinking-in-arrays-and-sql').count(), 1);
   assert.equal(await page.locator('main a[href="https://github.com/xqlsystems/xarray-sql"]').count(), 1);
   assert.equal(await page.locator('main pre code').filter({ hasText: 'AVG(air) AS mean_air' }).count(), 1);
@@ -225,7 +226,7 @@ try {
   const biologyExample = page.getByRole('navigation', { name: 'Documentation guides', exact: true }).getByRole('link', { name: 'Biology', exact: true });
   assert.equal(await biologyExample.count(), 1, 'Biology must be a sidebar example, not only an index link.');
   assert.equal(await biologyExample.evaluate((link) => link.closest('ul').previousElementSibling.textContent.trim()), 'Field guides');
-  assert.deepEqual(await biologyExample.evaluate((link) => [...link.closest('ul').querySelectorAll(':scope > li > a')].map((item) => item.textContent.trim())), ['Climate', 'Geoscience', 'Biology']);
+  assert.deepEqual(await biologyExample.evaluate((link) => [...link.closest('ul').querySelectorAll(':scope > li > a')].map((item) => item.textContent.trim())), ['Biology', 'Climate', 'Geoscience']);
   for (const [label, section] of [['AnnData', 'Formats'], ['OME-Zarr', 'Formats'], ['Scientific domains', 'Reference']]) {
     const link = page.getByRole('navigation', { name: 'Documentation guides', exact: true }).getByRole('link', { name: label, exact: true });
     assert.equal(await link.evaluate((element) => element.closest('ul').previousElementSibling.textContent.trim()), section);
@@ -243,7 +244,10 @@ try {
   assert.equal(page.url(), base + 'examples/geoscience/');
   const geoscienceTitle = await exampleTitle(page, 'geoscience');
   assert.deepEqual(await subtitleStyles(page), climateSubtitle);
-  assert.equal(await page.locator('main pre code').count(), 2);
+  assert.equal(await page.locator('main pre code').count(), 3);
+  assert.equal(await page.locator('main #vegetation-from-landsat-bands').count(), 1);
+  assert.equal(await page.locator('main a[href="https://data.source.coop/kentstephen/landsat-mosaics-new-england/README.md"]').count(), 1);
+  assert.doesNotMatch(await page.locator('main').textContent(), /air_temperature|warmest locations/);
   await openGuide(page, 'Biology');
   assert.equal(page.url(), base + 'biology/');
   assert.equal(await page.getByRole('navigation', { name: 'Documentation guides', exact: true }).count(), 1, 'Biology must retain the docsite sidebar.');
@@ -294,7 +298,7 @@ try {
     assert.equal(await page.locator('#ome-plot .biology-visualization').getAttribute('data-channel-ids'), '0,1');
     assert.deepEqual(await page.getByRole('list', { name: 'Channel colors' }).getByRole('listitem').allTextContents(), ['LaminB1', 'Dapi']);
   }
-  await page.getByRole('searchbox', { name: 'Search documentation' }).fill('Air temperature for a map');
+  await page.getByRole('searchbox', { name: 'Search documentation' }).fill('Vegetation from Landsat bands');
   await page.locator('#search-results a').first().waitFor();
   assert.ok((await page.locator('#search-results a').first().getAttribute('href')).startsWith(base + 'examples/geoscience/'));
   await page.keyboard.press('Escape');
@@ -353,9 +357,9 @@ try {
     assert.equal(new URL(href, page.url()).href, origin + '/' + path);
   }
   await page.goto(base + 'domains/');
-  assert.deepEqual((await page.locator('main h2').allTextContents()).slice(0, 3).map((title) => title.replace(/¶$/, '')), ['Climate', 'Geoscience', 'Biology']);
+  assert.deepEqual((await page.locator('main h2').allTextContents()).slice(0, 3).map((title) => title.replace(/¶$/, '')), ['Biology', 'Climate', 'Geoscience']);
   assert.equal(await page.locator('main #climate-and-geoscience').count(), 1, 'Keep existing combined-section links working.');
-  for (const domain of ['Climate', 'Geoscience', 'Biology']) {
+  for (const domain of ['Biology', 'Climate', 'Geoscience']) {
     const link = page.locator('main').getByRole('link', { name: `${domain} field guide`, exact: true });
     assert.equal(await link.count(), 1);
   }

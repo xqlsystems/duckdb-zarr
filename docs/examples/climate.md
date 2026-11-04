@@ -9,7 +9,7 @@ repository's existing SQL examples. Run these in DuckDB with the Zarr extension
 loaded; see the [loading instructions](../../README.md#loading-once-built).
 These are static SQL examples, not browser-executed cells.
 
-For latitude/longitude grids and map-ready results, see the
+For Landsat imagery and vegetation indices, see the
 [geoscience example](geoscience.md).
 
 ## Monthly mean air temperature

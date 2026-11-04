@@ -4,9 +4,27 @@
 domain-specific query engines. Domain coverage therefore means that the test
 suite includes representative data and queries from that community.
 
-The sections follow the field guide order: Climate,
-Geoscience, then Biology. Shared storage conventions are covered separately
+The sections follow the field guide order: Biology,
+Climate, then Geoscience. Shared storage conventions are covered separately
 below.
+
+## Biology
+
+| Community | Current test coverage |
+| --- | --- |
+| Annotated matrices / AnnData | A synthetic cell-by-gene store with named observations and variables, categorical and nullable annotations, sparse CSR/CSC matrices, layers, embeddings, pairwise matrices, views, and direct-array reads ([SQL tests](../test/sql/anndata.test)). The [comparison script](../scripts/check_anndata_tables.py) checks tables against `anndata.read_zarr` for three AnnData fixtures. |
+| Spatial biology / SpatialData tables | A synthetic SpatialData-like store with nested AnnData objects, inherited observation names, a label-image-to-annotation join, and view mounting ([SQL tests](../test/sql/spatialdata.test)). This does not establish comprehensive SpatialData support or test reading points and shapes from Parquet. |
+| Bioimaging | An OME-Zarr v3 multichannel image with a nested label image, including recursive discovery, resolution-level selection, named image axes, and label queries. |
+
+The [AnnData edge-case tests](../test/test_anndata_edge_cases.py) also check
+`raw/X` and `raw/var`, independently chunked nullable masks, and categorical
+ENUM width boundaries in Zarr v2/v3, both at the root and in nested tables.
+They run with `make test_debug` and `make test_release`.
+
+See the [Biology field guide](../demos/biology/README.md) for the interactive
+walkthrough, [Querying AnnData stores](anndata.md), including its
+[SpatialData boundaries](anndata.md#spatialdata-stores), and
+[Querying OME-Zarr](ome-zarr.md).
 
 <a id="climate-and-geoscience"></a>
 
@@ -28,30 +46,12 @@ summaries and the public precipitation query.
 | Geographic grids | Latitude/longitude queries, spatial aggregation, and ranking the warmest grid locations in the air-temperature dataset ([realistic SQL tests](../test/sql/realistic_queries.test)). |
 | Ocean regions | Basin-mask arrays, including missing-value handling ([reader SQL tests](../test/sql/read_zarr.test)). |
 
-See the [Geoscience field guide](examples/geoscience.md) for map-ready results
-and location-based summaries.
+See the [Geoscience field guide](examples/geoscience.md) for a public Landsat
+Zarr composite, calibrated red/NIR reflectance, and NDVI queries. This live-data
+walkthrough is separate from the automated fixture coverage above.
 
-GeoZarr-style pyramids are a likely next area to evaluate because they share
-some structural patterns with OME-Zarr multiscales, but they are not currently
-covered by fixtures.
-
-## Biology
-
-| Community | Current test coverage |
-| --- | --- |
-| Annotated matrices / AnnData | A synthetic cell-by-gene store with named observations and variables, categorical and nullable annotations, sparse CSR/CSC matrices, layers, embeddings, pairwise matrices, views, and direct-array reads ([SQL tests](../test/sql/anndata.test)). The [comparison script](../scripts/check_anndata_tables.py) checks tables against `anndata.read_zarr` for three AnnData fixtures. |
-| Spatial biology / SpatialData tables | A synthetic SpatialData-like store with nested AnnData objects, inherited observation names, a label-image-to-annotation join, and view mounting ([SQL tests](../test/sql/spatialdata.test)). This does not establish comprehensive SpatialData support or test reading points and shapes from Parquet. |
-| Bioimaging | An OME-Zarr v3 multichannel image with a nested label image, including recursive discovery, resolution-level selection, named image axes, and label queries. |
-
-The [AnnData edge-case tests](../test/test_anndata_edge_cases.py) also check
-`raw/X` and `raw/var`, independently chunked nullable masks, and categorical
-ENUM width boundaries in Zarr v2/v3, both at the root and in nested tables.
-They run with `make test_debug` and `make test_release`.
-
-See the [Biology field guide](../demos/biology/README.md) for the interactive
-walkthrough, [Querying AnnData stores](anndata.md), including its
-[SpatialData boundaries](anndata.md#spatialdata-stores), and
-[Querying OME-Zarr](ome-zarr.md).
+The guide reads one coarse pyramid level; this is not comprehensive GeoZarr
+interoperability coverage. Pyramid conventions are not yet covered by fixtures.
 
 ## General xarray/Zarr
 
@@ -63,7 +63,7 @@ and inherited coordinates checked for
 
 ## Not yet represented
 
-The format may work for other communities, including astronomy and
-remote sensing, but those domains do not yet have representative fixtures in
-the test suite. Support claims should follow the addition of domain-specific
-test data and queries.
+Astronomy does not yet have representative fixtures. Remote sensing is
+illustrated by the Landsat field guide, but likewise has no dedicated fixtures
+in the default test suite. Support claims should distinguish a verified
+walkthrough from systematic format and domain coverage.

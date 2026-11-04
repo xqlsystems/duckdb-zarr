@@ -27,9 +27,9 @@ markdown_extensions:
 nav:
   - Start here: README.md
   - Field guides:
+      - Biology: biology/index.md
       - Climate: examples/climate.md
       - Geoscience: examples/geoscience.md
-      - Biology: biology/index.md
   - Formats:
       - AnnData: anndata.md
       - OME-Zarr: ome-zarr.md
