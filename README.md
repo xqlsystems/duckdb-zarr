@@ -48,7 +48,7 @@ SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', group_pat
 SELECT cell_type, COUNT(*) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', table_name := 'obs') GROUP BY ALL;
 
 -- Get the statements that mount every table as a view (era5.main.surface, ...),
--- then run them; docs/design.md, section 3, shows how from Python and the CLI
+-- then run them; docs/design.md, "Mounting a store as views", shows how from Python and the CLI
 SELECT sql FROM read_zarr_views('test/fixtures/xarray_tutorial/era5_like.zarr', 'era5',
   view_names := MAP {'time_latitude_longitude': 'surface'});
 ```
@@ -81,7 +81,7 @@ Active development. Phases 1–3 are implemented:
 - **Phase 3** — HTTP/HTTPS stores, `dims=` and `array_path=` selection, recursive array discovery
 - **Nested groups** — one table set per Zarr group (`group_path=`), as in `xarray.DataTree`; AnnData stores with named axes, cell and gene names as coordinates, categoricals as `ENUM`, nullable columns, and sparse matrices
 
-See the [phased plan](docs/design.md#phased-plan) for what's next.
+See [known limits](docs/design.md#known-limits) and the [roadmap](docs/design.md#roadmap).
 
 ## Building
 

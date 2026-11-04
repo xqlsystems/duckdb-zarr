@@ -109,7 +109,7 @@ AnnData has its own axis naming and decoded tables; see the
 To mount all readable tables as views, call `read_zarr_views(store, database)`
 and execute the returned SQL statements on the same connection. It returns
 SQL; it does not execute the statements itself. See the
-[Python and CLI mounting recipes](design.md#3-mounting-multi-table-stores-attach-and-read_zarr_views).
+[Python and CLI mounting recipes](design.md#mounting-a-store-as-views).
 
 ### OME-Zarr Features
 

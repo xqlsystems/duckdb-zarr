@@ -1,136 +1,471 @@
-# Design: native Zarr in DuckDB
+# How duckdb-zarr works
 
-A design for `duckdb-zarr` — a Rust DuckDB extension that lets users query Zarr stores with SQL, in the same spirit as [xarray-sql](https://github.com/alxmrs/xarray-sql) (Python/DataFusion) and [zarr-datafusion](https://lib.rs/crates/zarr-datafusion) (Rust/DataFusion), but as a first-class DuckDB extension with no external query engine in the loop.
+`duckdb-zarr` is a [DuckDB](https://duckdb.org/) extension that reads
+[Zarr](https://zarr.dev/) stores as SQL tables. You point a query at a Zarr
+store on disk or at a URL, and the arrays inside it come back as rows and
+columns that you can filter, aggregate and join with any other data DuckDB can
+read: CSV files, Parquet files, other databases.
 
-## Goals
+This document explains the design: how an N-dimensional array becomes a table,
+which conventions the reader follows, what happens when a query runs, and why
+the main decisions went the way they did. It describes the extension as it is
+built today, including its limits, and ends with what is planned.
 
-- `SELECT * FROM 'path/to/store.zarr'` works for any Zarr v2 or v3 store that follows xarray-style conventions.
-- Read remote stores (S3, GCS, HTTP) via DuckDB's existing `httpfs`/`secrets` machinery.
-- Push projection and coordinate-range filters down so that only the chunks we need are touched.
-- Use DuckDB's native parallel scan (one Zarr chunk ≈ one morsel of work).
-- Ship as a community extension installable with `INSTALL zarr FROM community`.
+It is written for two groups of readers. If you work with scientific arrays
+(climate model output, microscopy images, single-cell matrices) and know
+xarray or NumPy better than SQL, start with [Background for array
+users](#duckdb-and-sql-for-array-users). If you know SQL and DuckDB but have
+not met Zarr, start with [Background for SQL users](#zarr-for-sql-users).
+Contributors will find a map of the source code at the end.
 
-## Non-goals (for the first cut)
+For task-oriented guides, see [Querying AnnData stores](anndata.md) and
+[Querying OME-Zarr](ome-zarr.md).
 
-- Writes. Read-only.
-- Automatic relational joins across nested groups. Each Zarr group is a node with its own tables (decision 8), and each `read_zarr` scan reads one dimension group of one node, or one array selected by store-relative path.
-- Replacing xarray. Users who need lazy array operations should keep using xarray; we just want a SQL handle on the same data.
-- Custom codecs beyond what `zarrs` already supports.
-- WebAssembly as a distributed platform. The extension compiles for `wasm32-unknown-emscripten` and loads in duckdb-wasm (`make wasm_mvp`): every store is read through DuckDB's own FileSystem (`DuckDbStore`) because `zarrs_http` depends on `reqwest::blocking`, and `zarrs`' rayon work runs on a one-thread pool built at extension init. Local (non-URL) store paths are not supported on wasm: array listing for local stores walks the host filesystem.
+## Background
 
-## Future integration boundaries (deferred)
+### Zarr, for SQL users
 
-Three integration targets come up whenever a Zarr reader ships in the Pangeo orbit: IceChunk, VirtualiZarr/Kerchunk, and Substrait. None are in scope for v0.1–v0.4. This section names each so future contributors aren't surprised by the gap, and is deliberate about *not* designing the seam upfront for them. Three integrations with three very different shapes can't share one general abstraction without producing one that's wrong for all three.
+Zarr is a storage format for N-dimensional arrays. An array is a grid of values
+of one type: a 2-D array of 16-bit integers can hold an image, a 3-D array of
+floats might hold air temperature over time, latitude and longitude. The number of
+dimensions (axes) is the array's *rank*, and the length along each axis is its
+*shape*: a temperature array with shape `(2920, 25, 53)` holds 2,920 time steps
+on a grid of 25 latitudes by 53 longitudes, 3.9 million values in all.
 
-**IceChunk** (Git-like versioning over a Zarr-compatible repository). The only viable Rust path is `zarrs_icechunk`, which is async-only and exposes a Repository + Session model rather than the open-a-path model of plain Zarr. Adding IceChunk would require (a) an async-aware boundary at the `zarr_reader` seam, breaking decision 5; (b) snapshot / branch identifiers on the SQL surface — named arguments on `read_zarr` and `ATTACH` would absorb this without breaking the existing API; (c) a probe step in the replacement scan to distinguish IceChunk repos from plain Zarr roots. None of this is started.
+Zarr splits each array into **chunks**, rectangular blocks of equal shape,
+and stores each chunk as a separate compressed object: a file on disk, or an
+object in cloud storage such as Amazon S3. The temperature array above might
+be chunked `(730, 13, 27)`, so one chunk covers 730 time steps of one quarter
+of the grid. A reader that needs only part of an array fetches and
+decompresses only the chunks that overlap that part. This is why Zarr works
+well for data far larger than memory, read over a network. The chunks at the
+far edge of an array can extend past its end; the extra positions hold the
+array's *fill value*. A chunk that was never written also reads as the fill
+value, so a mostly empty array costs little storage.
 
-**VirtualiZarr / Kerchunk** (Zarr-shaped views over archival NetCDF/HDF5/GRIB2). The chunk manifest lives at the Zarr path but the actual chunk bytes live in a foreign URL. The current storage adapter is "key → DuckDB filesystem at `store_root + '/' + key`" — wrong shape for virtual chunks, which need "key → manifest lookup → byte-range fetch from a different URL." Compounding this, virtual chunks usually point into HDF5/NetCDF/GRIB2 files whose internal compression is *not* a Zarr codec, so the non-goal "no custom codecs beyond `zarrs`" excludes most archival VirtualiZarr stores by construction. The only Rust ecosystem path today is IceChunk-backed VirtualiZarr (Kerchunk JSON/Parquet has no Rust parser), so VirtualiZarr is doubly gated on IceChunk landing first.
+The compression and byte layout of each chunk are described by a list of
+**codecs** (gzip, zstd, Blosc, and others) in the array's metadata.
 
-**Substrait** (cross-engine query plan exchange). DuckDB's separate `substrait` community extension serializes plans, but a `read_zarr(...)` call serializes as a DuckDB-specific extension function that no other engine can execute. The `ATTACH ... (TYPE ZARR)` path is closer to Substrait-friendly because it presents the Zarr store as a named table — Substrait's `ReadRel` references a table by name, which a hypothetical DataFusion-side reader could resolve through a shared catalog. We're not designing for Substrait, but the existence of the `ATTACH` form means we're not painting ourselves into a corner either.
+A Zarr **store** is a hierarchy, like a directory tree. Arrays live in
+**groups**, and groups can contain other groups. Each array and each group has
+a small JSON metadata document, and can carry **attributes**: arbitrary JSON
+key-value pairs that tools use to record units, descriptions and conventions.
 
-The `zarr_reader` seam (§Architecture) is correct for plain Zarr v2/v3 today. None of these three integrations fit through it without modification. That's by design — getting plain Zarr right is the v1 product, and a seam pre-shaped for three speculative integrations would be wrong-shaped for all three. The seam stays small; future work re-evaluates it then, with concrete user evidence.
+There are two versions of the format. Zarr v2 keeps an array's metadata in a
+`.zarray` file and its attributes in `.zattrs`. Zarr v3 keeps both in one
+`zarr.json` file. Object stores such as S3 cannot list the contents of a
+"directory" cheaply, so many published stores also carry **consolidated
+metadata**: one document at the root that contains the metadata of every array
+and group. In v2 this is a `.zmetadata` file; in v3 it is a block inside the
+root `zarr.json`.
 
-## Implementability risks (spike resolved 2026-05-04)
+### xarray and the CF conventions
 
-The pinned `duckdb` crate (`=1.10504.0`) exposes the `VTab` trait (bind/init/func) and scalar-function registration that v0.1 requires. Below are the resolved findings for the four APIs that were open questions:
+Zarr itself only stores arrays. The meaning of their axes comes from
+conventions layered on top, and the most widespread is
+[xarray](https://xarray.dev/)'s, a Python library for labelled N-dimensional
+data.
 
-**(a) Replacement-scan registration** — `Connection::register_replacement_scan` does **not** exist in duckdb-rs. However, `libduckdb-sys` (the underlying C FFI layer that ships with the crate) exposes `duckdb_add_replacement_scan`, `duckdb_replacement_scan_set_function_name`, `duckdb_replacement_scan_add_parameter`, and `duckdb_replacement_scan_set_error`. Replacement scan for `.zarr` path interception lands behind a thin `unsafe` FFI wrapper calling these symbols directly. This unblocks the v0.2 work.
+In xarray's model, every axis of an array has a **dimension name**, such as
+`time`, `lat` or `lon`. Arrays that share a dimension name share that axis.
+A **coordinate** is a 1-D array that labels the positions along a dimension
+and has the dimension's name: the `lat` array holds the 25 latitudes of the
+`lat` dimension. Most other arrays are **data variables**: `air(time, lat,
+lon)` is a data variable over three dimensions. A collection of data variables
+and coordinates is an xarray `Dataset`. A tree of datasets, one per Zarr group,
+is an xarray `DataTree`.
 
-**(b) ATTACH / storage-extension hooks** — `duckdb_register_storage_extension` is **absent** from `libduckdb-sys`. ATTACH as a proper storage engine is not achievable via the C extension API at this version. The v0.3 ATTACH milestone must use a different mechanism — most likely a macro-style shim (a SQL `ATTACH` wrapper that mounts each dimension group as a named view). This weakens the ATTACH UX slightly (no native `FROM zarr.temperature`) but keeps the rest of the design intact. **Update 2026-09-29:** the shim was spiked and rejected because it leaks the database instance; see decision 8, Mounting.
+When xarray writes Zarr, it stores dimension names in the array's
+`_ARRAY_DIMENSIONS` attribute (v2) or in the `dimension_names` field of
+`zarr.json` (v3).
 
-**(c) Dictionary-vector construction** — `duckdb_create_dictionary_vector` is **absent**. Coordinate columns are emitted as flat `FlatVector` values gathered from the cached coord array; the dictionary-encoding optimization is off the table. Correctness is unchanged; memory use per scan is higher for high-cardinality coord columns (rare in practice — time and lat/lon coords repeat heavily within a chunk but the duplication is at the chunk-buffer level, not the SQL vector level).
+The [CF conventions](https://cfconventions.org/) (Climate and Forecast) are a
+standard set of attributes from the climate and ocean sciences that xarray and
+NetCDF tools follow. The ones that matter here:
 
-**(d) Extension config-variable registration** — `duckdb_register_config_option`, `duckdb_create_config_option`, `duckdb_config_option_set_{name,description,type,default_value,default_scope}`, and `duckdb_client_context_get_config_option` are **all present** in `libduckdb-sys`. `SET zarr_chunk_cache_mb = 512` lands behind a thin FFI wrapper; the setting is readable from `InitInfo` via the client context pointer.
+- **Missing values.** A `_FillValue` or `missing_value` attribute names a
+  sentinel value (for example `-9999`) that marks a cell as missing.
+- **Packing.** An integer array with `scale_factor` and `add_offset` attributes
+  stores a real-valued measurement compactly. The true value is
+  `stored * scale_factor + add_offset`. Air temperature stored as the 16-bit
+  integer `27315` with a scale factor of `0.01` is `273.15` kelvin.
+- **Time.** A time coordinate is often stored as numbers with a `units`
+  attribute such as `"hours since 1900-01-01"` and a `calendar` attribute such
+  as `"standard"` or `"noleap"` (a 365-day calendar some climate models use).
+- **Bounds.** A coordinate can point, through a `bounds` attribute, to a
+  companion array of shape `(N, 2)` holding the start and end of each cell,
+  such as `time_bnds`.
+- **Auxiliary coordinates.** A data variable's `coordinates` attribute can
+  name extra coordinate arrays that are not indexed by a single dimension,
+  such as a 2-D `lat(y, x)` on a curvilinear ocean grid.
 
-**(e) Predicate filter pushdown** — `duckdb_bind_get_filter` and `duckdb_table_function_set_pushdown_filter` are **absent**. DuckDB will evaluate `WHERE lat > 30` by scanning all rows and filtering post-scan. Filter pushdown remains a v0.3 item; if the C API exposes a path at that point it can be added, otherwise the optimizer handles it outside the scan.
+Two other communities define their own layouts on Zarr, and the extension
+understands both. [OME-Zarr](https://ngff.openmicroscopy.org/) stores
+microscopy images as a *multiscale pyramid*: arrays `0`, `1`, `2`, ... hold
+the same image at decreasing resolution, and the group's `multiscales`
+attribute names the axes (`c`, `z`, `y`, `x` for channel, depth and the two
+image axes). [AnnData](https://anndata.readthedocs.io/) stores annotated
+matrices, most often single-cell gene expression: a matrix `X` of
+observations (cells) by variables (genes), with tables of annotations for each
+axis.
 
-**(f) Projection pushdown** — `duckdb_table_function_supports_projection_pushdown`, `duckdb_init_get_column_count`, and `duckdb_init_get_column_index` are **present** in `libduckdb-sys`. The high-level `VTab::supports_pushdown()` method (returns `false` by default) controls this on the duckdb-rs side. Both paths work; we use the high-level API for v0.1 (all columns, no pushdown), add projection pushdown in v0.2 when it reduces unnecessary coord materialization.
+### DuckDB and SQL, for array users
 
-## The pivot, in DuckDB terms
+SQL is the language of relational databases. Its unit of data is the
+**table**: a set of **rows**, each with the same named, typed **columns**. A
+query describes the result you want and the database works out how to compute
+it:
 
-A Zarr store with coordinates `lat(L)`, `lon(M)`, `time(T)` and data variables `temperature[T,L,M]`, `humidity[T,L,M]` is exposed as a single DuckDB table:
-
+```sql
+SELECT lat, AVG(air) AS mean_air
+FROM some_table
+WHERE time >= TIMESTAMP '2014-01-01'
+GROUP BY lat
+ORDER BY lat;
 ```
-| time      | lat   | lon   | temperature | humidity |
-|-----------|-------|-------|-------------|----------|
-| 2024-01-01| 0.0   | 0.0   | 273.15      | 0.81     |
-| 2024-01-01| 0.0   | 0.5   | 273.42      | 0.79     |
-| ...       |       |       |             |          |
+
+`SELECT` picks the output columns, `FROM` names the input, `WHERE` keeps the
+rows that match a condition, and `GROUP BY` collapses rows that share a value
+into one row per group, with aggregates such as `AVG`, `SUM` and `COUNT`. A
+`JOIN` combines rows of two tables that match on some columns. Rows in a table
+have no inherent order, so a query that needs one says `ORDER BY`. A missing
+value in SQL is `NULL`. It is not the same as a floating-point `NaN`:
+aggregates skip `NULL`, but a single `NaN` makes `AVG` return `NaN`.
+
+DuckDB is a SQL database that runs inside your program (a Python session, a
+command-line shell, a web page) rather than as a separate server. It is built
+for analytical queries over large tables, and it reads files in place: `FROM
+'data.parquet'` queries a Parquet file without importing it first.
+
+**Extensions** add features to DuckDB at run time; this project is one.
+Extensions can add **table functions**, which are functions that return a
+table and can appear in `FROM` like a table. `read_zarr('store.zarr')` is a
+table function. Table functions take **named parameters**, written `name :=
+value` (DuckDB also accepts `name = value`). An extension can also add a
+**replacement scan**, which is a hook that turns a string in `FROM`, such as
+`FROM 'store.zarr'`, into a call to one of its functions.
+
+A DuckDB **database** holds **schemas**, and a schema holds tables and
+**views**. A view is a stored query that you can select from like a table.
+`ATTACH` adds a database to a session, so `era5.main.surface` names the view
+`surface` in schema `main` of the attached database `era5`.
+
+DuckDB processes data in **vectors**: batches of values for one column, by
+default up to 2,048 of them. A table function fills one batch of rows per call, and DuckDB can call
+it from several threads at once.
+
+## From arrays to tables
+
+### One row per cell
+
+The extension turns arrays into a table by giving each cell its own row. Each
+dimension becomes a column holding that cell's coordinate value, and each data
+variable becomes a column holding that cell's value. Take a store with
+coordinates `time` (2 values), `lat` (2 values) and `lon` (3 values), and two
+data variables `temperature(time, lat, lon)` and `humidity(time, lat, lon)`.
+It reads as one table with 2 × 2 × 3 = 12 rows:
+
+| time | lat | lon | temperature | humidity |
+|---|---|---|---|---|
+| 2024-01-01 00:00 | 10.0 | 0.0 | 273.15 | 0.81 |
+| 2024-01-01 00:00 | 10.0 | 0.5 | 273.42 | 0.79 |
+| 2024-01-01 00:00 | 10.0 | 1.0 | 273.60 | 0.78 |
+| 2024-01-01 00:00 | 10.5 | 0.0 | 272.90 | 0.83 |
+| ... | | | | |
+
+This "long" layout is what lets plain SQL work on gridded data. A spatial
+average is `GROUP BY lat, lon`, a time series at a point is `WHERE lat = 10.0
+AND lon = 0.5`, and joining to a table of weather stations is an ordinary
+`JOIN` on `lat` and `lon`. It is the same layout as xarray's
+`Dataset.to_dataframe()` and the [xarray-sql](https://github.com/alxmrs/xarray-sql)
+project, which does the same job for the DataFusion query engine.
+
+The coordinate columns repeat a lot: each `lat` value appears once for every
+combination of `time` and `lon`. The extension never builds this table in
+memory. It generates the rows chunk by chunk as DuckDB asks for them (see
+[How a query runs](#how-a-query-runs)), so the cost of a query grows with the
+chunks it reads, not with the size of the product.
+
+A dimension with no coordinate array still gets a column. It holds the
+position along that axis, `0` to `N - 1`, as a `BIGINT`.
+
+### One table per set of dimensions
+
+Variables over different dimensions cannot share rows. A weather reanalysis
+such as ERA5 has surface variables over `(time, latitude, longitude)` and
+atmospheric variables over `(time, level, latitude, longitude)`, where `level`
+is a pressure level. Putting both in one table would repeat each surface value
+once per level, or fill most of the table with `NULL`.
+
+So a group's data variables are split into **tables**, one for each set of
+dimension names (and shape) they share. The test fixture `era5_like.zarr`
+reads as two tables:
+
+| Table | Dimensions | Columns |
+|---|---|---|
+| `time_latitude_longitude` | time, latitude, longitude | `10m_u_component_of_wind`, `2m_temperature`, `total_precipitation` |
+| `time_level_latitude_longitude` | time, level, latitude, longitude | `geopotential`, `temperature` |
+
+A table's name is its dimension names joined with underscores, in order.
+xarray-sql uses the same rule, so both projects give a store the same table
+names. Two tables in one group
+whose names differ only in ASCII letter case get no name (DuckDB identifiers
+ignore case); `dims :=` can still read them.
+
+Arrays that are metadata rather than data are kept out of tables: bounds
+arrays, auxiliary coordinates, and 0-dimensional constants, such as the
+physical parameters some ocean models store as arrays. (Inside AnnData
+objects, only the last rule applies, since the CF attributes have no meaning
+there.) They still appear in [`read_zarr_metadata`](#inspecting-a-store).
+
+### Groups become schemas
+
+A nested store has one set of tables per group, the way an xarray `DataTree`
+has one dataset per node. `read_zarr(store)` reads the root group, like
+`xarray.open_zarr(store)`; `group_path :=` selects another group, like
+xarray's `group=` argument. Arrays in different groups never share a table,
+even if their names and dimensions match, because sibling groups often reuse
+dimension names with different lengths: the levels of a simulation at two
+resolutions, or the members of an ensemble.
+
+A group can use the coordinates of its ancestors. If the root has an `x`
+coordinate and `simulation/fine` has `foo(x, y)` but no `x` array, the
+`simulation/fine` table takes its `x` column from the root. As in xarray, a
+group whose dimension lengths disagree with its parent's is *misaligned*, and
+its tables cannot be read as tables (single arrays in it still can, through
+`array_path :=`).
+
+When a store is mounted as a DuckDB database (see [Mounting a
+store](#mounting-a-store-as-views)), each group becomes a schema: the root is
+`main`, and a nested group is a schema named by its path, quoted because it
+contains a slash: `sim."simulation/fine".x_y`.
+
+### Arrays without dimension names
+
+Some writers record no dimension names. Plain zarr-python does not, and
+neither does AnnData. Such arrays are left out of tables. The extension does
+not guess, because a guess could be silently wrong: if every unnamed 1-D array
+of length 500 got the dimension name `dim_0`, two unrelated arrays would end
+up in one table, joined row by row, with no error.
+
+You can still read one such array by its path with `array_path :=`. Its axes
+are then named `dim_0`, `dim_1`, and so on, which is safe because only one
+array is involved. If a group has no other data, `read_zarr` fails with an
+error that names the unnamed arrays and suggests `array_path :=`.
+
+An array that names some of its axes but leaves others empty (a `null` entry
+in `dimension_names`) is treated differently: the empty entries become
+`dim_<position>` even in table reads, so two such arrays can end up sharing a
+`dim_0` axis. See [Known limits](#known-limits).
+
+Two layouts supply names that the arrays themselves lack. In OME-Zarr, an
+array takes its axis names from its group's `multiscales` attribute, so a
+microscopy image reads with `c`, `z`, `y`, `x` columns. The levels of a
+pyramid share those names but not their shapes, so each level is read on its
+own with `array_path :=`. For AnnData, the extension names each axis from the element's place
+in the AnnData object, described next.
+
+### AnnData stores
+
+An AnnData object is a group with the attribute `encoding-type: anndata`. It
+may be the root of a store written by `AnnData.write_zarr()`, a table inside a
+[SpatialData](https://spatialdata.scverse.org/) store (`tables/<name>`), or a
+modality of a MuData store (`mod/<name>`). Inside one, the extension applies
+three extra rules on top of the general model.
+
+First, it names the axes. The observation axis is `obs` and the variable axis
+is `var`, so `X`, the main matrix, has dimensions `(obs, var)`. AnnData keeps the
+annotations of each axis in a data frame, also named `obs` and `var`. Their
+columns are read as tables of the AnnData group itself, beside `X`, so the
+root of an AnnData store has the tables `obs`, `var` and `obs_var`. Each data
+frame's index (cell or gene names) becomes the coordinate of its axis, so every table can be filtered and joined by name:
+`WHERE obs = 'AAACATACAACCAC-1' AND var = 'MKI67'`.
+
+Second, it decodes AnnData's encoded columns. AnnData stores some columns as a
+group of arrays. A categorical column is integer codes plus a list of
+categories, and reads as a DuckDB `ENUM` (or as the categories' own type, when
+they are not distinct strings). A nullable column is values plus a mask, and
+reads with `NULL` where the mask is set.
+
+Third, it reads sparse matrices as their stored entries. A sparse matrix
+(`csr_matrix` or `csc_matrix`) stores only its nonzero entries. A table that
+holds only sparse matrices has one row per stored entry, not one row per
+cell: expanding a 2,700 × 32,738 matrix with 2.3 million stored values would
+produce 88 million rows. Queries that average over cells must account for the
+zeros a sparse table omits. The [AnnData guide](anndata.md) has the full
+mapping of elements to tables and examples of these queries.
+
+## The SQL interface
+
+### `read_zarr`
+
+`read_zarr(store)` reads one table. The store is a local path or a URL.
+
+```sql
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/float_baseline.zarr');
 ```
 
-Logical row count is `T × L × M`. The nD → 2D mapping is the same `ravel()`/metadata reshape that xarray-sql relies on: we never materialize the cartesian product in memory; we generate it row-major on the fly inside each chunk-sized scan.
+If the group being read has tables over more than one set of dimensions,
+`read_zarr` needs to know which one. Otherwise it fails with an error such as `group '/' has 2 tables
+[...]; use table_name= or dims= to select one, or array_path= to read one
+array`.
 
-Coordinate columns within a single chunk are highly repetitive. `duckdb-rs 1.10504.0` does not expose dictionary-vector construction (confirmed spike — see §Implementability risks), so coord columns are emitted as flat `FlatVector` values gathered from the cached coord array. Correctness is identical to the dictionary-encoding approach zarr-datafusion uses via Arrow `DictionaryArray`; the cost is more bytes per scan for high-cardinality coord columns, which in practice are rare since time/lat/lon repeat heavily within each chunk.
+| Parameter | Meaning |
+|---|---|
+| `table_name := 'time_lat_lon'` | Read the table with this name, as `read_zarr_tables` lists it. Letter case is ignored. Alias `"table"`. |
+| `dims := ['time', 'lat', 'lon']` | Read the table with these dimension names, in this order. An alternative to `table_name`; do not pass both. |
+| `group_path := 'simulation/fine'` | Read from this group instead of the root. Slashes at either end are optional. Alias `"group"`. |
+| `array_path := 'labels/nuclei/0'` | Read one array by its path in the store. Its dimensions are its own, an OME-Zarr image's axes, AnnData's axis names, or `dim_0`, `dim_1`, .... Alias `"array"`. Cannot be combined with `group_path` or `table_name`. |
+| `bounds := [['lat', '-30', '30'], ...]` | Read only coordinate ranges. See [Selecting coordinate ranges](#selecting-coordinate-ranges). |
+| `decode_times := false` | Leave CF time coordinates as their stored numbers instead of `TIMESTAMP`. The default is `true`, as in `xarray.open_zarr`. |
 
-### One table per dimension group
+The aliases `"table"`, `"group"` and `"array"` need double quotes because
+`TABLE`, `GROUP` and `ARRAY` are SQL keywords.
 
-A Zarr store often holds variables with *different* dimension sets. ERA5 is the canonical example: surface variables (`t2m`, `sp`, `tcwv`) have dims `(time, lat, lon)`, while pressure-level variables (`t`, `u`, `v`, `q`) have dims `(time, level, lat, lon)`. A single wide table can't hold both without padding NULLs across millions of rows.
+The columns of a table are its dimensions, in order, then its data variables.
+In a table read, a column is named after the variable within its group
+(`foo`), not its path in the store (`simulation/fine/foo`); with `array_path
+:=`, the path is the name. When the only data column's name would be a number
+or a path, as with an OME-Zarr resolution level `0`, it is named `value`
+instead, so you do not have to quote it:
 
-We split the store into **one table per distinct dimension set**. The ERA5 example surfaces as two tables:
+```sql
+SELECT c, AVG(value) AS mean_intensity
+FROM read_zarr('test/fixtures/bioimage/ome_zarr/synthetic_multichannel.ome.zarr',
+               array_path := '0')
+GROUP BY c;
+```
 
-- a surface table over `(time, lat, lon)` with one column per surface variable
-- an atmosphere table over `(time, level, lat, lon)` with one column per pressure-level variable
+### Querying a path directly
 
-Tables get a default name from their dimensions joined in order (`time_lat_lon`, `time_level_lat_lon`, or `scalar` for none), the same rule xarray-sql uses (decision 8); users can rename mounted views with the `view_names` argument of `read_zarr_views` (section 3). `read_zarr_tables` enumerates the tables so users can discover their names and groupings before issuing the scan.
-
-## SQL surface
-
-Four entry points, in priority order.
-
-### 1. Replacement scan (the headline UX)
+A string ending in `.zarr` in `FROM` is read with `read_zarr`:
 
 ```sql
 SELECT lat, lon, AVG(temperature)
-FROM 'gs://my-bucket/era5.zarr'
+FROM 'test/fixtures/xarray_tutorial/float_baseline.zarr'
 GROUP BY lat, lon;
 ```
 
-DuckDB's [replacement scan API](https://duckdb.org/docs/api/c/replacement_scans) claims paths via a two-step probe:
+The check ignores letter case and a trailing slash, so `s3://bucket/store.zarr/`
+works too. For a local path, the extension also checks that a `zarr.json` or
+`.zgroup` file exists at that path, so that a directory merely named `.zarr`
+falls through to DuckDB's other readers. For URLs (`http://`, `https://`,
+`s3://`, `gs://`, `az://`) the suffix alone decides, because checking would
+cost a network request. Paths without the `.zarr` suffix are never claimed;
+read them with `read_zarr(path)`. This form takes no parameters, so it only
+works when the store's root group has a single table.
 
-1. **Normalized suffix check** — strip a trailing slash, lowercase the suffix, accept `.zarr`. Handles macOS case-insensitive filesystems and the `s3://bucket/store.zarr/` form that cloud consoles love to produce. URL-decoding is DuckDB's job; we accept whatever string we're handed.
-2. **Metadata stat** — single read of `zarr.json` (v3) or `.zgroup` (v2) at the path. Only if this succeeds do we claim the path; otherwise we let DuckDB's normal replacement chain take over.
+### Inspecting a store
 
-Suffix-less Zarr groups are reachable via `read_zarr(path)` directly; auto-claim of suffix-less paths is deferred because it would force a stat on every string literal DuckDB hands us.
+Two table functions describe a store without reading any chunk data.
 
-If the store contains exactly one dimension group, the replacement scan returns that table directly. If it contains multiple, the scan errors with a message listing the available groups and tells the user to `ATTACH` or call `read_zarr` with an explicit `dims :=`.
+`read_zarr_metadata(store)` lists every array, one row each:
 
-### 2. `read_zarr` table function
+| Column | Type | Meaning |
+|---|---|---|
+| `name` | `VARCHAR` | Path of the array in the store |
+| `dims` | `VARCHAR[]` | Declared dimension names (empty if none) |
+| `dtype` | `VARCHAR` | Zarr data type |
+| `shape`, `chunk_shape` | `UBIGINT[]` | Array shape and chunk shape |
+| `attrs` | `VARCHAR` | Attributes, as JSON text |
+| `role` | `VARCHAR` | `coord`, `data`, `aux_coord`, `bounds`, `scalar` or `unsupported` |
+| `array_path_dims` | `VARCHAR[]` | The dimension names `read_zarr(store, array_path := name)` would use |
+
+An array that the underlying Zarr library cannot open, for example because of
+an unsupported data type or codec, is listed with role and dtype
+`unsupported` and the error text in `attrs`, instead of failing the call.
+
+`read_zarr_tables(store)` lists every table in every group, one row each:
+
+| Column | Type | Meaning |
+|---|---|---|
+| `group_path` | `VARCHAR` | The group, as a path (`/`, `/simulation/fine`) |
+| `schema_name` | `VARCHAR` | The schema the group mounts as (`main` for the root) |
+| `table_name` | `VARCHAR` | The table's name, or `NULL` if it cannot be read as one table |
+| `dims` | `VARCHAR[]` | Dimension names |
+| `shape` | `UBIGINT[]` | Length of each dimension |
+| `chunk_shape` | `UBIGINT[]` | The chunk grid the scan uses (see [Mixed chunk shapes](#mixed-chunk-shapes)) |
+| `data_vars`, `coord_vars` | `VARCHAR[]` | Paths of the arrays (or AnnData encoded groups) that supply its columns |
+
+The list columns can be searched with DuckDB's list functions:
 
 ```sql
-SELECT * FROM read_zarr('path/to/store.zarr');
-
--- Pick a subset of variables
-SELECT * FROM read_zarr('store.zarr', variables := ['temperature']);
-
--- Pick a table when the store has more than one: by the name read_zarr_tables
--- gives it, or by its dimensions
-SELECT * FROM read_zarr('era5.zarr', table_name := 'time_lat_lon');
-SELECT * FROM read_zarr('era5.zarr', dims := ['time', 'lat', 'lon']);
-
--- Override coordinate-to-variable mapping when conventions don't apply
-SELECT * FROM read_zarr(
-  'store.zarr',
-  coords := ['t', 'y', 'x'],
-  variables := ['u', 'v']
-);
-
--- Pick one array, including a nested OME-Zarr level
-SELECT * FROM read_zarr('image.ome.zarr', array_path := 'labels/nuclei/0');
-
--- Pick a node of a nested store (decision 8); the root is the default
-SELECT * FROM read_zarr('sim.zarr', group_path := 'simulation/fine', table_name := 'x_y');
-
+SELECT table_name
+FROM read_zarr_tables('test/fixtures/xarray_tutorial/era5_like.zarr')
+WHERE list_contains(data_vars, 'temperature');
 ```
 
-Named arguments stay close to xarray's vocabulary (`variables`, `coords`, `chunks`, `dims`). Variables that share the requested dim set become one output column each, joined on coordinate index — exactly the xarray-sql `pivot()` shape. Variables outside that dim set are silently excluded; the user picks them up by querying a different `dims` group.
+A `NULL` `table_name` means the row is listed for inspection but `read_zarr`
+cannot read it by name: its group is misaligned, it shares dimension names
+with an array of a different shape (as the levels of an OME-Zarr pyramid do),
+it contains an array that cannot be opened, it mixes CSR and CSC sparse
+matrices, or its name collides with another table's after case folding. Only
+the last case can be read with `dims :=`; for the others, read arrays one at a
+time with `array_path :=`.
 
-`array_path` adds an unambiguous selector for multiscale OME-Zarr levels and nested labels. The same selector is accepted by `read_zarr_metadata` and `read_zarr_tables`. A quoted `"array"` alias is also registered; the quotes are required because `ARRAY` is a DuckDB keyword. `table_name` selects a table by the name `read_zarr_tables` gives it, ignoring case like DuckDB identifiers; its quoted alias is `"table"`, because `TABLE` is a keyword too. It is the same as the table's `dims` list, which stays available, and a table whose name is `NULL` in the catalog (decision 8) can only be read by `dims`.
+Both functions accept `group_path :=` and `array_path :=` to narrow the
+listing. `read_zarr_groups` is the older name of `read_zarr_tables` and still
+works.
 
-### Coordinate bounds
+### Mounting a store as views
 
-`bounds := [[dim, lo, hi], ...]` selects inclusive ranges of stored numeric or
-CF-time coordinates. Endpoints are strings; `NULL` leaves that end unrestricted.
-It works with `group_path :=`, `table_name :=` and `array_path :=` selection:
+For repeated queries it is convenient to give each table a short, stable
+name. `read_zarr_views(store, database)` returns the SQL statements that
+mount a store as a DuckDB database: one `ATTACH` of an in-memory database, one
+`CREATE SCHEMA` per nested group that has a named table, and one `CREATE
+VIEW` per named table. You
+run the statements yourself. The views store no data; each one calls
+`read_zarr` when queried.
+
+```sql
+SELECT sql FROM read_zarr_views('test/fixtures/xarray_tutorial/era5_like.zarr', 'era5',
+  view_names := MAP {'time_latitude_longitude': 'surface',
+                     'time_level_latitude_longitude': 'atmosphere'});
+-- ATTACH ':memory:' AS "era5";
+-- CREATE OR REPLACE VIEW "era5"."main"."surface" AS SELECT * FROM read_zarr('...', table_name := 'time_latitude_longitude');
+-- CREATE OR REPLACE VIEW "era5"."main"."atmosphere" AS SELECT * FROM read_zarr('...', table_name := 'time_level_latitude_longitude');
+```
+
+`view_names` renames views. Its keys are table names for tables in the root
+group and `group/path/table_name` for the others. A key that names no table,
+or a rename that gives two views in one schema the same name, is an error.
+Tables with a `NULL` `table_name` get no view. The `ATTACH` fails if the
+database name is already in use; detach the old mount first or pick another
+name.
+
+From Python, run each returned row:
+
+```python
+mount = """
+SELECT sql FROM read_zarr_views('test/fixtures/xarray_tutorial/era5_like.zarr', 'era5',
+  view_names := MAP {'time_level_latitude_longitude': 'atmosphere'})
+"""
+for (sql,) in con.sql(mount).fetchall():
+    con.execute(sql)
+```
+
+In the DuckDB command-line shell, write the rows to a file and read it back:
+
+```
+.bail on
+.mode list
+.headers off
+.once mount.sql
+SELECT sql FROM read_zarr_views('test/fixtures/xarray_tutorial/era5_like.zarr', 'era5',
+  view_names := MAP {'time_level_latitude_longitude': 'atmosphere'});
+.read mount.sql
+```
+
+After mounting, `SELECT level, AVG(temperature) FROM era5.atmosphere GROUP BY
+level` works like a query on any other table. Without `view_names`, the same
+view is `era5.main.time_level_latitude_longitude`.
+
+### Selecting coordinate ranges
+
+A `WHERE` clause on a coordinate column gives the right answer, but it does
+not make the read smaller: the extension reads every chunk and DuckDB discards
+the rows that do not match (see [Filters and pruning](#filters-and-pruning)).
+To read less, pass the ranges to `read_zarr` with `bounds :=`:
 
 ```sql
 SELECT time, lat, lon, value
@@ -139,511 +474,641 @@ FROM read_zarr('test/fixtures/xarray_tutorial/bounds_grid.zarr',
              ['lat', '-30', '30']]);
 ```
 
-The dense scan skips chunks with no matching coordinates, then filters rows
-within the retained chunks. This is an explicit pruning parameter, not automatic
-pushdown of SQL `WHERE` predicates. Bounds need a stored coordinate array;
-string labels (including AnnData observation and variable names) are rejected.
-Use `WHERE` to filter labels. Plain integer coordinates and endpoints whose
-absolute values reach `2^53` are also rejected because the current range planner
-uses `f64` keys. The same limit applies to decoded timestamp microseconds and
-timestamp endpoints. Use `WHERE` for exact large-integer or timestamp comparisons. With
-`decode_times := false`, time bounds use the raw numeric offsets instead.
+Each entry is `[dimension, low, high]`. Both ends are inclusive and written as
+strings, because a SQL list cannot mix a dimension name with numbers. `NULL`
+leaves an end open. Times are written `YYYY-MM-DD`, optionally followed by
+`HH:MM`, seconds and fractional seconds. The scan skips every chunk that holds
+no coordinate in range, then drops the rows outside the range from the chunks
+it does read, so the result is exact.
 
-### 3. Mounting multi-table stores: `ATTACH` and `read_zarr_views`
+Some ranges are refused rather than answered approximately. A dimension needs
+a stored numeric or time coordinate: positional `0..N-1` columns and string
+labels (such as AnnData cell names) cannot be bounded, so filter those with
+`WHERE`. Ranges compare values as 64-bit floats, so for integer and time
+coordinates a range is rejected if an endpoint or any coordinate value has a
+magnitude of 2^53 or more, which a float cannot represent exactly. DuckDB
+counts timestamps in microseconds since 1970, so this rules out time axes that
+reach before about 1685 or after about 2255.
+
+With `decode_times := false`, time ranges use the raw stored numbers. Tables
+made only of sparse matrices are filtered row by row but not pruned by chunk.
+
+## How a query runs
+
+DuckDB runs a table function in three phases: *bind*, once per query, decides
+the output columns; *init* prepares the scan; the *scan* function is then
+called repeatedly, each call filling one batch of rows, until it returns an
+empty batch.
+
+### Bind: from a path to a schema
+
+1. **Open the store.** Pick a storage backend from the path (see
+   [Where stores can live](#where-stores-can-live)).
+2. **List the arrays.** For a local store, walk the directory tree, looking
+   for `zarr.json` (v3) or `.zarray` (v2). For a remote store, read the list
+   from consolidated metadata, since object stores cannot list directories
+   cheaply.
+3. **Build the tree of tables.** For each group, read each array's dimension
+   names from `dimension_names` (v3) or `_ARRAY_DIMENSIONS` (v2), then from
+   OME-Zarr or AnnData layouts where those apply. Set aside bounds arrays,
+   auxiliary coordinates, 0-dimensional arrays and arrays without names.
+   Identify coordinates: a 1-D array whose only dimension has its own name.
+   Group the remaining arrays by dimension names and shape, resolve each
+   dimension's coordinate from the group or its nearest ancestor, and check
+   alignment with the parent group.
+4. **Choose one table** from `table_name`, `dims`, `array_path`, or the only
+   table in the group.
+5. **Load the coordinates.** Each coordinate array is read whole into memory.
+   Coordinates are 1-D and small next to the data (ERA5's latitude, longitude
+   and time axes together fit in a few megabytes).
+6. **Decide each column's type and decoding.** Each column gets a DuckDB type
+   and a decoding rule: plain, packed integer, CF time, or AnnData categorical,
+   plus a missing-value sentinel (see [Reading values
+   correctly](#reading-values-correctly)).
+
+### Plan: work units
+
+The scan is divided into **work units**, one per cell of the table's chunk
+grid. If the table's chunks are `24 × 10 × 10` over `(time, lat, lon)`, there
+is one work unit for every block of 24 time steps, 10 latitudes and 10
+longitudes, and the work units are listed in row-major order (the last
+dimension varies fastest). With `bounds :=`, work units with no coordinate in
+range are dropped here, before any data is read.
+
+### Scan: from a chunk to rows
+
+Each call to the scan function takes the current work unit, decodes the chunk
+of each data variable the query uses, and writes rows until the batch is full
+or the chunk runs out. Then it moves to the next work unit.
+
+Writing rows from a decoded chunk is the core of the extension. A chunk of
+shape `(s₀, s₁, …, s_{D-1})` holds `s₀ × s₁ × … × s_{D-1}` cells, stored in
+row-major order. The scan walks them with a flat row counter `i` and recovers
+each cell's position along every dimension with the row-major strides:
+
+```
+stride[k] = s[k+1] × s[k+2] × … × s[D-1]     (stride[D-1] = 1)
+index[k]  = (i / stride[k]) mod s[k]         (integer division)
+```
+
+For a chunk of shape `(2, 3)`, rows 0 to 5 have positions `(0,0) (0,1) (0,2)
+(1,0) (1,1) (1,2)`. Each data column reads the cell at those positions from
+its decoded chunk. Each coordinate column looks up its coordinate array at the
+chunk's starting offset plus `index[k]`. The coordinate columns are never
+stored repeated; they are produced from the 1-D arrays as each batch is
+written. The batch size is read from DuckDB at run time rather than assumed to
+be 2,048.
+
+The chunks at the far edge of an array can be cut short by the array's end.
+The Zarr library still returns the chunk at its full size, padded with fill
+values. The scan then uses two sets of strides: those of the clipped shape,
+inside the array, to enumerate rows, and those of the full chunk shape to find
+each cell in the buffer.
+
+Data variables the query does not mention are not decoded. `SELECT time, lat,
+lon, temperature` on a table that also has `humidity` never reads a
+`humidity` chunk. Coordinates are loaded at bind regardless.
+
+### Mixed chunk shapes
+
+Variables in one table do not always share a chunk shape. In the
+`air_temperature_gradient` dataset from the xarray tutorial, `Tair` is chunked
+`(730, 13, 27)` and `dTdx` `(730, 7, 27)`, because they came from NetCDF
+variables stored differently. AnnData tables hit the same problem, since
+zarr-python picks each array's chunks from its data type: in a store of
+500,000 cells, an `int8` column might be chunked `(250000,)` and a `float64`
+column `(62500,)`.
+
+The work-unit grid is therefore the largest chunk length in each dimension
+over the table's dense arrays; `read_zarr_tables` shows it as `chunk_shape`. An
+array chunked like the grid reads one chunk per work unit. Any other array
+reads the work unit's region as a subset, which decodes each of its chunks the
+region touches. When the smaller chunks fit evenly inside the grid, as
+power-of-two chunk sizes do, each is decoded once. When they do not (7 against
+13), a chunk that straddles two work units is decoded twice.
+
+### Sparse tables
+
+A table made only of sparse matrices has a different plan: it produces one
+row per stored entry, by walking the matrix's compressed row (CSR) or column
+(CSC) structure, rather than one row per cell. When a table has several sparse
+matrices, the rows are the union of their stored positions, with `0` for a
+matrix that has nothing at a position another one stores. A sparse matrix in a
+table that also has a dense array is read densely, one row per cell, because
+the dense array needs every row anyway.
+
+### Filters and pruning
+
+Pruning means skipping chunks that cannot contribute to the result. It
+matters: in one measurement, a one-day slice of the ARCO-ERA5 store needed 3
+of its 69,033 chunks.
+
+Today the scan does not see a query's `WHERE` conditions. DuckDB applies them
+to the rows the scan returns, so results are correct, but the scan reads every
+chunk of the table. The `bounds :=` parameter is the explicit substitute.
+
+The reason is the interface the extension is built on. DuckDB's own readers,
+such as its Parquet reader, receive `WHERE` conditions through DuckDB's C++
+interface. Extensions written in Rust use DuckDB's C API instead, and the
+extension currently uses version 1.5.6 of it, which has no such hook, so that
+one binary loads in both DuckDB 1.5.6 and 2.0. DuckDB 2.0 adds a second C API,
+the v2 API, which does have one: during optimization, the scan is offered each
+`WHERE` condition and can *accept* the ones it will apply itself; DuckDB keeps
+applying the rest. Moving to it is the planned route to pushdown (see
+[Roadmap](#roadmap)). The range logic behind `bounds :=` is kept separate from
+the parameter so that pushed conditions can reuse it.
+
+Projection pushdown, telling the scan which columns a query uses, works in
+both C APIs, and the extension uses it as described above.
+
+### Threads
+
+The extension asks DuckDB for as many threads as there are work units, and
+threads take work units from a shared counter. In the current version, all
+threads also share one lock that is held while a chunk is decoded, so in
+practice chunks are decoded one at a time. See [Known limits](#known-limits).
+
+## Reading values correctly
+
+### Data types
+
+| Zarr data type | DuckDB type |
+|---|---|
+| `bool` | `BOOLEAN` |
+| `int8`, `int16`, `int32`, `int64` | `TINYINT`, `SMALLINT`, `INTEGER`, `BIGINT` |
+| `uint8`, `uint16`, `uint32`, `uint64` | `UTINYINT`, `USMALLINT`, `UINTEGER`, `UBIGINT` |
+| `float32`, `float64` | `FLOAT`, `DOUBLE` |
+| `string` (v3), or `\|O` with the `vlen-utf8` filter (v2) | `VARCHAR` |
+| any integer type with CF packing attributes | `DOUBLE` |
+| any numeric type with CF time attributes | `TIMESTAMP` |
+| AnnData categorical of distinct strings | `ENUM` |
+
+Other types are not supported yet, including NumPy `datetime64`, fixed-width
+byte and Unicode strings, complex numbers and structured types. If the Zarr
+library can open the array, `read_zarr` fails at bind with `unsupported
+dtype`; if it cannot, the array is listed as `unsupported` (see [Inspecting a
+store](#inspecting-a-store)).
+
+Arrays can be little- or big-endian on disk; the Zarr library converts them
+to the machine's byte order when it decodes a chunk. The codecs available are
+those of the [zarrs](https://zarrs.dev/) library this extension builds on:
+gzip, zstd, Blosc (on all platforms except Windows with the GNU toolchain),
+CRC32C checksums, sharding and transpose.
+
+### Missing values
+
+A cell becomes SQL `NULL` when its stored value equals the variable's
+missing-value sentinel. The sentinel is chosen once per variable:
+
+1. The `_FillValue` attribute, if present and readable as the array's type. If it is `NaN` and a
+   `missing_value` attribute also exists, `missing_value` is used instead,
+   because xarray writes `_FillValue = NaN` for data whose real sentinel it
+   has already replaced in memory.
+2. Otherwise the `missing_value` attribute.
+3. Otherwise the array's Zarr `fill_value`, unless all its bytes are zero (so
+   `0` and `0.0` are not sentinels). Boolean and string fill values are never
+   used.
+
+A `NaN` sentinel matches any `NaN`, since `NaN` never equals itself. Without a
+`NaN` sentinel, a `NaN` in a float column stays `NaN`, not `NULL`. String
+columns are never masked, and AnnData's encoded columns use their own masks
+instead.
+
+xarray writes a floating-point `_FillValue` in Zarr v3 as a base64 string of
+the value's 8 little-endian bytes (`NaN` is `"AAAAAAAA+H8="`). The extension
+decodes these.
+
+Rule 3 means that, in an array without CF attributes, a real value equal to a
+nonzero `fill_value` also reads as `NULL`. See [Known limits](#known-limits).
+
+### Packed integers
+
+A variable is packed when its stored type is an integer and it has a
+`scale_factor` or `add_offset` attribute (a missing one defaults to 1 or 0).
+Its column is `DOUBLE`, and each cell is computed as `stored × scale_factor +
+add_offset`. The comparison against the missing-value sentinel happens before
+scaling, as CF requires: the sentinel is a stored integer, and scaling it
+first would change it.
+
+The integer requirement matters. Some float arrays carry a `scale_factor`
+attribute as leftover metadata, and scaling values that are already real
+numbers would corrupt them.
+
+### CF time
+
+A coordinate or variable whose `units` attribute reads `"<unit> since
+<reference date>"` is a CF time axis. The extension converts it to
+`TIMESTAMP`, so time conditions read naturally:
 
 ```sql
-ATTACH 'era5.zarr' AS era5 (TYPE ZARR);
-
-SELECT * FROM era5.surface          -- (time, lat, lon)
-WHERE time >= '2024-01-01';
-
-SELECT level, AVG(t)
-FROM era5.atmosphere                -- (time, level, lat, lon)
-GROUP BY level;
+SELECT date_trunc('month', time) AS month, AVG(air) AS mean_air
+FROM 'test/fixtures/xarray_tutorial/air_temperature.zarr'
+WHERE time >= TIMESTAMP '2014-01-01'
+GROUP BY month ORDER BY month;
 ```
 
-Not implemented, and not possible through the C API at DuckDB 1.5.5 (decision 8, Mounting). `read_zarr_views` returns the statements that build the same layout, and the client runs them: one schema per Zarr group, the root as `main`, and one view per table, named from its dimensions joined in order (`time_lat_lon`) unless `view_names :=` renames it. This is the recommended UX for ERA5-class stores where you'll be issuing many queries and want stable table names.
-
-```sql
-SELECT sql FROM read_zarr_views('era5.zarr', 'era5',
-  view_names := MAP {'time_lat_lon': 'surface', 'time_level_lat_lon': 'atmosphere'});
--- ATTACH ':memory:' AS "era5";
--- CREATE OR REPLACE VIEW "era5"."main"."surface" AS SELECT * FROM read_zarr('era5.zarr', table_name := 'time_lat_lon');
--- CREATE OR REPLACE VIEW "era5"."main"."atmosphere" AS SELECT * FROM read_zarr('era5.zarr', table_name := 'time_level_lat_lon');
-```
-
-`view_names` is xarray-sql's `table_names`, keyed by table name instead of dimension tuple. A table outside the root is keyed by its group path and name (`'simulation/fine/x_y'`). A key that names no table, or a rename that gives two views of one schema the same name, is an error. In Python, run each row: `for (sql,) in con.sql("SELECT sql FROM read_zarr_views(...)").fetchall(): con.execute(sql)`. In the DuckDB CLI, write the rows to a file and read it back:
-
-```
-.bail on
-.mode list
-.headers off
-.once mount.sql
-SELECT sql FROM read_zarr_views('era5.zarr', 'era5');
-.read mount.sql
-```
-
-### 4. `read_zarr_metadata` and `read_zarr_tables`
-
-Two introspection table functions, each with a homogeneous schema (split because mixing array rows and group rows in one table forces NULLs across most columns of the group rows):
-
-```sql
-SELECT * FROM read_zarr_metadata('store.zarr');
--- name | dims | dtype | shape | chunk_shape | attrs | role | array_path_dims
-
-SELECT * FROM read_zarr_tables('store.zarr');
--- group_path | schema_name | table_name | dims | shape | chunk_shape | data_vars | coord_vars
-```
-
-Both are read-no-chunks. `read_zarr_metadata` enumerates arrays for inspection and tooling; `read_zarr_tables` lists the tables of every group, with the schema and table name each maps to (decision 8). It is what the multi-group error message points users at, and the input to the mounting recipe in decision 8. Both accept `group_path :=` to look at one node. `read_zarr_groups` is the 0.1.x name of `read_zarr_tables` and stays registered.
-
-Names and shapes are lists (`dims VARCHAR[]`, `shape UBIGINT[]`, `chunk_shape UBIGINT[]`, `data_vars VARCHAR[]`, `coord_vars VARCHAR[]`, `array_path_dims VARCHAR[]`), so SQL can filter and unnest them (`WHERE list_contains(data_vars, 'temperature')`). `attrs` stays JSON text, because attributes are arbitrary JSON.
-
-## Vocabulary
-
-The code, the docs and the error messages use these terms. Older sections of this document say *dimension group* for what is now called a table.
-
-| Term | Meaning | In DuckDB | In code |
-|---|---|---|---|
-| store | A Zarr hierarchy | A database, mounted with the statements `read_zarr_views` returns (decision 8) | `ZarrStore` |
-| node | A Zarr group, as a node of an `xarray.DataTree` | A schema; the root is `main` | a group path (`""` is the root) |
-| variable | Values over named dimensions, stored as one array | A data column | `Variable` |
-| storage | How a variable's values are stored: one array, one that zarrs cannot open, or (AnnData, decision 9) a group of arrays: categorical, nullable, sparse | | `Storage` |
-| scan plan | How a table's rows are produced: one per cell, or one per stored entry for a table of sparse matrices only | | `ScanPlan` |
-| table | The variables of one node that share dimension names and shape | A table (a view) | `Table` |
-| coordinate | The values of a dimension, from an array in the node or an ancestor | A dimension column | `Table::coords` |
-| encoding | How stored values decode: CF packing, CF time | The column's type | `ColumnEncoding` |
-| selection | What a call reads: one node (`group_path :=`), one array (`array_path :=`), or the default | | `Selection` |
-| work unit | One cell of a table's plan grid, the largest chunk in each dimension (decision 6) | One morsel of a parallel scan | `WorkUnit` |
-
-## Architecture
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                        DuckDB query engine                       │
-│   replacement scan ─▶ TableFunction(bind/init/scan)              │
-└────────────────────────┬─────────────────────────────────────────┘
-                         │
-              ┌──────────▼──────────┐
-              │  duckdb-zarr crate  │  this repository
-              │  ─────────────────  │
-              │  extension entry    │
-              │  read_zarr          │
-              │  read_zarr_metadata │
-              │  read_zarr_tables   │
-              │  read_zarr_views    │
-              │  DuckDB store I/O    │
-              │  replacement scan   │
-              └──────────┬──────────┘
-                         │  no DuckDB types cross this seam
-              ┌──────────▼──────────┐
-              │   zarr-core crate   │  engine-independent; zarrs
-              │  open / metadata /  │
-              │  decode / storage   │
-              └─────────────────────┘
-```
-
-The root crate follows DuckDB extension conventions: one module per SQL entry point and a thin extension entrypoint, with `duckdb` pinned to `=1.20000.0` in Cargo.toml. The adapter uses the frozen v1.5.6 C API (`C_STRUCT` metadata and `zarr_init_c_api`), which also loads on DuckDB 2.0. `TARGET_DUCKDB_VERSION` selects the engine used by tests and CI; `DUCKDB_CAPI_VERSION` selects the ABI version advertised by the binary.
-
-Engine-independent reading lives in `crates/zarr-core`: array metadata, DataTree
-and AnnData layouts, sparse matrices, decoded values, CF-time handling, and
-coordinate pruning. Its public types contain no DuckDB or Arrow types. The root
-`src/zarr_reader` modules are adapters: they open stores through DuckDB's file
-system, map core types to DuckDB types (including ENUMs), and write decoded values
-into DuckDB vectors. Both crates are workspace members, so `cargo test --workspace`
-and the workspace Clippy target cover the shared core as well as the adapter.
-
-### Bind phase
-
-1. Open the store with `zarrs` and read group metadata.
-2. Classify arrays as coordinates vs data variables. **Honor xarray's metadata first**, but read it from the right place — Zarr v2 puts `_ARRAY_DIMENSIONS` in `.zattrs` (per-array attrs), while Zarr v3 makes `dimension_names` a first-class field in the array's `zarr.json` metadata, *not* in attrs. The bind code must branch on format version: `zarrs` exposes the v3 field via `ArrayMetadataV3::dimension_names`. Falling through to attrs for v3 stores would silently miss the metadata on every array and degrade to the heuristic. During table enumeration, arrays still lacking dimension names after applying OME and AnnData axis inference are excluded from tables and recorded in `NodeTables::unnamed` by `StoreTree::tables`. Their presence does not fail enumeration or prevent reading other tables. If `read_zarr` selects a group with no other data variables, it fails with an error naming those arrays and suggesting `array_path=`. Selecting one unnamed array with `array_path=` synthesizes `dim_0..dim_{ndim-1}` (decision 7), unless OME axes or the AnnData layout supply axis names; AnnData elements use the names from decision 9 in both table and `array_path=` reads.
-3. Read the `coordinates` attribute on each data variable. xarray uses this to mark *non-dimension* coordinates — typically a 2D `lat(y, x) / lon(y, x)` mesh on satellite swath data, where the coord variable is itself nD. v1 cannot represent these as scalar columns; if encountered, error at bind ("non-dimension coordinate `lat` has shape (1024, 1024); 2D coords are deferred"). **This step must run before step 5 (dim-group enumeration).** An nD array identified here as a non-dimension coord must be excluded from the data-variable pool before grouping. If step 3 runs after grouping, a 2D coord like `xc(y, x)` is indistinguishable from a data variable over `(y, x)` and silently lands in a spurious dim group. The `rasm` fixture demonstrates this: `Tair` carries `coordinates='yc xc'`; without pre-grouping exclusion, `xc` and `yc` form a spurious `(y, x)` group with two float64 columns, no error, and wrong output.
-4. Suppress CF metadata variables that aren't real data:
-   - **Bounds variables** (CF §7.1) — a coord with attrs like `time.attrs['bounds'] == 'time_bnds'` declares `time_bnds` as its cell-boundary descriptor. `time_bnds` then has shape `(N, 2)` and an extra `nbnds` dimension. Without filtering, `time_bnds` becomes a spurious dim group with one meaningless table — the `ersstv5` tutorial dataset triggers this exact case. Identification: parent coord has a `bounds` attribute pointing at the variable name. Fallback when the attr is missing: variable name matches `<dim>_bnds` / `<dim>_bounds` *and* shape is `(N, 2)`. Suppressed bounds are exposed in `read_zarr_metadata.attrs` on the parent coord, not as a top-level array.
-   - **Scalar (0-dim) coordinates** — ROMS-style stores attach physical constants as Zarr arrays with `shape = []` (e.g. `hc = critical depth`, `Vtransform = 2`). Including them as columns would repeat the same constant on every row; they're metadata, not data. Surface in `read_zarr_metadata.attrs` and exclude from the row schema. The schema-inference code must guard the strides computation against `shape = []` so bind doesn't panic.
-5. Group data variables by their dimension set. Each distinct dim set becomes a candidate output table. Variables in a dim group may be chunked differently: if `Tair` is chunked `[730, 13, 27]` and `dTdx` `[730, 7, 27]` (the `air_temperature_gradient` case: packed `int16` vs native `float32` produces different on-disk chunks), the group's plan grid is the largest chunk length in each dimension, `[730, 13, 27]`, and `dTdx` is read as an array subset per work unit (decision 6).
-6. Materialize coordinate arrays eagerly (they are 1D and small — ERA5 lat/lon/time fits in a few MB) so we have them for both schema metadata and later filter pruning. Coordinates are cached at the **store** level, keyed by array name. An `ATTACH` that mounts multiple views shares one cache, so `time` is loaded exactly once even if it appears in three groups. **Unindexed dimensions** — dimensions that appear in a data variable's dim list but have no backing coordinate array (the `tiny` tutorial dataset has `dim_0(5)` with no `dim_0` array) — are handled by synthesizing a `0..N` integer range as the cached coord. The synthesis is one `arange` call at bind; the scan kernel doesn't need to know whether a coord came from disk or `arange`.
-7. The `read_zarr` call resolves to exactly one dim group (via `dims :=`, the variables list, or — if unambiguous — the only group present); `ATTACH` materializes all of them as views, each with its own `BindData` but a shared coord cache.
-8. Build a DuckDB schema for the chosen group:
-   - one column per coordinate in that group, typed from its Zarr dtype (or `INTEGER` for synthesized RangeIndex coords).
-   - one column per selected data variable, typed from its Zarr dtype — *unless* the variable carries `scale_factor` / `add_offset` attrs, in which case the output type is `DOUBLE` (or `FLOAT` if both attrs are `f4`) per §Type mapping > Packed integer decoding.
-9. Stash a `BindData` containing: store handle, chosen dim group, common chunk shape, projected columns *with per-column encoding tag* (plain / packed / range), the active CF sentinel per data variable (per §Type mapping > NULL masking precedence), captured DuckDB `FileSystem` handle (see §Storage backends), and a reference to the store-level coord cache.
-
-### Init phase (chunk plan)
-
-Compute the cartesian product of *chunk indices* across the dim group's plan grid (the largest chunk length per dimension, decision 6). Each chunk-index tuple becomes a parallel scan unit. If the group's chunk shape is `[t=24, lat=10, lon=10]`, init enumerates `⌈T/24⌉ × ⌈L/10⌉ × ⌈M/10⌉` units.
-
-Filter pushdown (see below) prunes this list before it ever runs.
-
-### Scan phase (per chunk)
-
-For each work unit:
-
-1. Decode each selected data variable's chunk from `zarrs` into an `ndarray::ArrayD`. Sparse stores have **implicit chunks** — chunk keys with no backing storage object simply don't exist; `zarrs` returns a "chunk not found" error variant for these. We catch it and synthesize a fill-value chunk using the **zarr-level `fill_value`** from `zarr.json` (distinct from the CF-level `_FillValue` attr — see §Type mapping > NULL masking precedence). Cells matching the CF-level sentinel still flow through the masking step in (3) and become SQL `NULL`. Treating missing chunks as errors would break sparse satellite-swath data and is wrong by Zarr spec.
-2. Compute the row-major iteration order over the chunk's logical extent.
-3. Fill DuckDB's output `DataChunk`. The exact transform per data column depends on the variable's encoding tag (set at bind time):
-   - **Plain numeric/string variable** — copy `data_arrays[v][row_start..row_end]` into the output flat vector. While copying, mask cells whose raw value equals the active CF sentinel (`_FillValue` or `missing_value`, per §Type mapping > NULL masking precedence) by clearing the validity bit.
-   - **Packed integer variable** (carries `scale_factor`/`add_offset` attrs) — three steps per cell, in this order, per CF §8.1: (a) compare raw integer to the active sentinel; if match, clear validity bit and skip; (b) compute `decoded = raw * scale_factor + add_offset` as `f64`; (c) cast to the bind-time output type (`DOUBLE`/`FLOAT`) and write. Mask-before-decode is mandatory: applying `scale * sentinel + offset` first would shift the sentinel and the equality check would miss.
-   - **Coordinate column** — gather from the cached coord arrays into a flat `FlatVector`. For unindexed dimensions (no backing coord array — see §Bind phase), `coord_values[k]` is a synthesized `0..s_k` integer range computed at bind, and the gather step treats it identically to a real coord. Dictionary-vector construction is not available in this crate version (see §Implementability risks).
-4. Yield up to `STANDARD_VECTOR_SIZE` (2048) rows at a time; resume on the next call.
-
-The local scan state holds the current chunk's decoded buffers and a cursor; the global init state holds the immutable work-unit list. This matches DuckDB's morsel-driven model and gives us free intra-query parallelism.
-
-## The pivot algorithm
-
-The "pivot" is the heart of this extension: the operation that turns a decoded N-dimensional Zarr chunk into a stream of 2-D rows DuckDB can scan. xarray-sql's [`iter_record_batches`](https://github.com/alxmrs/xarray-sql/blob/3adf6af86e26cfdda771dfa7df0b70c8dd636e3a/xarray_sql/df.py#L231) (entered through [`read_xarray_table`](https://github.com/alxmrs/xarray-sql/blob/3adf6af86e26cfdda771dfa7df0b70c8dd636e3a/xarray_sql/reader.py#L188)) is the reference implementation; this section translates that algorithm into our Rust + DuckDB context so the v0.1 scan callback is a port, not a fresh design.
-
-### Inputs per work unit
-
-For one work unit (one chunk-index tuple within one dim group):
-
-- **`shape`** — the chunk's logical shape `(s₀, s₁, …, s_{D-1})` in the dim group's canonical order. ERA5 surface chunk: `shape = (24, 10, 10)` over `(time, lat, lon)`.
-- **`coord_values[k]`** — the 1-D slice of the k-th dimension's coordinate array covering this chunk (length `s_k`). Read once at bind into the store-level cache, then sliced per chunk by index. For unindexed dims (a dim that appears in a data variable's dim list but has no backing coord array), `coord_values[k]` is synthesized at bind as `arange(0, s_k)` — see §Bind phase. The kernel doesn't care which form a coord came from.
-- **`data_arrays[v]`** — the decoded chunk for each selected data variable, one `ndarray::ArrayD<T_v>` per variable, total size `prod(shape)`. After `zarrs` decode the buffer is C-contiguous, so a flat `ArrayView1<T_v>` is a zero-copy view.
-
-The chunk holds `total_rows = prod(shape)` logical rows. For an ERA5 surface chunk that's `24 × 10 × 10 = 2,400`.
-
-### The strided-index trick
-
-Walking the chunk in row-major order maps each flat row index `i ∈ [0, total_rows)` to a multi-index via:
-
-```
-strides[k] = product of shape[k+1..D]      // C-order strides
-i_k = (i / strides[k]) % shape[k]          // dim-k position for row i
-```
-
-This is the only piece of arithmetic that has to be exactly right. Row 0 picks coord index 0 in every dim; row 1 advances the innermost dim; row `s_{D-1}` resets the innermost and advances the next-outermost; and so on. It mirrors how `ndarray::ArrayD` lays out its memory after `zarrs` decode — which is why the data-variable side is a slice and the coordinate side is a gather.
-
-### Per-vector loop (inner)
-
-DuckDB scan callbacks fill one `DataChunk` per call. The per-call row budget is queried at runtime via `duckdb_vector_size()` (the C API) or the equivalent duckdb-rs output-vector size — **not** hardcoded as 2048. The default is 2048, but DuckDB can be compiled with a different `STANDARD_VECTOR_SIZE`, and an extension that hardcodes the constant will silently overflow the DataChunk buffer if the value is ever larger. (xarray-sql's default `batch_size` is 65,536 — DataFusion tolerates much larger batches than DuckDB's vectorised executor wants. Same algorithm, smaller increment.)
-
-For each `DataChunk` covering rows `[row_start, row_end)`:
-
-1. Build a row-index range `i = row_start..row_end`.
-2. For each output column in schema order:
-   - **Coordinate column k** — compute `coord_idx[i] = (i / strides[k]) % shape[k]`, then gather `coord_values[k][coord_idx[i]]` into the output flat `FlatVector`. Dictionary-vector construction is not available (see §Implementability risks).
-   - **Data-variable column v** — copy the slice `data_arrays[v][row_start..row_end]` into the output flat vector. Zero-copy where DuckDB's vector layout permits, `memcpy` otherwise. For *packed* and *NULL-masked* encodings the copy becomes a transform — see §Scan phase > step 3 for the exact pipeline.
-3. Apply `_FillValue` masking: any cell whose raw value equals the array's `_FillValue` becomes SQL `NULL` via the DataChunk validity bitmap.
-
-The data-variable copy is where the bytes move; coord gathers are negligible since coords are 1-D and tiny.
-
-### Per-chunk loop (outer)
-
-A single chunk yields `⌈total_rows / STANDARD_VECTOR_SIZE⌉` calls to the scan callback. The local scan state holds:
-
-- the work-unit's chunk-index tuple
-- the decoded `data_arrays[v]` for each selected variable (lifetime: one work unit)
-- a cursor `next_row_start` that survives across scan calls
-
-When `next_row_start == total_rows`, the local state advances to the next work unit from the global init list; the previous chunk's `data_arrays` are dropped.
-
-### What the algorithm does NOT compute
-
-Three things that look like they should be in the inner loop but aren't:
-
-- **The cartesian product of coordinate values.** xarray-sql never materialises an N-dimensional grid of coord tuples; the strided-index trick reconstructs each row's coord values on demand from the 1-D coord arrays. We don't build any intermediate "long-format" table either.
-- **Coord broadcast over the chunk shape.** xarray-sql's simpler `dataset_to_record_batch` uses `np.broadcast_to(coord.reshape(reshape), shape).ravel()` — broadcast is zero-copy, the `ravel()` forces a copy. The streaming `iter_record_batches` skips even that by computing `coord_idx` per batch. We use the streaming form because DuckDB scans incrementally; the all-at-once form has no advantage when the consumer pulls 2,048 rows at a time.
-- **Re-decoding chunks.** Each Zarr chunk is decoded exactly once per work unit. The `data_arrays` stay live in the local scan state until the chunk is fully drained; the inner per-vector loop only slices.
-
-### Invariants bind enforces, scan assumes
-
-The pivot is correct only if the chunk is internally consistent. Bind enforces, before any work unit runs:
-
-- All selected data variables in the dim group share the same `shape`. Their chunk shapes may differ (decision 6).
-- The dim group's canonical dim order matches the data variable's `dimension_names` from xarray's metadata. xarray-sql derives it from `first_var.dims`; our bind picks the same source so coord broadcast and data ravel use the same axis ordering.
-- Coordinate arrays are 1-D and length-matched to their dim's chunk size — pulled from the store-level cache, not re-read per chunk.
-
-If any of these drift, the algorithm silently produces wrong rows. They're checked once at bind, not repeatedly at scan, because chunks within a Zarr group don't change shape mid-query.
-
-### Filter pushdown plugs in here
-
-xarray-sql's `_block_metadata` computes per-partition `(min, max)` for each dim from the actual coord array slice — using `np.min/max`, not first/last, so descending lat (ERA5: 90 → -90) gives the right bounds. We do the same in the chunk planner: for each candidate work unit, `(min, max)` per dim is computed once from the cached coord array (cheap, since coords are tiny) and any work unit whose `(min, max)` doesn't intersect the predicate is dropped. Pruning happens between init and the first scan call, so the scan callback only ever sees work units it must execute.
-
-## Type mapping
-
-The base dtype mapping is mechanical:
-
-| Zarr dtype                         | DuckDB type                              | Notes                                       |
-| ---------------------------------- | ---------------------------------------- | ------------------------------------------- |
-| `i1/i2/i4/i8`                      | `TINYINT`..`BIGINT`                      |                                             |
-| `u1/u2/u4/u8`                      | `UTINYINT`..`UBIGINT`                    |                                             |
-| `f4/f8`                            | `FLOAT`/`DOUBLE`                         | NaN preserved                               |
-| `bool`                             | `BOOLEAN`                                |                                             |
-| `M8[ns]` / `M8[us]`                | `TIMESTAMP_NS` / `TIMESTAMP`             | native NumPy datetimes; mapped directly     |
-| CF-encoded time (`f4/f8/i4/i8`)    | `TIMESTAMP`                              | decoded on real-world calendars; raw dtype otherwise |
-| `S<n>` (fixed bytes)               | `BLOB`                                   | not yet implemented; error at bind          |
-| `U<n>` (UTF-32)                    | `VARCHAR`                                | not yet implemented; error at bind          |
-| `string` (v3) / `\|O`+vlen-utf8 (v2) | `VARCHAR`                              | variable-length; see below                  |
-| structured / other object          | unsupported                              | error at bind                               |
-
-CF-encoded time appears in real stores as `int32`, `int64`, `float32`, or `float64` depending on the source NetCDF — RASM uses `f8` + `noleap`, `air_temperature` uses `f4` + `gregorian`, ERA5-style stores use `i8`. We decode it to `TIMESTAMP` at scan time; see §CF time decoding and decision 3. The `units` and `calendar` attrs ride along into `read_zarr_metadata.attrs` either way, so a column left raw still says what it is.
-
-### CF time decoding (CF §4.4)
-
-A coordinate whose `units` attr reads `"<step> since <reference>"` is a time axis stored as plain numbers: ARCO-ERA5's `time` is `int64` + `"hours since 1900-01-01 00:00:00"`. Surfacing the integer is physically faithful and semantically useless — `WHERE time >= '2024-01-01'`, `date_trunc('month', time)` and a join against a calendar table all need a real timestamp, and a user who has to write `TIMESTAMP '1900-01-01' + INTERVAL (time) HOUR` by hand has to first go read the array's attrs to know that's the right expression. So bind resolves the encoding and the column comes out as `TIMESTAMP` (microseconds since the Unix epoch, DuckDB's physical layout).
-
-Decoding is gated on the `calendar` attr, which is where the AGPL problem from decision 3 dissolves:
-
-- **`proleptic_gregorian`, and `standard`/`gregorian` with a reference date on or after the 1582-10-15 reform** (absent `calendar` means `standard`, per CF §4.4.1) — decoded. These are ordinary civil-date arithmetic: `chrono::NaiveDate` for calendar validation and day arithmetic, plus a rational step size for the UDUNITS unit, in `crates/zarr-core/src/cftime.rs`. `chrono` is already in the dependency tree transitively via `duckdb → arrow → arrow-arith`, so taking it directly costs nothing new.
-- **Everything else** — `noleap`/`365_day`, `all_leap`/`366_day`, `360_day`, `julian`, and pre-reform `standard` references — left as the raw on-disk dtype. These calendars have years that do not exist on a wall clock; there is no correct `TIMESTAMP` to emit, and emitting a plausible-looking wrong one is worse than emitting the number.
-
-The reform gate is enforced *per value*, not just on the reference: a `standard` axis can perfectly well have a post-reform reference and negative offsets that reach back past 1582-10-15, and those instants are Julian in the file's own terms. They decode to `NULL` rather than to a date ~10 days off; `decode_times := false` recovers the raw offsets for anyone who actually has such data.
-
-Mechanics worth pinning down:
-
-- **Step sizes** are the UDUNITS time names (`weeks`…`nanoseconds`, with the usual abbreviations) held as an exact rational number of microseconds, so `"nanoseconds since ..."` does not round-trip through a float. `years` and `months` are deliberately *not* decoded — they have no fixed length, and xarray refuses them too. Bare `m` is not accepted either: in UDUNITS it means metres.
-- **Reference parsing** accepts the shapes real stores use: `1900-01-01`, `1800-01-01 00:00:00`, `1970-01-01T00:00:00Z`, `0001-1-1 0:0:0`, and a trailing UTC offset, which is *subtracted* to reach UTC. The offset's sign is optional, because UDUNITS' own canonical output omits it — `"hours since 1800-01-01 00:00:0.0 0:00"` is how NOAA/NCEP-derived stores spell a zero offset, and rejecting it would silently leave the whole axis raw.
-- **Precision.** Float offsets are split into whole and fractional parts before scaling, because `days since 1800-01-01` reaches ~7.0e15 µs — past the point where an f64 multiply still resolves single microseconds. Integer offsets never touch floating point at all.
-- **Masking and range.** The `_FillValue`/`missing_value` sentinel is compared against the *raw* value first, as in packed-int decoding. NaN, and any offset that decodes outside DuckDB's timestamp range, become SQL `NULL` — `i64::MIN`/`i64::MAX` are DuckDB's ±infinity sentinels and must never be collided with.
-- **Escape hatch.** `read_zarr(store, decode_times := false)` turns the whole thing off and restores the raw offsets, mirroring `xarray.open_zarr(decode_times=False)`.
-
-### Variable-length strings (`string` / vlen-utf8)
-
-Unlike other supported dtypes, `ZarrDtype::String` has no fixed `byte_size()` — each element is its own UTF-8 byte run, not a fixed-width slot in a flat buffer. This is the on-disk encoding [anndata](https://github.com/scverse/anndata) (and [zarr-python](https://github.com/zarr-developers/zarr-python) generally) use for `obs`/`var` text columns such as `gene_symbol` ([see here for more background from the context of `duckdb-zarr`](https://github.com/xqlsystems/duckdb-zarr/issues/40)), as either the Zarr v3 `string` dtype or the Zarr v2 `dtype: "|O"` + `filters: [{"id": "vlen-utf8"}]` pair — `zarrs` normalizes both to the same `string` data type at open time, so the reader doesn't need to special-case v2.
-
-Because the rest of the reader is built around `ColumnEncoding`/byte-offset math (`retrieve_chunk::<ArrayBytes<'static>>().into_fixed()`, indexed by `dtype.byte_size()`), string columns take a parallel path everywhere a byte buffer would otherwise be read or decoded:
-
-- Decoding uses `retrieve_chunk::<Vec<String>>` / `retrieve_array_subset::<Vec<String>>` (zarrs' `ElementOwned` API) instead of `ArrayBytes::into_fixed()`, yielding one `String` per element directly.
-- `ColumnValues` (a trait with `FixedValues` and `StringValues` implementations, shared as `Arc<dyn ColumnValues>`) replaces the bare `Vec<u8>` used for a coordinate array's pre-loaded values and a data variable's per-chunk decode buffer. Each implementation writes its own elements into a DuckDB vector, so both paths carry either representation without branching on the dtype.
-- zarrs pads a boundary chunk's *element count* to the full nominal `chunk_shape` for every dtype uniformly (fill-value elements past the array's logical bound), so the existing `zarrs_flat` physical-offset math indexes correctly into a `Vec<String>` with no changes. [string_dtype.test](../test/sql/string_dtype.test) (`string_var_v3_2d`) and [ragged_chunks.test](../test/sql/ragged_chunks.test) cover ragged boundary chunks for 1-D and 2-D string and float arrays.
-- No NULL masking applies: `FillSentinel` only represents numeric sentinels (`Float`/`Int`/`UInt`, see [meta.rs](../crates/zarr-core/src/meta.rs)), so a `_FillValue`/`missing_value` attr on a string variable doesn't parse into a sentinel and every decoded string (including zarrs' own empty-string fill-value substitution) is written through as-is.
-
-`ColumnEncoding::PackedInt` never applies to strings (its trigger condition requires an integer on-disk dtype), and CF-time detection explicitly skips them (a string array carrying a `units` attr is not a time axis), so neither decoding ever intersects string decoding.
-
-### Packed integer decoding (CF §8.1)
-
-A data variable whose **on-disk dtype is an integer type** (i8/u8/i16/u16/i32/u32/i64/u64) *and* that carries `scale_factor` and/or `add_offset` attrs is *packed*: the on-disk integer is a quantization of a real-valued measurement. **The integer dtype is required.** A float array that incidentally carries `scale_factor` as legacy metadata (measurement precision, grid resolution) must NOT be decoded — applying `scale * value + offset` to already-decoded floats would corrupt them by a factor of ~100×. The trigger condition is `integer_dtype AND (has scale_factor OR has add_offset)`, not the presence of attrs alone.
-
-Real example from the `air_temperature_gradient` xarray tutorial dataset:
-
-```
-Tair: dtype=int16, attrs={scale_factor: 0.01, add_offset: 0.0}
-```
-
-Reading the raw `int16` and exposing it as DuckDB `SMALLINT` would produce `27315` where the user expects `273.15` — a silent correctness bug across roughly a third of real-world atmospheric data. We must decode at scan time:
-
-1. Read the raw integer chunk via `zarrs`.
-2. Mask sentinel cells (`_FillValue`, `missing_value`, or zarr `fill_value`) **on the raw integer values** — CF §8.1 mandates this order, because applying `scale * sentinel + offset` would shift the sentinel and the equality check would miss.
-3. For non-NULL cells, apply `value * scale_factor + add_offset` and emit the decoded value.
-4. Output column type is `DOUBLE` (or `FLOAT` if both `scale_factor` and `add_offset` are `f4`) — never the on-disk integer type. Bind overrides the type mapping for any variable carrying these attrs.
-
-### NULL masking precedence
-
-`_FillValue` and `missing_value` are both used as masking sentinels in real Zarr stores; CF §2.5.1 documents both. They coexist and have separate semantics — the `basin_mask` tutorial dataset has `missing_value = -100` with no `_FillValue`, so checking only `_FillValue` would silently leak the sentinel into query results. Bind resolves the active sentinel for each variable in this order:
-
-1. `_FillValue` from attrs, if present.
-2. Otherwise `missing_value` from attrs, if present.
-3. Otherwise no CF-level NULL masking.
-
-This is **separate** from the array-level `fill_value` in `zarr.json`, which controls what an *implicit* (missing) chunk decodes to (see Scan phase). Conflating the two corrupts both behaviors: `fill_value` is for chunks that don't exist on disk; `_FillValue` / `missing_value` is for sentinel cells within decoded chunks.
-
-**Base64-encoded sentinel values (xarray convention).** When xarray writes a Zarr v3 store it encodes the `_FillValue` array attribute as a **base64 byte string** regardless of the actual value — including non-NaN floats. Specifically: xarray base64-encodes the 8 raw IEEE 754 float64 bytes of the sentinel in little-endian order. Example: `_FillValue = NaN` → `"AAAAAAAA+H8="`, `_FillValue = -9.97e36` → `"AAAAAAAAnsc="`. By contrast, `missing_value` (also a CF attr) is written as a plain JSON number, and zarr.json's own `fill_value` field uses zarr-spec string literals (`"NaN"`, `"Infinity"`) — neither is base64.
-
-The Rust reader must therefore handle `_FillValue` specially: if the JSON value is a string, base64-decode it as 8 bytes (little-endian float64) and cast to the array's on-disk dtype for comparison. If the decoded sentinel is NaN, the equality test `value == sentinel` always returns false (IEEE 754 NaN ≠ NaN); use `value.is_nan()` instead. `missing_value` is read as a plain numeric JSON value and compared normally. Integer sentinels are never NaN, so the base64 path only arises for float arrays.
-
-### Endianness
-
-Zarr dtypes carry an explicit byte-order marker (`<f4` little-endian, `>f4` big-endian, `=f4` native). `zarrs` decodes both orientations into native-byte-order `ndarray` buffers, so the copy into DuckDB's `DataChunk` is a `memcpy` with no swap. Round-trip correctness is verified against a big-endian fixture — most modern hardware is little-endian, so the bug would otherwise only surface on legacy machines.
-
-## Storage backends
-
-DuckDB already speaks S3, GCS, Azure, and HTTP through its `httpfs` extension and the secrets manager. Rather than implement our own object-store layer, the storage adapter is a thin shim that:
-
-- detects the URI scheme,
-- for `file://` and bare paths, uses `zarrs`'s local store directly,
-- for remote schemes, delegates per-key reads to a DuckDB-backed `ReadableStorageTraits` impl that calls into DuckDB's `FileSystem` API.
-
-`zarrs` is built around an abstract `ReadableStorageTraits` trait, so swapping in a DuckDB-backed store is a few hundred lines, not a fork.
-
-**Capturing the FileSystem handle.** DuckDB's `FileSystem` is owned by the `ClientContext` of the active connection, not by any global. We capture a handle to it during the bind callback (the `ClientContext` is one of the bind arguments DuckDB hands us), wrap it in an `Arc`, and stash it inside `BindData` next to the coord cache. The init and scan callbacks pull the handle out of `BindData` and clone the `Arc` into each thread's local state. The Rust storage adapter then forwards each `get(key)` and `get_partial(key, range)` call to the captured `FileSystem` over FFI — credentials, retries, and filesystem-level caching all stay inside DuckDB and don't get re-implemented here. The exact `duckdb-rs` symbols for grabbing the `FileSystem` from the `ClientContext` are confirmed during v0.4 implementation; the spike (§Implementability risks) did not cover this path since remote storage is a v0.4 concern.
-
-## Predicate & projection pushdown
-
-DuckDB's `TableFunction` exposes `pushdown_filters` and `pushdown_projection`. We exploit both:
-
-- **Projection pushdown** — only the data variables referenced by the query (or computed-on after pushdown of `SELECT` columns) are decoded. This is the same easy win zarr-datafusion already takes.
-- **Coordinate-range filter pushdown** — for any conjunctive filter on a coordinate column (`time >= '2024-01-01' AND lat BETWEEN 30 AND 60`), we use the cached 1D coord arrays to translate the filter into an index range per dimension, then compute which chunk-index tuples intersect that range. Non-intersecting chunks are dropped from the work-unit list before init returns.
-- **Statistics** — we expose per-coordinate min/max as table statistics so DuckDB's optimizer can also reason about ordering and joins.
-
-Filters on data variables cannot be pushed (Zarr is dense, no chunk-level statistics by default); they fall back to DuckDB's normal filter execution after the scan.
-
-**Correctness rigor — required test cases.** Filter pushdown is easy to get wrong on the boundary, and the failure mode is silently-wrong results. The implementation must pass:
-
-- **Decreasing coordinate arrays** — ERA5 latitude runs 90.0 → -90.0; the index translation can't assume monotonic-increasing.
-- **Non-uniform spacing** — gaussian grids and pressure levels are not evenly spaced; chunk index can't be `coord_value / chunk_size`. The translation goes through the cached coord array (binary-searchable since coords are sorted-by-spec), not arithmetic.
-- **Exact chunk-boundary predicates** — `time = '2024-01-15T00:00:00'` where the value sits exactly on a chunk seam must include the owning chunk once, not zero or two.
-- **Empty-result predicates** — `lat > 100` returns zero rows without panic and without scheduling any chunk reads.
-- **Inclusive vs exclusive bounds** — `BETWEEN`, `<`, `<=`, `>`, `>=` each must intersect the chunk grid correctly.
-
-## Concurrency & memory
-
-- One decoded chunk per active scan thread. With ERA5-style 24×10×10 chunks at `f4` that's a few hundred KB resident per thread.
-- Decode is CPU-heavy; we let DuckDB schedule across cores.
-- Coordinate arrays are loaded once in bind and shared (Arc) across threads.
-- An optional small LRU of decoded chunks helps when many queries hit the same data. Configuration is exposed as a DuckDB extension config variable (`SET zarr_chunk_cache_mb = 256`) rather than a custom `PRAGMA` — `SET` is the documented mechanism for loadable extensions to register tunables and is the API actually exposed by `duckdb-rs`.
-
-## Phased plan
-
-0. **Spike (v0.0, complete)** — verified what `duckdb-rs` exposes for replacement-scan registration, storage-extension `ATTACH` hooks, dictionary-vector construction, extension-config-variable registration, and predicate/projection pushdown. Findings recorded in §Implementability risks.
-1. **MVP (v0.1)** — local-filesystem only, Zarr v3, `read_zarr` + `read_zarr_metadata` + `read_zarr_groups`, single dim group only, no pushdown beyond projection. Includes packed-integer decoding (`scale_factor` / `add_offset`) and full NULL masking precedence (`_FillValue` → `missing_value` → none) — both are correctness, not optimizations. Goal: end-to-end demo against the xarray tutorial datasets in `test/fixtures/xarray_tutorial/`.
-2. **v0.2** — Zarr v2 + Blosc/LZ4 codecs (free with `zarrs`), replacement scan (via `libduckdb-sys` FFI), projection pushdown, type mapping for native datetime/string dtypes.
-3. **v0.3** — Multi-group stores via `ATTACH ... (TYPE ZARR)`; coordinate-range filter pushdown; parallel scan; statistics; **coarsest-grid chunk planning** (relaxes decision 6's uniform-chunk requirement now that the scan engine is being reworked anyway). Goal: beat naive `xarray + pandas` (with dask, on the same thread budget) on a real ERA5 query. Benchmark must capture chunks-decoded vs total chunks, not just wall-clock.
-4. **v0.4** — Remote stores via DuckDB filesystem FFI, secrets integration, community-extension submission.
-5. **Later** — CF time on the artificial calendars (`noleap`, `360_day`, `julian` — deferred until a permissively-licensed implementation path exists; the real-world calendars decode today, see §CF time decoding), chunk-level statistics (when present), aggregate pushdown, write support, 2D non-dimension coordinates, async `zarrs` if remote latency demands it.
-
-## Open questions and decisions
-
-Each subsection keeps the original tradeoff visible so future readers can see what was on the table, then records the call we made and why.
-
-### 1. Convention vs. config
-
-zarr-datafusion infers the coord/data split from dimensionality alone; xarray reads `_ARRAY_DIMENSIONS` (v2) or `dimension_names` (v3). We can either commit to one or layer them.
-
-> **Decision:** Honor xarray's metadata first; fall back to the "1D = coord, nD = data" heuristic only when the metadata is missing.
->
-> **Rationale:** xarray is the de facto producer of stores in this ecosystem, and its metadata already encodes the right answer — using it gets us correct dim names and ordering for free. The dimensionality heuristic exists for ad-hoc Zarr stores written by tools that don't follow the xarray convention.
-
-### 2. Multi-variable layout
-
-When a store contains many data variables, do we expose them as one wide table, one table per variable, or something in between?
-
-> **Decision:** One wide table **per dimension group** — i.e. per distinct set of dimensions across the data variables. ERA5 → two tables: surface (`time, lat, lon`) and atmosphere (`time, level, lat, lon`).
->
-> **Rationale:** A single wide table only works when all variables share dims. Real scientific stores routinely mix surface (3D) and atmospheric (4D) fields, and forcing them together would mean pad-NULL-or-bust. One-table-per-variable goes the opposite direction and wastes the natural locality. Grouping by dim set keeps schemas tight, row counts honest, and queries readable. `ATTACH` with one view per group is what makes this UX tolerable for stores with several groups.
-
-### 3. CF-time decoding
-
-CF-encoded time (e.g. `int64` + `units = "hours since 1970-01-01"` + `calendar = "noleap"`) needs explicit conversion. We can decode at scan time (transparent but opinionated), expose a UDF (explicit but a tiny extra hop), or defer the whole thing.
-
-> **Decision (superseded):** Defer. CF-encoded time columns are exposed raw as `BIGINT`; users handle the conversion app-side.
->
-> **Rationale:** The originally-proposed `cftime-rs` is AGPL-3.0 (incompatible with community-extension binary distribution) and unmaintained since October 2023, so the easy path was closed, and implementing *all* of CF's calendars in-tree would have gated every other v0.2 deliverable on its testing burden.
->
-> **Decision (current):** Decode at scan time, on the real-world calendars only. `proleptic_gregorian` and post-reform `standard`/`gregorian` columns come out as `TIMESTAMP`; `noleap`, `360_day`, `julian` and friends stay raw. `decode_times := false` opts out. See §CF time decoding.
->
-> **Rationale:** The deferral conflated two problems. The hard one is the *artificial* calendars, which genuinely need cftime semantics — and those are still deferred. The easy one is the calendars that match a wall clock, which is where essentially all widely-queried data lives (ERA5, GPCP, the NCEP reanalyses), and which needs no *new* dependency: `chrono` — already pulled in transitively by `duckdb`'s own Arrow dependency — supplies the civil-date arithmetic directly. Splitting the two turns the AGPL blocker from a wall into a scope boundary. And the win is not marginal: without it every time predicate in every query has to be hand-written against the array's `units` attr, which is exactly the friction this extension exists to remove.
-
-### 4. Replacement scan ambiguity
-
-`.zarr` is a directory, not a file. DuckDB's replacement scan fires on any string literal in `FROM`, so we need to claim only the strings that actually point at a Zarr store without stat'ing every random path.
-
-> **Decision:** Two-step probe — (a) **normalized** suffix check (case-insensitive `.zarr`, trailing slash stripped to handle `s3://bucket/store.zarr/` cloud-console paths), then (b) a single stat for `zarr.json` (v3) or `.zgroup` (v2) at the path. Only if both pass do we claim the path; otherwise fall through to DuckDB's normal scan chain. Suffix-less Zarr groups are reachable via `read_zarr(path)` directly; auto-claim of suffix-less paths is deferred to avoid stat'ing every string literal.
->
-> **Rationale:** A single stat call against a known filename is essentially free, and the suffix gate keeps us from probing every Parquet path the user types. The `FROM 'foo.zarr'` UX is the headline pitch of this extension; spending one stat per query to make it seamless is the right trade. The normalization is enumerated explicitly because the original wording missed the trailing-slash and case-insensitive cases.
-
-### 5. `zarrs` async story
-
-`zarrs` has an async API behind a feature flag; the DuckDB scan callback is sync.
-
-> **Decision:** Sync. One chunk decoded per scan call; intra-query parallelism comes from DuckDB's morsel scheduler dispatching across threads.
->
-> **Rationale:** DuckDB's table-function callbacks are sync; bridging async would force a `tokio` runtime per scan or `block_on`, both of which add complexity for unclear gain. zarr-datafusion ships sync today, and it's still well ahead of any non-DataFusion alternative. We can revisit if remote-store I/O latency starts dominating wall-clock time on real workloads.
-
-### 6. Mismatched chunk shapes within a dim group
-
-Within a dim group, two data variables might be chunked differently — e.g. `temperature[24,10,10]` and `humidity[1,20,20]`, both over `(time, lat, lon)`. The init phase enumerates a single cartesian product of chunk indices and so cannot align both grids without finer-grained iteration. Three options: (a) require uniform chunk shape per dim group, error at bind on mismatch; (b) plan against the coarsest chunk grid and re-read finer-chunked variables multiple times per work unit; (c) iterate at the row level rather than the chunk level.
-
-> **Decision (v1):** (a) — require uniform chunk shape across all selected variables in a dim group, and fail at bind on a mismatch.
->
-> **Empirical correction:** the original framing said this would "rarely be observed in practice." That was wrong. The `air_temperature_gradient` xarray tutorial dataset (NCEP reanalysis — same provenance as ERA5) has `Tair` chunked `[730, 13, 27]` while `dTdx`/`dTdy` share dims but are chunked `[730, 7, 27]`, because xarray preserves source-NetCDF chunking per variable and packed-vs-native storage routinely produces different chunks. AnnData stores hit it too: zarr-python picks each array's chunks from its dtype size, so in a 500,000-cell store an `int8` column of `obs` is chunked `(250000,)` and a `float64` column `(62500,)`, and the `obs` table could not be read at all.
->
-> **Decision (v0.3, with decision 8):** (b), with the re-reads done by zarrs. The plan grid is the largest chunk length in each dimension over the group's arrays (`StoreTree::tables` in `tree.rs`), and `read_zarr_tables.chunk_shape` shows it. An array chunked like the plan grid reads one chunk per work unit, as before. Any other array reads the work unit's region with `retrieve_array_subset`, which decodes each of its chunks that the region touches; its values are then indexed by row position in the clipped region instead of through the padded chunk strides (`UnitValues::padded` in `read_zarr.rs`). The pivot kernel is otherwise unchanged.
->
-> **Cost:** an array with smaller chunks that nest in the plan grid (zarr-python's power-of-two chunks always do) decodes each chunk once. When chunk boundaries do not nest (13 against 7), a chunk that straddles two work units is decoded by both. An array with larger chunks than another in some dimension and smaller in another makes the plan cell larger than either, so a work unit holds more rows. Both were judged better than an error that blocks the read.
-
-### 7. Arrays that declare no dimension names
-
-AnnData and plain zarr-python write neither `dimension_names` nor `_ARRAY_DIMENSIONS` ([issue #40](https://github.com/xqlsystems/duckdb-zarr/issues/40)), so `dimension_names()` rejected every array in such a store at bind, including a single-array `array_path=` read.
-
-> **Decision:** When `array_path=` selects one array that declares no dimension names (and has no OME `multiscales.axes`), name its dimensions `dim_0..dim_{ndim-1}` (`synthesize_dim_names` in `meta.rs`). Whole-store enumeration (`read_zarr(store)`, the replacement scan, `read_zarr_tables` without `array_path=`) does not do this. Since decision 8 it leaves such arrays out of every table, and a group with no other data fails with an error that names them and suggests `array_path=`.
->
-> **Why only for `array_path=`:** a placeholder name carries no meaning. If enumeration gave placeholder names to every unnamed array, two unrelated arrays of the same length would both get `dim_0`, land in the same dim group, and be joined row by row. That returns wrong data with no error. With `array_path=` the user picks exactly one array, so nothing can be misaligned. For the same reason, a synthesized name never binds a coordinate array, even if a sibling array is called `dim_0`.
->
-> **Superseded in part by decision 9**, which names AnnData's axes for `array_path=` reads too, so `obs/n_genes` now binds `obs` rather than `dim_0`. The arrays inside an encoded group keep `dim_N`.
-
-Two changes to `read_zarr_metadata` support this:
-
-- The `array_path_dims` column holds the names that `read_zarr(store, array_path := name)` binds, from the same function (`array_path_dims`) that the bind uses. The `dims` column is unchanged and still shows only declared names, so `[]` for an unnamed array. A separate column keeps each column's meaning the same in every call.
-- An array that zarrs cannot open because of its data type, codecs, storage transformers or an unknown extension field is listed with `role = 'unsupported'`, `dtype = 'unsupported'` and the error text in `attrs`, and the call continues (`is_unsupported_array_error`). Other open errors (I/O, auth, missing metadata, an invalid fill value) still fail the call, because hiding them would make a broken store look partly empty.
-
-### 8. Nested stores: one DuckDB schema per group, tables named like xarray-sql
-
-A Zarr store can nest groups, as an `xarray.DataTree` written with `DataTree.to_zarr()` does. Each group is a node with its own dimensions: `simulation/coarse` and `simulation/fine` can both have `foo(x, y)` with different lengths of `x`. Before this decision the reader listed arrays from every nested group into one pool and grouped them by dimension names alone (`infer_dim_groups`). That fails with a shape mismatch in the example above and silently merges the two nodes when the lengths agree. xarray-sql plans DataTree support too ([xarray-sql #82](https://github.com/xqlsystems/xarray-sql/issues/82)), and the two projects should give the same store the same tables.
-
-> **Decision:**
->
-> - **Scope dimensions per node.** A dimension group is identified by `(node path, dims)`, not `dims` alone. Arrays in different groups never share a table.
-> - **Read the root node by default.** `read_zarr(store)` reads the root group only, like `xarray.open_zarr(store)`. A new `group_path :=` parameter selects another node, with the same meaning as xarray's `group=`: `read_zarr(store, group_path := 'simulation/fine', dims := ['x', 'y'])`. `"group" :=` is an alias; the quotes are required because `GROUP` is a DuckDB keyword, the same reason `array_path` has the quoted alias `"array"`. This is a breaking change for anyone who reads a nested store today without `array_path=`.
-> - **Inherit coordinates like xarray.** A node's tables include coordinate arrays from its ancestors for dimensions the node shares with them, as `DataTree` does. As in xarray, a child whose shared dimension has a different length from its parent's is an error.
-> - **Name tables like xarray-sql.** The default name of a dimension group is `"_".join(dims)` in dimension order, or `scalar` for none (`xarray_sql.df.default_table_name`). Mounted views can be renamed through `read_zarr_views(view_names := MAP {...})`, keyed by table path rather than dimension tuple. Two groups in one node whose names are equal after case folding get no name (`table_name` is `NULL`), because DuckDB identifiers ignore case. xarray-sql raises an error here (`xarray_sql.df.resolve_table_names`); listing the rest keeps the catalog usable, and `dims :=` still reads both groups.
-> - **Map a store to a database with one schema per node.** Store → database, node path → schema, dimension group → table. The root node is schema `main`, and a nested path is one quoted schema name: `sim."simulation/fine".x_y`. This mirrors a DataFusion `CatalogProvider` (catalog → schema → table), which is the shape xarray-sql #82 favors.
-> - **Publish the mapping through `read_zarr_tables`; let users mount it.** `read_zarr_tables` (named `read_zarr_groups` in 0.1.x) gains `group_path`, `schema_name` and `table_name` columns, so each row states the node, the schema, the dimensions and the name. That is the whole contract with xarray-sql. The extension does not create the schemas and views itself (see Mounting below). `read_zarr_views(store, 'sim')` returns the statements that do: `ATTACH ':memory:' AS sim`, then one `CREATE SCHEMA` per node and one `CREATE VIEW ... AS SELECT * FROM read_zarr(store, group_path := ..., table_name := ...)` per named row.
->
-> **Why not keep flattening:** flattening only works when no two nodes reuse a dimension name, and DataTree stores reuse them by design (multiscale levels, ensembles, AnnData's `obs` and `var` against `X`). Scoping per node is the xarray data model; matching it is what lets xarray-sql and this extension agree.
-
-**Implementation notes** (`crates/zarr-core/src/tree.rs`):
-
-- `group_path` is the node path as `DataTree` writes it (`/`, `/simulation/fine`); `group_path :=` accepts it with or without slashes. `schema_name` is `main` for the root and the path without the leading slash otherwise, so a one-level group needs no quoting (`sim.simulation.…`). A top-level Zarr group named `main` would collide with the root's schema; mount it under another name.
-- `table_name` is `NULL` when `read_zarr(store, group_path := g, dims := d)` would fail for that row: the node is not aligned with its ancestors, or the node has arrays with the same dims but different shapes (multiscale levels). Such rows are still listed, one per shape, and stay readable with `array_path=`. It is also `NULL` for groups whose names collide after case folding, which `read_zarr` can still read with `dims :=`.
-- A `group_path=` that names no group is an error in `read_zarr`, `read_zarr_tables` and `read_zarr_metadata`, not an empty result.
-- Alignment follows xarray's check: a node's dimension lengths must match its parent's arrays, and an inherited coordinate must match the length of the dimension it labels. Only arrays with dimension names count. `array_path=` reads skip the check.
-- Arrays with no dimension names are left out of a node's tables; `read_zarr_metadata` still lists them. An array zarrs cannot open (unsupported data type or codec) is placed in its table from its raw metadata document (`raw_array_layout`). Reading that table fails and names the array, and its `table_name` is `NULL`, so a column never goes missing without notice; the node's other tables still read.
-- `read_zarr_tables` emits its rows in pages of one DuckDB vector, since a store can have more tables than one vector holds.
-- The CF rules that keep auxiliary coordinates and bounds variables out of tables (`cf_auxiliary_vars` in `meta.rs`) are the same ones that give them their `role` in `read_zarr_metadata`.
-- Columns of a group read are named after the variable within its node (`foo`), as in xarray, not after its store path.
-
-The mounting statements come from `read_zarr_views` (section 3 of the SQL surface), one per row: `ATTACH`, `CREATE SCHEMA IF NOT EXISTS` and `CREATE OR REPLACE VIEW`. Run them in order and stop on the first error. The initial `ATTACH` rejects an existing database alias so its views are not replaced. To remount, explicitly detach the previous in-memory mount first or choose a new alias. It is a table function rather than a procedure for the reason below. Rows of `read_zarr_tables` with a `NULL` `table_name` get no view.
-
-**Mounting: why there is no `zarr_attach`.** A procedure such as `CALL zarr_attach('sim.zarr', 'sim')` that creates the schemas and views was spiked on 2026-09-29 (branch `spike-zarr-attach`) and rejected. The C API at DuckDB 1.5.5 has no storage-extension hook and no way to run SQL on the calling connection, so the procedure needs a second connection. The extension can get a database handle only while it loads: `get_database` returns a wrapper that DuckDB frees when loading ends (`extension_load.cpp`). So the connection must be opened at load and kept. The DDL itself worked: views mounted, a quoted `"demo/nested"` schema worked, and it ran inside `BEGIN ... COMMIT` and was visible to other connections. But the kept connection holds a strong reference to the database instance, and the function catalog that holds the connection belongs to that instance, so the instance is never freed. After `close()`, the database file stays locked against other processes, and reopening it in the same process hangs. This affects everyone who loads the extension, not only users of the procedure. A control build without the side connection released the file normally. Revisit if the C API gains storage extensions, a way to run SQL on a client context, or a callback when a database closes.
-
-**AnnData under this model.** An AnnData store maps onto the tree: `obs` and `var` are nodes, `X`, `layers` and `obsm` share their axes. The two AnnData-specific pieces, naming the axes and decoding group-encoded variables, are decision 9.
-
-### 9. AnnData stores: a DataTree with named axes, the obs and var frames at the root, and decoded encodings
-
-Decision 8 reads any nested store as a tree of tables, but an AnnData store needs more before its tables mean anything. AnnData writes no dimension names, so every array was left out of every table. AnnData stores several kinds of variable as a group of arrays (its [on-disk format](https://anndata.readthedocs.io/en/stable/fileformat-prose.html)): a categorical is `codes` plus `categories`, a nullable column is `values` plus `mask`, and a sparse matrix is `data`, `indices` and `indptr`. Read as plain arrays, these give codes instead of labels, `''` instead of NULL, and three unaligned arrays instead of a matrix. And the groups on disk are not the shape users think in: `obs` as a node of its own gives a table `obs.obs` whose rows are joined to `X` through an `_index` column. The issue #40 thread showed that users can decode all of it in SQL, but the queries are long, and two easy mistakes return wrong data with no error: reading a nullable column's `values` without its `mask` gives `''` for NULL, and an `ASOF JOIN` to `indptr` picks arbitrarily between the tied offsets of empty rows.
-
-> **Decision:** In every AnnData object, apply an AnnData layer on top of decision 8 (`crates/zarr-core/src/anndata.rs`). An AnnData object is a group with `encoding-type: anndata`: the root of a store that `AnnData.write_zarr()` wrote, or a group inside another store, such as a SpatialData table at `tables/<name>` or a MuData modality at `mod/<name>`. Element paths below are relative to that group, and its own node takes the place of the root: `tables/cells/obs` reads as `"tables/cells".obs`. Groups outside every AnnData object read as plain Zarr. One schema per group, tables named by dims, inherited coordinates and the catalog in `read_zarr_tables` all stay. A store whose root is an AnnData object costs one metadata read more; any other store reads each group's attributes once to find AnnData objects, which consolidated metadata serves from memory.
->
-> - **Name the axes by element.** An element that declares no dimension names gets them from its place in the object:
->
->   | Element | Dimensions | Table |
->   |---|---|---|
->   | `X` | `obs`, `var` | `main.obs_var` |
->   | `obs/*` | `obs` | `main.obs` |
->   | `var/*` | `var` | `main.var` |
->   | `layers/*` | `obs`, `var` | `layers.obs_var` |
->   | `obsm/<k>` | `obs`, `<k>_component` | `obsm.obs_<k>_component` |
->   | `varm/<k>` | `var`, `<k>_component` | `varm.var_<k>_component` |
->   | `obsm/<df>/*`, `varm/<df>/*` | `obs` or `var` | `"obsm/<df>".obs`, ... |
->   | `obsp/*` | `obs_i`, `obs_j` | `obsp.obs_i_obs_j` |
->   | `varp/*` | `var_i`, `var_j` | `varp.var_i_var_j` |
->   | `raw/X` | `obs`, `raw_var` | `raw.obs_raw_var` |
->   | `raw/var/*` | `raw_var` | `raw.raw_var` |
->
->   An `obsm` entry with more than two dimensions gets `<k>_component_1`, `<k>_component_2`, and so on. Names apply only where every group between the AnnData object and the element is a container (`dict`, `dataframe`, `raw`). The arrays inside an encoded variable, awkward arrays and `uns` get none. `uns` is skipped entirely during enumeration: it has no axes and often holds arrays zarrs cannot open. `array_path=` binds the same names, which replaces the `dim_N` names decision 7 gave these arrays.
-> - **Read `obs` and `var` as tables of the AnnData object's node** (the root, in an AnnData store). Their columns are variables of that node, beside `X`, and `raw/var`'s are variables of `raw`, beside `raw/X` (`logical_node`). The other groups (`layers`, `obsm`, `obsp`, `raw`, ...) stay nodes. `read_zarr(store, group_path := 'obs')` fails with a pointer to `table_name := 'obs'`, and so do `read_zarr_tables` and `read_zarr_metadata`; `read_zarr_metadata(group_path := '/')` lists the arrays of the root's variables, including the obs and var columns and the arrays inside encoded groups (`Layout::node_of_array`). A column that is folded into its parent node is never a dimension coordinate, even when it has its axis's name; such a column (`obs/obs`) is named by its store path, because its basename would collide with the dimension column.
-> - **Make each data frame's index the coordinate of its axis.** The column its `_index` attribute names (usually `_index`) is not a data column. It is the coordinate of `obs` (or `var`, `raw_var`) in the frame's node, so the `obs` column holds cell names in every table that has the dimension, through decision 8's inheritance. `obs_i` and `obs_j` take the `obs` coordinate, and `var_i` and `var_j` the `var` coordinate (`COORDINATE_ALIASES`).
-> - **List a data frame's columns in its `column-order`**, as `adata.obs` does; other variables stay in path order.
-> - **Read each encoded group as one variable.** `categorical` reads as an `ENUM` of its categories when they are distinct strings, and as the categories' own type otherwise (an `ENUM` holds strings only). A negative code is NULL. `nullable-integer`, `nullable-boolean` and `nullable-string-array` read as `values` with NULL where `mask` is true. The Zarr fill value is not a NULL sentinel for these: the encoding says what is missing.
-> - **A table's rows are the cells its variables store.** A dense array stores every cell, a sparse matrix (`csr_matrix`, `csc_matrix`) only its entries. A table of sparse matrices alone therefore has one row per stored entry, the union over its matrices, with 0 for a matrix that has nothing at a row another matrix stores (the true value of that cell). A sparse matrix in a table with a dense array of the same dims and shape is read densely, one row per cell, because the dense array needs every row anyway.
->
-> **Why `obs` and `var` in the object's node:** they annotate the two axes of `X`. As nodes of their own they gave the tables `obs.obs` and `var.var`, and a root with no `obs` coordinate for `X` to inherit. At the root they are what an xarray `Dataset` of an AnnData object would hold: `X(obs, var)`, `cell_type(obs)`, `gene_symbol(var)`.
->
-> **Why names, not positions, in the dimension columns:** with the index as the coordinate, every table can be filtered and joined by cell or gene name (`WHERE obs = 'AAACATACAACCAC-1' AND var = 'MKI67'`) with no lookup join. The cost is that joins compare strings, and a store with duplicate names makes a join return extra rows. anndata warns about duplicate names and `obs_names_make_unique()` is a standard step, so the guide documents the risk instead of falling back to positions, which would make a column's type depend on the data. `array_path=` reads still give positions. anndata's own `read_lazy` names an `obs` frame's dimension after its `_index` attribute, which is usually `_index` for `var` too; that works for one frame at a time, not for a tree where `X` shares an axis with each.
->
-> **Why `<k>_component` and `obs_i`/`obs_j`:** the second axis of an `obsm` entry is its components (of a UMAP, a PCA) and has a different length in each entry, so each entry needs its own dimension name. Long tables keep every value scalar; DuckDB array columns were considered and rejected. A pairwise matrix's axes are both cells, and the row and column of a matrix are `i` and `j`.
->
-> **Why stored entries for sparse tables:** densifying `X` turns 2.3 million stored values of a 2,700 by 32,738 matrix into 88 million rows, and real atlases are a thousand times larger. A long table of entries is how single-cell users already treat `X` in SQL. The cost is that aggregates must account for the zeros a sparse table omits: start from the `obs` table with a `LEFT JOIN` and average `COALESCE(X, 0)`, or divide a sum by the number of cells. The user guide says so, and the test checks that query.
->
-> **Why the union, not one table per matrix:** table names come from dims (decision 8), so two `layers` with the same dims must share a table. The union rule is the same rule as for dense arrays, which store every cell, so mixing the two follows from it.
-
-> **Why any group, not only the root:** SpatialData stores keep their tables as AnnData objects at `tables/<name>`, beside images and labels that are OME-Zarr and points and shapes that are Parquet. Reading those tables needs nothing SpatialData-specific: the objects follow the AnnData format, and the rest of the store is either plain Zarr or not Zarr at all. DuckDB's `read_parquet` already reads the points and shapes, so the extension stays a Zarr reader, and users join the elements on the keys the table's attributes name (`region`, `instance_key`).
-
-Not done: `awkward-array`, `dataframe` columns in `uns`, and the global `obs` and `var` of a MuData store (`encoding-type: MuData`), which lie outside its AnnData modalities and so have no axis names. A CSR matrix with duplicate indices reads as the sum of its entries, as scipy does. `array_path=` selects an encoded group as one decoded variable, with integer positions for its dimensions as for one array (`anndata::variable_table`); `group_path=` naming one is an error that points there (`check_group_path`). Sparse matrices on their own share a table only if all have the same major axis; a table that mixes CSR and CSC has a `NULL` `table_name`. Beside a dense array, the decoded major ranges of a matrix are shared by work units only when its major axis is the outer axis of the work-unit order, so memory stays at a few ranges.
-
-## Why this is worth building
-
-Every team running a Pangeo-style pipeline already has DuckDB installed for the tabular side of their workload. Today they shuttle data through Parquet exports or notebook glue to bridge the two worlds. A native extension collapses that bridge: ad-hoc SQL on a Zarr store with no copy, no external service, and the same DuckDB session that already holds their joins, dashboards, and BI tooling.
-
-It's also the smallest piece of the xarray-sql / zarr-datafusion family, because DuckDB does the optimizer, scheduler, and SQL frontend for us. Our job is just the scan.
+Without the conversion, ERA5's `time` would read as a count of hours since
+1900, and every query would need to look up that attribute to write
+`TIMESTAMP '1900-01-01' + INTERVAL (time) HOUR`.
+
+Only calendars that match the real-world calendar are converted:
+`proleptic_gregorian`, and `standard` or `gregorian` (the default when no
+calendar is given) from 15 October 1582, when the Gregorian calendar began.
+Dates before then in a `standard` axis follow the older Julian calendar in the
+file's own terms. If the reference date is that early, the axis keeps its
+stored numbers; if only some values are, those values read as `NULL` rather
+than as dates about ten days off.
+
+Model calendars such as `noleap`, `all_leap`, `360_day` and `julian` have
+dates that a real calendar lacks, such as 30 February, so those axes keep
+their stored numbers. Their `units` and `calendar` attributes are visible
+in `read_zarr_metadata`.
+
+Some details of the conversion:
+
+- Units can be `weeks`, `days`, `hours`, `minutes`, `seconds`,
+  `milliseconds`, `microseconds` or `nanoseconds`, with the usual
+  abbreviations. `months` and `years` are refused, as xarray refuses them,
+  because they have no fixed length. Bare `m` means metres in the UDUNITS
+  library that defines these names, so it is refused too.
+- Reference dates can be written `1900-01-01`, `1800-01-01 00:00:00`,
+  `1970-01-01T00:00:00Z` or `0001-1-1 0:0:0`, with an optional time-zone
+  offset. The offset's sign is optional, because UDUNITS writes a zero offset
+  as `0:00`.
+- Integer offsets are converted with integer arithmetic, and floating-point
+  offsets are split into whole and fractional parts before scaling. The
+  fractional part matters at scale: `days since 1800-01-01` reaches about
+  7 × 10^15 microseconds, beyond the range where a single float multiply is
+  exact to the microsecond.
+- A missing-value sentinel is checked against the stored number before
+  conversion. `NaN`, and values that would fall outside DuckDB's timestamp
+  range, become `NULL`.
+- `decode_times := false` turns the conversion off for the whole query.
+
+When an integer variable has both packing attributes and time units, it is
+decoded as packed; no store in practice packs its time axis. A float variable
+with both is decoded as time, and its `scale_factor` is ignored.
+
+### Strings
+
+Variable-length UTF-8 strings, as AnnData and zarr-python write for text
+columns such as gene symbols, read as `VARCHAR`. zarrs reads both the v3
+`string` type and the v2 `vlen-utf8` encoding.
+
+## Where stores can live
+
+| Path | How it is read |
+|---|---|
+| Local path | Directly from the file system |
+| `http://`, `https://` | With the zarrs HTTP client |
+| `s3://`, `gs://`, `az://` | Through DuckDB's own file system, so credentials come from DuckDB's [secrets manager](https://duckdb.org/docs/stable/configuration/secrets_manager) (`CREATE SECRET ... TYPE S3`) |
+
+Routing cloud storage through DuckDB means the extension inherits DuckDB's
+credentials, retries and configuration instead of reimplementing them. The
+DuckDB file system is obtained from the query's client context during bind.
+
+A remote store needs consolidated metadata to be listed. Most published
+datasets have it; xarray writes it with `to_zarr(..., consolidated=True)`. The
+extension reads it once per query and answers every later metadata lookup from
+memory, so opening a store with a hundred arrays costs a few requests rather
+than hundreds. Without consolidated metadata, a remote store can still
+be read one array at a time with `array_path :=`. This is the usual case for
+public OME-Zarr images.
+
+The extension also builds for WebAssembly and loads in
+[DuckDB-Wasm](https://duckdb.org/docs/stable/clients/wasm/overview), which runs
+DuckDB in a web browser. There, every path, HTTP included, goes through
+DuckDB's file system, and the Zarr library's internal thread pool runs on a
+single thread. Local paths do not work in the browser, because listing a
+local store walks the host's file system.
+
+## Design decisions
+
+The decisions are numbered so that code comments and tests can refer to them.
+
+### 1. Follow declared dimension names, never guess them
+
+Dimension names come only from metadata: xarray's attribute or field,
+OME-Zarr's axes, or AnnData's layout. The alternative was to infer roles from
+shape, so that 1-D arrays are coordinates and the rest are data, as the
+zarr-datafusion project does. Declared names were chosen because xarray writes
+most of the stores in this ecosystem and its metadata already gives the right
+dimension names and order. Shape-based inference was dropped altogether
+because of the failure described in decision 7.
+
+### 2. One table per set of dimensions
+
+The alternatives were one wide table for the whole store, which only works
+when every variable has the same dimensions, and one table per variable,
+which makes users join variables they usually want side by side. Grouping by
+dimensions gives tables with no padding `NULL`s and keeps related variables in
+one row. It matches how xarray-sql splits and names tables, so a store gets
+the same tables in both projects.
+
+### 3. Decode CF time, but only on real-world calendars
+
+Converting time to `TIMESTAMP` is opinionated, and the obvious library for it,
+the Rust port of cftime, is AGPL-licensed, which rules it out for an extension
+distributed as a binary. What made it possible was splitting the problem. The
+calendars that match a wall clock need only ordinary date arithmetic, which
+the `chrono` library (already a dependency of DuckDB's Rust crate) provides,
+and those calendars cover nearly all widely queried data, including ERA5, GPCP
+and the NCEP reanalyses. The model calendars stay as raw numbers rather than
+becoming plausible-looking wrong dates. `decode_times := false` restores the
+numbers everywhere.
+
+### 4. Claim only `.zarr` paths in `FROM`
+
+DuckDB offers every string in a `FROM` clause to each registered replacement
+scan. Checking the file system for every string would slow down unrelated
+queries, so the extension considers only strings ending in `.zarr`, and for
+local paths confirms with one file check. Other Zarr paths remain reachable
+through `read_zarr(path)`.
+
+### 5. Read synchronously
+
+zarrs has an asynchronous interface, but DuckDB's table-function callbacks are
+synchronous, and bridging the two would mean running an async runtime inside
+each scan. Reads are synchronous. This can be revisited if network latency
+comes to dominate remote queries.
+
+### 6. Mixed chunk shapes share a work-unit grid
+
+Three options were considered: refuse tables whose variables are chunked
+differently, plan on the largest chunks and read the other arrays as subsets,
+or iterate row by row. Refusing was the first implementation, and it turned
+out to block common data, including NCEP reanalysis stores and the `obs`
+table of any large AnnData store. Row-by-row iteration would give up chunked
+reads. Planning on the largest chunks keeps the scan's structure and lets
+zarrs do the subset reads, at the cost of decoding some chunks twice when
+chunk boundaries do not line up (see [Mixed chunk
+shapes](#mixed-chunk-shapes)).
+
+### 7. Give placeholder names only to a single selected array
+
+AnnData and plain zarr-python write no dimension names. Naming such axes
+`dim_0`, `dim_1`, ... everywhere would let two unrelated arrays of the same
+length share `dim_0`, land in one table and be joined row by row, returning
+wrong data with no error. So placeholder names are given only when
+`array_path :=` selects one array, where nothing can be misaligned, and a
+placeholder name never matches a coordinate array, even one called `dim_0`.
+Group reads leave unnamed arrays out. Arrays that name only some of their axes
+do not follow this decision yet (see [Known limits](#known-limits)). `read_zarr_metadata` shows both the
+declared names (`dims`) and the names an `array_path` read would use
+(`array_path_dims`), so neither column changes meaning between calls.
+
+### 8. Each group is a node, and a store maps to a database
+
+Earlier versions pooled the arrays of every group and grouped them by
+dimension names alone. That failed with a shape mismatch when two groups
+reused a dimension name with different lengths, and silently merged them when
+the lengths agreed. Reading one group at a time, with xarray's rules for
+inheriting coordinates and checking alignment, is the `DataTree` model, and
+following it lets xarray-sql and this extension agree on any store. Store maps
+to database, group to schema and table to table, the same catalog shape that
+DataFusion, the engine under xarray-sql, uses. `read_zarr_tables` publishes
+that mapping, and it is the whole contract between the two projects.
+
+The natural way to mount a store would be `ATTACH 'era5.zarr' AS era5 (TYPE
+ZARR)`. The C API has no hook for adding a new kind of database to `ATTACH`,
+and no way for an extension to run SQL on the caller's connection. A procedure
+that created the views through a second connection was prototyped and
+rejected: the extra connection kept DuckDB from ever releasing the database,
+which left database files locked after closing, for every user of the
+extension. `read_zarr_views` returns the statements instead, which costs the
+user one extra step and avoids the problem. This can be revisited if the C API
+gains storage extensions or a way to run SQL on a connection.
+
+### 9. AnnData: named axes, decoded encodings, stored entries
+
+Read as plain Zarr, an AnnData store gives no tables at all (it has no
+dimension names), integer codes instead of category labels, empty strings
+instead of `NULL` for nullable columns, and three unaligned arrays instead of
+each sparse matrix. Users can decode all of that in SQL, but the queries are
+long, and two easy mistakes return wrong data without an error. So the
+extension applies an AnnData layer inside every AnnData group. The main
+choices:
+
+- `obs` and `var` sit beside `X`. As groups of their own they would give
+  tables named `obs.obs` and `var.var`, and a root with no `obs` coordinate
+  for `X` to inherit. Beside `X` they are what an xarray `Dataset` of an
+  AnnData object would hold: `X(obs, var)`, `cell_type(obs)`,
+  `gene_symbol(var)`.
+- Names, not positions, label the axes. With each frame's index as the
+  coordinate, every table can be filtered and joined by cell or gene name
+  without a lookup join. Joins then compare strings, and a store with
+  duplicate names gives extra rows; AnnData warns about duplicates and
+  `obs_names_make_unique()` is a standard step, so the guide documents the
+  risk rather than switching to positions.
+- Embeddings stay long. The second axis of an `obsm` entry (the components
+  of a PCA or UMAP) has a different length in each entry, so each gets its own
+  dimension, `<key>_component`. DuckDB array columns were considered and
+  rejected, to keep every value scalar.
+- Sparse matrices read as stored entries. Expanding them to every cell
+  would turn a modest dataset into tens of millions of rows of zeros, and real
+  atlases are a thousand times larger. One row per stored entry is how
+  single-cell users already treat `X` in SQL. The cost is that averages over
+  cells must add the missing zeros back, for example by starting from the
+  `obs` table with a `LEFT JOIN` and averaging `COALESCE(X, 0)`. Two sparse
+  matrices with the same dimensions must share a table (decision 2), so the
+  table's rows are the union of their entries.
+- Any AnnData group, not just the root. SpatialData keeps its tables as
+  AnnData objects beside OME-Zarr images and Parquet files. Reading those
+  tables needs nothing SpatialData-specific, and DuckDB's `read_parquet`
+  already reads the rest, so the extension stays a Zarr reader.
+
+Not covered yet: `awkward-array` elements, data frames inside `uns`, and the
+global `obs` and `var` of a MuData store, which lie outside its AnnData
+modalities.
+
+### 10. Explicit coordinate ranges until `WHERE` can be pushed down
+
+Pushing `WHERE` conditions into the scan is the goal: it is what users of any
+database expect, and both xarray-sql and zarr-datafusion do it. The C API the
+extension uses has no hook for it, so `bounds :=` was added as an explicit
+stopgap. Its range logic resolves each bound against the coordinate values
+themselves, so descending axes (ERA5's latitude runs from 90 to -90) and
+unevenly spaced ones (pressure levels) need no special cases. Ranges are
+inclusive and checked row by row inside kept chunks. Integer and time values
+too large for a float to hold exactly are rejected rather than compared
+approximately.
+
+The plan for real pushdown, on DuckDB 2.0's v2 C API, reuses that logic: each
+accepted condition on a coordinate becomes a set of kept indices, which
+selects chunks and filters rows exactly as `bounds :=` does. The scan accepts
+only conditions it can apply exactly (comparisons with a constant, and `IN`
+lists), and uses any others only to skip chunks, leaving DuckDB to apply them.
+That second group includes `BETWEEN` and other two-sided ranges, which the v2
+API passes without saying whether their ends are inclusive
+([duckdb/duckdb#25391](https://github.com/duckdb/duckdb/issues/25391), open
+as of November 2026).
+`bounds :=` stays as an alias for at least one release after pushdown ships.
+
+### 11. Keep the Zarr reader independent of DuckDB
+
+Reading Zarr (store layout, DataTree and AnnData rules, decoding, CF time,
+range pruning) lives in a separate crate, `zarr-core`, whose public types
+contain no DuckDB or Arrow types. The DuckDB extension is an adapter on top.
+This keeps the conventions testable on their own and lets other engines reuse
+them.
+
+## Known limits
+
+The [Roadmap](#roadmap) covers the planned fixes for most of these.
+
+- No pushdown of `WHERE`. Every query reads every chunk of its table
+  unless it uses `bounds :=` (see [Filters and pruning](#filters-and-pruning)).
+- No statistics. The extension reports no row count, so DuckDB's optimizer
+  plans joins on its default guess, and no column statistics.
+- Chunks are decoded one at a time. A lock shared by all scan threads is
+  held during decoding.
+- A nonzero Zarr `fill_value` reads as `NULL` in arrays without CF
+  missing-value attributes, even where it is a real value.
+- `NaN` is not `NULL` unless the variable's sentinel is `NaN`.
+- Partly named arrays get placeholder names in table reads. A `null` entry in
+  `dimension_names` becomes `dim_<position>`, so such arrays can share a
+  table, contrary to decision 7.
+- Unsupported data types: NumPy `datetime64`, fixed-width strings, complex
+  and structured types.
+- Auxiliary coordinates are dropped. A 2-D `lat(y, x)` named in a
+  `coordinates` attribute does not become a column.
+- Model calendars stay numeric. `noleap`, `360_day`, `julian` and similar
+  time axes are not converted.
+- Coordinates are reloaded for every query, as is consolidated metadata.
+- Remote stores need consolidated metadata, except for single-array reads
+  with `array_path :=`.
+- Local paths do not work in DuckDB-Wasm.
+- A few arrays can drop out of a table without an error: an array with an
+  unsupported data type or codec whose metadata gives no readable shape, and
+  an AnnData encoded column whose values array zarrs cannot open. `read_zarr_metadata` still lists them.
+- `group_path :=` on a group with no arrays in or below it reports the group
+  as not found.
+- Read-only. The extension does not write Zarr.
+
+## Roadmap
+
+The aim is to work like any SQL table and to reach rough parity with
+[xarray-sql](https://github.com/alxmrs/xarray-sql) and
+[zarr-datafusion](https://github.com/jayendra13/zarr-datafusion). The items
+below are planned but not built. Each says which DuckDB C API it needs: the
+v1.5.6 API the extension uses today, or DuckDB 2.0's v2 API.
+
+The v2 API changes the plan, so its terms come first. In DuckDB 2.0 every v2
+function is marked unstable, so it may change between releases, and an
+extension built on it is tied to the DuckDB version it was built for. It also
+does not load in DuckDB 1.5. The
+`duckdb` Rust crate for 2.0 (version `1.20000.0`) includes bindings to it for
+loadable extensions, but its safe wrapper for table functions still covers
+only the v1 API, so the port means calling the v2 functions directly.
+
+### Expected of any database
+
+- Filter pushdown on coordinates (v2 API). Comparisons, `IN` and ranges on
+  dimension columns select chunks and rows, as decision 10 describes. Pushed
+  conditions could later select index ranges inside a chunk too, as
+  zarr-datafusion does, so that a narrow slice reads less than whole chunks.
+- Row counts for the optimizer (v1 and v2 APIs). DuckDB uses a table's row
+  count to plan joins and choose algorithms. A dense table's count is the
+  product of its shape, known exactly at bind; a sparse table's is the number
+  of stored entries, known after reading the matrices' index arrays. Both
+  sibling projects report exact counts. The extension reports none today.
+- Column statistics (not available in either C API). xarray-sql and
+  zarr-datafusion report exact minimum and maximum values for coordinates,
+  and xarray-sql reports null counts. The extension knows coordinate minima
+  and maxima exactly from the coordinate arrays, but neither DuckDB C API lets
+  a table function report per-column statistics. This needs a change in
+  DuckDB.
+- Parallel scans (v1 and v2 APIs). Both APIs support per-thread scan state,
+  which removes the shared lock described in [Threads](#threads). On the v2
+  API the scan can also declare that its rows have no particular order, which
+  lets DuckDB run its output in parallel.
+- Grouped aggregates by coordinate (v2 API). The v2 API lets a scan tell
+  DuckDB that its rows are already partitioned by some columns, so `GROUP BY`
+  on a coordinate could skip hashing. zarr-datafusion goes further and answers
+  `COUNT`, `MIN` and `MAX` from metadata.
+
+### Parity with xarray-sql and zarr-datafusion
+
+- `NaN` as `NULL`. xarray-sql returns floating-point `NaN` as `NULL`, which
+  matches how xarray users treat missing data. The extension keeps `NaN`
+  unless it is the variable's sentinel.
+- More data types: NumPy `datetime64` and `timedelta64`, and fixed-width byte
+  and Unicode strings. Both siblings read `datetime64`.
+- Dictionary-encoded coordinate columns (v1 API). Coordinate values repeat
+  heavily, and zarr-datafusion encodes them as dictionaries. The v1 API can
+  build dictionary vectors by slicing a vector with a selection vector.
+- Writing Zarr with `COPY ... TO 'out.zarr'` (v1 API copy functions), as
+  zarr-datafusion supports.
+- A `chunks :=` parameter to set the work-unit size, as xarray-sql's
+  `chunks=` sets its partitions.
+- Packed `float32` output. xarray decodes integers packed with `float32`
+  scale factors to `float32`; the extension always uses `DOUBLE`.
+- Model calendars (`noleap`, `360_day`, ...). xarray-sql keeps them as
+  numbers and offers a `cftime()` function for them.
+- Icechunk and virtual Zarr, which zarr-datafusion reads. Icechunk adds
+  Git-like versioning to Zarr; its Rust library is asynchronous only and opens
+  repositories and sessions rather than paths, so it needs an asynchronous
+  storage layer and a way to name snapshots in SQL. Virtual Zarr (Kerchunk and
+  VirtualiZarr manifests) presents existing NetCDF, HDF5 or GRIB2 files as
+  Zarr; their chunks live in other files at offsets given by a manifest, and
+  are often compressed in ways that are not Zarr codecs.
+
+### Smaller improvements
+
+- Cache coordinates and consolidated metadata across queries, keyed by store,
+  instead of reloading them in every bind. A configurable chunk cache (a
+  `SET` option, available in both APIs) is a possible follow-up.
+- Auxiliary coordinates as columns. Neither sibling exposes them (xarray-sql
+  drops them, zarr-datafusion treats them as data), but xarray's own
+  `to_dataframe()` does.
+
+### Blocked on DuckDB
+
+- `ATTACH 'store.zarr' (TYPE ZARR)`. Neither C API lets an extension add a
+  kind of database to `ATTACH` or create views on the caller's connection, so
+  `read_zarr_views` remains the way to mount a store (decision 8).
+- Column statistics, above.
+
+### Not planned
+
+- Substrait, a format for passing query plans between engines. A `read_zarr`
+  call is specific to DuckDB, so plans that use it cannot run elsewhere;
+  mounted views, which other engines could resolve by name, are a closer fit.
+- `variables :=` and `coords :=` parameters, from an early draft of this
+  design. Selecting columns in `SELECT` already limits what is decoded, and
+  neither sibling has an override for coordinate roles.
+
+## Related projects
+
+- [xarray-sql](https://github.com/alxmrs/xarray-sql) queries xarray datasets
+  with SQL through Apache DataFusion. This extension follows its table layout
+  and naming.
+- [zarr-datafusion](https://github.com/jayendra13/zarr-datafusion) reads Zarr
+  into DataFusion from Rust.
+- [zarrs](https://zarrs.dev/) is the Rust Zarr library this extension uses
+  for metadata, codecs and chunk decoding.
+
+## Where things live in the code
+
+| Concept | Location |
+|---|---|
+| Extension entry point, function registration | `src/lib.rs` |
+| `read_zarr`: bind, work units, scan, row writing | `src/read_zarr.rs` |
+| `read_zarr_metadata`, `read_zarr_tables`, `read_zarr_views` | `src/read_zarr_metadata.rs`, `src/read_zarr_tables.rs`, `src/read_zarr_views.rs` |
+| `group_path`, `array_path` parameter handling | `src/selection.rs` |
+| `FROM 'store.zarr'` | `src/replacement_scan.rs` |
+| Opening stores; DuckDB file system adapter | `src/zarr_reader/meta.rs`, `src/zarr_reader/duckdb_store.rs` |
+| Writing decoded values into DuckDB vectors | `src/zarr_reader/scan.rs`, `src/zarr_reader/types.rs` |
+| Groups, tables, coordinate inheritance, alignment, table names | `crates/zarr-core/src/tree.rs` |
+| Dimension names, CF roles, sentinels, packing | `crates/zarr-core/src/meta.rs` |
+| AnnData layout and encodings | `crates/zarr-core/src/anndata.rs`, `crates/zarr-core/src/sparse.rs` |
+| CF time | `crates/zarr-core/src/cftime.rs` |
+| `bounds :=` range pruning | `crates/zarr-core/src/bounds.rs` |
+| Consolidated metadata cache | `crates/zarr-core/src/consolidated_store.rs` |
+| SQL tests and fixtures | `test/sql/`, `scripts/generate_fixtures.py` |
+
+A few terms in the code differ from this document. A *node* is a group. A
+`Variable` is one column's source, which is one array or, for AnnData encoded
+columns, a group of arrays; its `Storage` says which. A `ScanPlan` is either
+one row per cell or one row per stored sparse entry. A `ColumnEncoding` is a
+decoding rule: plain, packed, CF time or categorical.
