@@ -93,6 +93,18 @@ async function navigationStyles(page) {
 
 /** Snapshot actual typography so example pages can be compared to the biology reference. */
 async function titleStyles(page) {
+  const layout = await page.locator('main h1').evaluate((heading) => {
+    const box = heading.getBoundingClientRect();
+    return {
+      height: box.height,
+      expectedHeight: 2 * parseFloat(getComputedStyle(heading).lineHeight),
+      gap: heading.nextElementSibling.getBoundingClientRect().top - box.bottom,
+      permalinkBoxes: [...heading.querySelectorAll('.headerlink')].reduce((total, link) => total + link.getClientRects().length, 0),
+    };
+  });
+  assert.equal(layout.permalinkBoxes, 0, 'Title permalinks must not add a glyph or an extra line.');
+  assert.ok(Math.abs(layout.height - layout.expectedHeight) < 2, 'Field-guide titles should occupy exactly two lines.');
+  assert.ok(layout.gap >= 0 && layout.gap <= 24, 'Introductory content should follow the title without a large gap.');
   return page.locator('main h1').evaluate((element) => {
     const style = getComputedStyle(element);
     return Object.fromEntries(['fontFamily', 'fontSize', 'fontWeight', 'lineHeight', 'letterSpacing', 'margin', 'color'].map((property) => [property, style[property]]));

@@ -51,7 +51,7 @@
     </nav>
   </aside>
   <main id="main-content" class="{% block main_class %}docs-content{% if page and page.meta.example_title %} example-content{% endif %}{% endblock %}" tabindex="-1">
-    {% if page and not page.is_homepage %}<p class="eyebrow">The field guide</p>{% endif %}
+    {% if page and not page.is_homepage %}<p class="eyebrow">field guide</p>{% endif %}
     {% block content %}{{ page.content }}{% endblock %}
     <footer class="page-footer">
       {% if page and page.previous_page %}<a href="{{ page.previous_page.url | url }}">← {{ page.previous_page.title }}</a>{% endif %}

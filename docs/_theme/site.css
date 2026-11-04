@@ -7,6 +7,8 @@
 .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap;border:0}.skip-link{position:fixed;top:-80px;left:18px;background:#fff;padding:12px;z-index:10}.skip-link:focus{top:12px}.guides-toggle{display:none;border:1px solid var(--border);background:transparent;color:var(--accent);padding:11px 14px;border-radius:4px;font-size:13px;white-space:nowrap}
 .docs-content.example-content h1,.biology-content .intro-copy h1{font-family:var(--serif);font-size:clamp(44px,5.6vw,70px);font-weight:400;line-height:1.12;letter-spacing:-.035em;margin:20px 0 22px;color:#20372f}
 .docs-content h1 .title-accent{display:block;color:var(--accent)}
+/* A permalink after the block accent would create an unwanted third title line. */
+.example-content h1 .headerlink{display:none}
 .example-content > h1 + p,.biology-content .example-subtitle{font-size:15px;font-weight:400;line-height:1.8;color:#20372f;margin:16px 0;max-width:none}
 .biology-layout{grid-template-columns:195px minmax(0,1fr)}.biology-content{min-width:0;max-width:none;margin:0;padding:0}.biology-content .intro{padding-top:0}
 @media(min-width:761px) and (max-width:1150px){.biology-content .workspace{grid-template-columns:1fr}.biology-content .plot{border-left:0;border-top:1px solid var(--border)}}
