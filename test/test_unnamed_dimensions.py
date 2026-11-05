@@ -71,6 +71,7 @@ def test_dims_label_positions_without_changing_values(connection, unnamed_store,
 
 
 def test_defaults_and_group_reads_are_unchanged(connection, unnamed_store):
+    """Keep default labels, catalog metadata, and group selection unchanged."""
     store, _, _ = unnamed_store
     cursor = connection.execute("SELECT * FROM read_zarr(?, array_path := 'plain')", [str(store)])
     assert [column[0] for column in cursor.description] == ["dim_0", "dim_1", "plain"]
@@ -84,6 +85,7 @@ def test_defaults_and_group_reads_are_unchanged(connection, unnamed_store):
 
 @pytest.mark.parametrize("names", [[], ["cells"], ["cells", "genes", "extra"]])
 def test_name_count_must_match_rank(connection, unnamed_store, names):
+    """Reject a supplied name list that does not match the array rank."""
     store, _, _ = unnamed_store
     with pytest.raises(duckdb.Error, match="2 dimensions"):
         connection.execute(
@@ -102,6 +104,7 @@ def test_name_count_must_match_rank(connection, unnamed_store, names):
     ),
 ])
 def test_dimension_names_must_be_valid_and_distinct(connection, unnamed_store, names):
+    """Reject invalid or case-insensitively repeated axis names."""
     store, _, _ = unnamed_store
     with pytest.raises(duckdb.Error, match="dimension names"):
         connection.execute(
@@ -111,6 +114,7 @@ def test_dimension_names_must_be_valid_and_distinct(connection, unnamed_store, n
 
 @pytest.mark.parametrize("names", [["row", "column"], ["dim_0", "dim_1"], ["row", None]])
 def test_declared_names_cannot_be_overridden(connection, unnamed_store, names):
+    """Preserve declared axes, including explicit dim_N and partial names."""
     store, root, values = unnamed_store
     if root.metadata.zarr_format == 2:
         root["plain"].attrs["_ARRAY_DIMENSIONS"] = names
@@ -130,6 +134,7 @@ def test_declared_names_cannot_be_overridden(connection, unnamed_store, names):
 
 
 def test_supplied_names_do_not_bind_sibling_coordinates(connection, unnamed_store):
+    """Keep integer positions even when a matching sibling array exists."""
     store, root, _ = unnamed_store
     root.create_array("cells", data=np.array([100, 200, 300]))
     assert connection.execute(
@@ -139,6 +144,7 @@ def test_supplied_names_do_not_bind_sibling_coordinates(connection, unnamed_stor
 
 
 def test_ome_axis_names_cannot_be_overridden(connection, unnamed_store):
+    """Protect axis names supplied by OME multiscales metadata."""
     store, root, _ = unnamed_store
     root.attrs["multiscales"] = [{
         "axes": [{"name": "y"}, {"name": "x"}], "datasets": [{"path": "plain"}],
@@ -150,6 +156,7 @@ def test_ome_axis_names_cannot_be_overridden(connection, unnamed_store):
 
 
 def test_anndata_axis_names_cannot_be_overridden(connection, unnamed_store):
+    """Protect the observation and variable axes recognized from AnnData."""
     store, root, values = unnamed_store
     root.attrs.update({"encoding-type": "anndata", "encoding-version": "0.1.0"})
     root.create_array("X", data=values)
@@ -160,6 +167,7 @@ def test_anndata_axis_names_cannot_be_overridden(connection, unnamed_store):
 
 
 def test_scalar_accepts_an_empty_dimension_list(connection, unnamed_store):
+    """Read a rank-zero array with its matching empty axis-name list."""
     store, root, _ = unnamed_store
     root.create_array("scalar", data=np.array(42, dtype="int32"))
     assert connection.execute(
@@ -168,6 +176,7 @@ def test_scalar_accepts_an_empty_dimension_list(connection, unnamed_store):
 
 
 def test_unusual_dimension_names_and_array_alias(connection, unnamed_store):
+    """Preserve spaces and quotes in names when using the array alias."""
     store, _, _ = unnamed_store
     cursor = connection.execute(
         'SELECT * FROM read_zarr(?, "array" := \'plain\', dims := ?) ORDER BY 1, 2',
@@ -175,3 +184,54 @@ def test_unusual_dimension_names_and_array_alias(connection, unnamed_store):
     )
     assert [column[0] for column in cursor.description] == ["cell ids", 'gene "names"', "plain"]
     assert len(cursor.fetchall()) == 12
+
+
+@pytest.mark.parametrize("array_path,names,value_name", [
+    ("plain", ["plain", "genes"], "plain_1"),
+    ("plain", ["PLAIN", "genes"], "plain_1"),
+    ("plain", ["plain", "PLAIN_1"], "plain_2"),
+    ("nested/plain", ["value", "genes"], "value_1"),
+    ("nested/plain", ["value", "VALUE_1"], "value_2"),
+    ("0", ["value", "genes"], "value_1"),
+    ("0", ["value", "VALUE_1"], "value_2"),
+    ("nested/plain", ["nested/plain", "genes"], "value"),
+])
+def test_value_column_is_distinct_from_a_supplied_axis(
+    connection, unnamed_store, store_path, array_path, names, value_name,
+):
+    """Deduplicate final aliases without hiding values or changing axis labels."""
+    _, root, values = unnamed_store
+    if array_path == "0":
+        root.create_array("0", data=values, chunks=(2, 3))
+    cursor = connection.execute(
+        "SELECT * FROM read_zarr(?, array_path := ?, dims := ?) ORDER BY 1, 2",
+        [store_path, array_path, names],
+    )
+    assert [column[0] for column in cursor.description] == names + [value_name]
+    assert cursor.fetchall() == [
+        (i, j, float(values[i, j])) for i in range(3) for j in range(4)
+    ]
+    # Only the fixed test-case identifier is interpolated, never input or data.
+    assert connection.execute(
+        f'SELECT "{value_name}" FROM read_zarr(?, array_path := ?, dims := ?) ORDER BY 1',
+        [store_path, array_path, names],
+    ).fetchall() == [(float(value),) for value in values.flat]
+
+
+def test_group_value_alias_is_distinct_from_a_dimension(connection, unnamed_store):
+    """Apply the same final-alias collision rule to ordinary group reads."""
+    store, root, values = unnamed_store
+    names = ["value", "genes"]
+    if root.metadata.zarr_format == 2:
+        array = root.create_array("0", data=values)
+        array.attrs["_ARRAY_DIMENSIONS"] = names
+    else:
+        root.create_array("0", data=values, dimension_names=names)
+    cursor = connection.execute(
+        "SELECT value, genes, value_1 FROM read_zarr(?, dims := ?) ORDER BY value, genes",
+        [str(store), names],
+    )
+    assert [column[0] for column in cursor.description] == names + ["value_1"]
+    assert cursor.fetchall() == [
+        (i, j, float(values[i, j])) for i in range(3) for j in range(4)
+    ]

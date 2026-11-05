@@ -530,9 +530,6 @@ fn table_with_dims<'a>(
     Ok(table)
 }
 
-/// Extract the ordered dimension names from a `dims` named-parameter value.
-///
-/// `dims` is a `LIST(VARCHAR)`, e.g. `read_zarr(store, dims=['time','lat','lon'])`.
 /// A single data-variable column selected by `array_path` has a numeric level
 /// name (`0`) or a nested store-relative path (`labels/nuclei/0`), both of which
 /// otherwise need SQL double-quoting. Surface it as `value` instead. Ordinary
@@ -541,6 +538,7 @@ fn needs_value_alias(name: &str) -> bool {
     name.contains('/') || name.parse::<u64>().is_ok()
 }
 
+/// Extract ordered, non-NULL names from a `dims` LIST(VARCHAR) parameter.
 fn parse_dims_param(value: Value) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let items = value
         .to_list()
@@ -581,6 +579,7 @@ enum ColumnNames {
     ArrayPath,
 }
 
+/// Resolve input arrays, register unique output names, and construct the scan plan.
 fn finish_bind(
     bind: &BindInfo,
     store: ZarrStore,
@@ -644,10 +643,10 @@ fn finish_bind(
             } else {
                 name.to_string()
             };
-        // Paths can collide too (`obs/obs` and `obs/Obs`); number the later one.
-        if collides && used.contains(&tree::fold_case(&display_name)) {
+        // Check the final output name, including `value` aliases, in both modes.
+        if !col.is_coord && used.contains(&tree::fold_case(&display_name)) {
             display_name = (1..)
-                .map(|n| format!("{name}_{n}"))
+                .map(|n| format!("{display_name}_{n}"))
                 .find(|candidate| !used.contains(&tree::fold_case(candidate)))
                 .expect("an unused suffix exists");
         }

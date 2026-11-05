@@ -141,6 +141,8 @@ names label integer positions; they do not bind sibling coordinate arrays or
 modify the store. Omitting `dims=` keeps `dim_0`, `dim_1`, and so on. Arrays
 with existing axis names still require `dims=` to match those names exactly.
 Group reads continue to use `dims=` only to select a table, not to invent axes.
+If a value-column name or its `value` alias conflicts with an axis name, it
+receives a numbered suffix such as `plain_1` or `value_1`; axis names stay unchanged.
 
 ### Coordinate bounds
 
