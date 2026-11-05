@@ -3,8 +3,8 @@
 # group: [zarr]
 #
 # Fixture: unsupported_dtype.zarr in scripts/generate_fixtures.py. `good` is a
-# float32 array of 4 zeros with no dimension_names (as plain zarr-python writes
-# it). `bad` has a data type zarrs does not know. See docs/design.md, decision 7.
+# float32 array of 4 zeros without optional dimension metadata. `bad` has a
+# data type zarrs does not know. See docs/design.md, decision 7.
 
 require zarr
 
@@ -37,6 +37,22 @@ query I
 SELECT SUM(good) FROM read_zarr('test/fixtures/xarray_tutorial/unsupported_dtype.zarr', array_path := 'good');
 ----
 0.0
+
+# Explicit names label positions only when array_path selects an unnamed array.
+query III
+SELECT COUNT(*), MIN(sample), MAX(sample) FROM read_zarr('test/fixtures/xarray_tutorial/unsupported_dtype.zarr', array_path := 'good', dims := ['sample']);
+----
+4	0	3
+
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/unsupported_dtype.zarr', array_path := 'good', dims := ['sample', 'extra']);
+----
+array 'good' has 1 dimensions, but dims= supplies 2 names
+
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/unsupported_dtype.zarr', array_path := 'good', dims := ['']);
+----
+dims= dimension names must be non-empty
 
 # A group read leaves unnamed arrays out, so this store's root has no data. The
 # error names the array and suggests array_path= (decision 8).

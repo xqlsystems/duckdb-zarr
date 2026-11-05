@@ -126,6 +126,24 @@ Named arguments stay close to xarray's vocabulary (`variables`, `coords`, `chunk
 
 `array_path` adds an unambiguous selector for multiscale OME-Zarr levels and nested labels. The same selector is accepted by `read_zarr_metadata` and `read_zarr_tables`. A quoted `"array"` alias is also registered; the quotes are required because `ARRAY` is a DuckDB keyword. `table_name` selects a table by the name `read_zarr_tables` gives it, ignoring case like DuckDB identifiers; its quoted alias is `"table"`, because `TABLE` is a keyword too. It is the same as the table's `dims` list, which stays available, and a table whose name is `NULL` in the catalog (decision 8) can only be read by `dims`.
 
+When `array_path=` selects an array without dimension metadata or recognized
+OME-Zarr/AnnData axes, `dims=` can supply its axis names for this query:
+
+```sql
+SELECT sample, good
+FROM read_zarr('test/fixtures/xarray_tutorial/unsupported_dtype.zarr',
+  array_path := 'good', dims := ['sample'])
+ORDER BY sample;
+```
+
+Supply one non-empty, non-NULL name per axis, distinct ignoring case. These
+names label integer positions; they do not bind sibling coordinate arrays or
+modify the store. Omitting `dims=` keeps `dim_0`, `dim_1`, and so on. Arrays
+with existing axis names still require `dims=` to match those names exactly.
+Group reads continue to use `dims=` only to select a table, not to invent axes.
+If a value-column name or its `value` alias conflicts with an axis name, it
+receives a numbered suffix such as `plain_1` or `value_1`; axis names stay unchanged.
+
 ### Coordinate bounds
 
 `bounds := [[dim, lo, hi], ...]` selects inclusive ranges of stored numeric or
@@ -554,9 +572,9 @@ Within a dim group, two data variables might be chunked differently — e.g. `te
 
 ### 7. Arrays that declare no dimension names
 
-AnnData and plain zarr-python write neither `dimension_names` nor `_ARRAY_DIMENSIONS` ([issue #40](https://github.com/xqlsystems/duckdb-zarr/issues/40)), so `dimension_names()` rejected every array in such a store at bind, including a single-array `array_path=` read.
+Zarr arrays may omit both `dimension_names` and `_ARRAY_DIMENSIONS` ([issue #40](https://github.com/xqlsystems/duckdb-zarr/issues/40)); dimension names are optional, including for plain zarr-python writers. Before single-array fallbacks were added, `dimension_names()` rejected such arrays at bind, including an `array_path=` read.
 
-> **Decision:** When `array_path=` selects one array that declares no dimension names (and has no OME `multiscales.axes`), name its dimensions `dim_0..dim_{ndim-1}` (`synthesize_dim_names` in `meta.rs`). Whole-store enumeration (`read_zarr(store)`, the replacement scan, `read_zarr_tables` without `array_path=`) does not do this. Since decision 8 it leaves such arrays out of every table, and a group with no other data fails with an error that names them and suggests `array_path=`.
+> **Decision:** When `array_path=` selects one array that declares no dimension names (and has no OME `multiscales.axes`), name its dimensions `dim_0..dim_{ndim-1}` by default (`synthesize_dim_names` in `meta.rs`). An explicit `dims=` list can instead label those integer positions for one query ([issue #76](https://github.com/xqlsystems/duckdb-zarr/issues/76)); it never binds sibling coordinates. Whole-store enumeration (`read_zarr(store)`, the replacement scan, `read_zarr_tables` without `array_path=`) does not invent names. Since decision 8 it leaves such arrays out of every table, and a group with no other data fails with an error that names them and suggests `array_path=`.
 >
 > **Why only for `array_path=`:** a placeholder name carries no meaning. If enumeration gave placeholder names to every unnamed array, two unrelated arrays of the same length would both get `dim_0`, land in the same dim group, and be joined row by row. That returns wrong data with no error. With `array_path=` the user picks exactly one array, so nothing can be misaligned. For the same reason, a synthesized name never binds a coordinate array, even if a sibling array is called `dim_0`.
 >
