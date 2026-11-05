@@ -198,7 +198,8 @@ impl VTab for ReadZarrVTab {
                 // integer indices.
                 let array_names = crate::zarr_reader::meta::list_array_names(&store_path, &store)
                     .unwrap_or_default();
-                let (array_name, table) = array_path_table(&store, &array_names, &requested)?;
+                let (array_name, table) =
+                    array_path_table(&store, &array_names, &requested, requested_dims.as_deref())?;
                 if let Some(dims) = requested_dims {
                     if table.dims != dims {
                         return Err(format!(
@@ -544,6 +545,9 @@ fn parse_dims_param(value: Value) -> Result<Vec<String>, Box<dyn std::error::Err
     let items = value
         .to_list()
         .ok_or("dims must be a list of dimension names, e.g. dims=['time','lat','lon']")?;
+    if items.iter().any(Value::is_null) {
+        return Err("dims must contain non-null dimension names".into());
+    }
     Ok(items.iter().map(|item| item.to_string()).collect())
 }
 

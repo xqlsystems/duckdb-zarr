@@ -304,10 +304,13 @@ pub fn select_array_name(
 /// table: one array, or an AnnData encoded variable (a group of arrays read as
 /// one variable, see [`anndata::variable_table`]). With no listing (a remote
 /// store without consolidated metadata) the path is taken as an array.
+/// `fallback_dims` supplies names only for axes with no metadata-derived names;
+/// existing names, including those of encoded variables, are left unchanged.
 pub fn array_path_table(
     store: &ZarrStore,
     array_names: &[String],
     requested: &str,
+    fallback_dims: Option<&[String]>,
 ) -> Result<(String, Table), Box<dyn std::error::Error>> {
     let layout = if array_names.is_empty() {
         None
@@ -326,7 +329,7 @@ pub fn array_path_table(
     } else {
         select_array_name(array_names, requested)?
     };
-    let mut table = array_table(store, array_names, &name)?;
+    let mut table = array_table(store, array_names, &name, fallback_dims)?;
     // In an AnnData store an obs or var column belongs to the root, where its
     // data frame folds (decision 9), not to the group that stores it.
     if let Some(layout) = &layout {
@@ -389,13 +392,14 @@ pub fn first_chunk_shape(arr: &ZarrArray) -> Result<Vec<u64>, Box<dyn std::error
 ///
 /// Dimension names come from [`array_path_dims`]. For each declared name, the
 /// coordinate array is looked up in the selected array's parent group first, then
-/// at the store root. A dimension without a coordinate array reads as an integer
-/// index; that is the usual case for OME-Zarr, and always the case for a
-/// synthesized `dim_N`.
+/// at the store root. `fallback_dims` labels otherwise unnamed axes without
+/// binding coordinate arrays. Without it, unnamed axes use `dim_N` placeholders.
+/// In both cases the axis values are integer positions.
 pub fn array_table(
     store: &ZarrStore,
     array_names: &[String],
     array_name: &str,
+    fallback_dims: Option<&[String]>,
 ) -> Result<Table, Box<dyn std::error::Error>> {
     let arr = open_array(store, array_name)?;
     let shape = arr.shape().to_vec();
@@ -415,7 +419,35 @@ pub fn array_table(
                 .collect();
             (dims, coords)
         }
-        None => (synthesize_dim_names(shape.len()), Vec::new()),
+        None => {
+            let dims = match fallback_dims {
+                Some(dims) => {
+                    if dims.len() != shape.len() {
+                        return Err(format!(
+                            "array '{array_name}' has {} dimensions, but dims= supplies {} names",
+                            shape.len(),
+                            dims.len()
+                        )
+                        .into());
+                    }
+                    let mut used = HashSet::new();
+                    for dim in dims {
+                        if dim.trim().is_empty() || dim.contains('\0') {
+                            return Err("dims= dimension names must be non-empty and contain no NUL characters".into());
+                        }
+                        if !used.insert(tree::fold_case(dim)) {
+                            return Err(format!(
+                                "dims= dimension names must be distinct ignoring case: '{dim}' is repeated"
+                            )
+                            .into());
+                        }
+                    }
+                    dims.to_vec()
+                }
+                None => synthesize_dim_names(shape.len()),
+            };
+            (dims, Vec::new())
+        }
     };
 
     Ok(Table {
@@ -1095,8 +1127,8 @@ mod tests {
 
     #[test]
     fn array_path_synthesizes_dims_but_group_enumeration_leaves_the_array_out() {
-        // AnnData and zarr-python write neither `dimension_names` nor
-        // `_ARRAY_DIMENSIONS` (issue #40). One array selected with array_path= gets
+        // Arrays may omit optional `dimension_names` and `_ARRAY_DIMENSIONS`
+        // metadata (issue #40). One array selected with array_path= gets
         // dim_0, dim_1, ... Enumerating a group must never do that: with placeholder
         // names, unrelated arrays of the same length would be joined row by row. The
         // array is left out of every table and reported as unnamed instead.
@@ -1108,7 +1140,7 @@ mod tests {
         });
         let names = vec!["X".to_string()];
 
-        let table = array_table(&store, &names, "X").unwrap();
+        let table = array_table(&store, &names, "X", None).unwrap();
         assert_eq!(table.dims, vec!["dim_0", "dim_1"]);
 
         let node = tree::StoreTree::load(&store, &names, None)
@@ -1116,6 +1148,36 @@ mod tests {
             .tables("");
         assert!(node.tables.is_empty(), "{:?}", node.tables);
         assert_eq!(node.unnamed, vec!["X"]);
+    }
+
+    #[test]
+    fn supplied_dims_label_only_unnamed_axes() {
+        let store = store_with_array_json("plain", {
+            let mut d = array_doc("float32", serde_json::json!(0.0));
+            d["shape"] = serde_json::json!([3, 4]);
+            d["chunk_grid"]["configuration"]["chunk_shape"] = serde_json::json!([2, 3]);
+            d
+        });
+        let names = vec!["plain".to_string()];
+        let dims = vec!["cells".to_string(), "genes".to_string()];
+        let (_, table) = array_path_table(&store, &names, "plain", Some(&dims)).unwrap();
+        assert_eq!(table.dims, dims);
+        assert_eq!(table.variables[0].dims.as_ref(), Some(&dims));
+        assert!(table.coords.is_empty());
+
+        let invalid = [
+            (vec!["cells"], "2 dimensions"),
+            (vec!["cells", "CELLS"], "distinct ignoring case"),
+            (vec!["", "genes"], "non-empty"),
+            (vec!["bad\0name", "genes"], "NUL"),
+        ];
+        for (dims, message) in invalid {
+            let dims = dims.into_iter().map(str::to_string).collect::<Vec<_>>();
+            let error = array_path_table(&store, &names, "plain", Some(&dims))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(message), "{error}");
+        }
     }
 
     #[test]
@@ -1141,7 +1203,7 @@ mod tests {
             d
         });
         let arr = open_array(&store, "X").unwrap();
-        let table = array_table(&store, &["X".to_string()], "X").unwrap();
+        let table = array_table(&store, &["X".to_string()], "X", None).unwrap();
         assert_eq!(array_path_dims(&store, None, &arr, "X"), table.dims);
         assert_eq!(table.dims, vec!["dim_0", "dim_1"]);
     }
@@ -1164,7 +1226,7 @@ mod tests {
         );
         let store: ZarrStore = store;
         let names = vec!["g/X".to_string(), "g/dim_0".to_string()];
-        let table = array_table(&store, &names, "g/X").unwrap();
+        let table = array_table(&store, &names, "g/X", None).unwrap();
         assert_eq!(table.dims, vec!["dim_0", "dim_1"]);
         assert!(table.coords.is_empty(), "{:?}", table.coords);
     }
