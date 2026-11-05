@@ -142,6 +142,7 @@ impl VTab for ReadZarrVTab {
     type BindData = ReadZarrBind;
     type InitData = ReadZarrInit;
 
+    /// Resolve the requested array or group and construct its SQL-visible scan.
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
         let path_val = bind.get_parameter(0);
         let store_path = path_val.to_string();

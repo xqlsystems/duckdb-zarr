@@ -82,6 +82,7 @@ impl PositionalDimensions {
 mod tests {
     use super::*;
 
+    /// Preserve supplied spelling while keeping the parsed axes positional.
     #[test]
     fn parses_supplied_names_without_changing_spelling() {
         let names = vec!["cell ids".to_string(), "Gene \"names\"".to_string()];
@@ -92,6 +93,7 @@ mod tests {
         assert_eq!(parsed.into_names(), names);
     }
 
+    /// Reject wrong ranks, blank names, NUL bytes, and case-folded duplicates.
     #[test]
     fn rejects_invalid_supplied_names() {
         let cases = [
@@ -110,6 +112,7 @@ mod tests {
         }
     }
 
+    /// Check rank first, then preserve left-to-right precedence for name errors.
     #[test]
     fn invalid_names_preserve_error_precedence() {
         let cases = [
@@ -143,6 +146,7 @@ mod tests {
         }
     }
 
+    /// Keep stored axes unchanged even when fallback labels are unusable.
     #[test]
     fn declared_names_keep_their_provenance_and_ignore_fallbacks() {
         let fallbacks = [vec!["duplicate", "DUPLICATE"], vec!["wrong_length"]];
@@ -166,6 +170,7 @@ mod tests {
         }
     }
 
+    /// Generate positional defaults and accept an empty name list for scalars.
     #[test]
     fn defaults_and_scalar_axes_remain_positional() {
         for (rank, supplied, expected) in [
@@ -181,6 +186,7 @@ mod tests {
         }
     }
 
+    /// Keep parsed names valid even if the original input is later mutated.
     #[test]
     fn parsed_names_own_their_validity() {
         let mut names = vec!["cells".to_string(), "genes".to_string()];

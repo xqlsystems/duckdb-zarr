@@ -1098,6 +1098,7 @@ mod tests {
         })
     }
 
+    /// Synthesize axes only for selected arrays, never to align unrelated group data.
     #[test]
     fn array_path_synthesizes_dims_but_group_enumeration_leaves_the_array_out() {
         // Arrays may omit optional `dimension_names` and `_ARRAY_DIMENSIONS`
@@ -1123,6 +1124,7 @@ mod tests {
         assert_eq!(node.unnamed, vec!["X"]);
     }
 
+    /// Build positional axes from valid supplied names and reject malformed lists.
     #[test]
     fn supplied_dims_label_only_unnamed_axes() {
         let store = store_with_array_json("plain", {
@@ -1167,6 +1169,7 @@ mod tests {
         assert_eq!(dimension_names(&arr, "a").unwrap(), vec!["x", "dim_1"]);
     }
 
+    /// Keep metadata defaults aligned with the axes used for single-array reads.
     #[test]
     fn array_path_dims_matches_what_read_zarr_binds() {
         let store = store_with_array_json("X", {
@@ -1181,6 +1184,7 @@ mod tests {
         assert_eq!(table.dims, vec!["dim_0", "dim_1"]);
     }
 
+    /// Never treat a sibling named dim_N as an implicit coordinate.
     #[test]
     fn synthesized_dims_never_bind_a_coordinate_array() {
         // A sibling array that happens to be called `dim_0` is not a coordinate for
