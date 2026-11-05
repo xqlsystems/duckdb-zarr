@@ -9,6 +9,7 @@ pub mod bounds;
 pub mod cftime;
 pub mod consolidated_store;
 pub mod decode;
+mod dimensions;
 pub mod meta;
 pub mod sparse;
 pub mod tree;

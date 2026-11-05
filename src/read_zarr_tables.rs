@@ -160,7 +160,7 @@ pub(crate) fn catalog_rows(
     let (store_tree, nodes) = match selection {
         Selection::Array(requested) => {
             // One array is not a table of its node, so it gets no table name.
-            let (array_name, table) = array_path_table(&store, &array_names, &requested)?;
+            let (array_name, table) = array_path_table(&store, &array_names, &requested, None)?;
             let node = table.variables.first().map_or_else(
                 || tree::node_of(&array_name).to_string(),
                 |var| var.node.clone(),

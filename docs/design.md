@@ -253,6 +253,23 @@ are then named `dim_0`, `dim_1`, and so on, which is safe because only one
 array is involved. If a group has no other data, `read_zarr` fails with an
 error that names the unnamed arrays and suggests `array_path :=`.
 
+Pass `dims :=` alongside `array_path :=` to replace those placeholder names
+with your own, one non-empty, non-NULL name per axis, distinct ignoring case:
+
+```sql
+SELECT sample, good
+FROM read_zarr('test/fixtures/xarray_tutorial/unsupported_dtype.zarr',
+  array_path := 'good', dims := ['sample'])
+ORDER BY sample;
+```
+
+The names still label integer positions; they do not bind sibling coordinate
+arrays or modify the store. Omitting `dims :=` keeps `dim_0`, `dim_1`, and so
+on. An array that already has axis names still requires `dims :=` to match
+those names exactly — it cannot relabel them. If a value column's name or its
+`value` alias then conflicts with a supplied axis name, it gets a numbered
+suffix such as `plain_1` or `value_1`, leaving the axis name unchanged.
+
 An array that names some of its axes but leaves others empty (a `null` entry
 in `dimension_names`) is treated differently: the empty entries become
 `dim_<position>` even in table reads, so two such arrays can end up sharing a
@@ -934,8 +951,11 @@ length share `dim_0`, land in one table and be joined row by row, returning
 wrong data with no error. So placeholder names are given only when
 `array_path :=` selects one array, where nothing can be misaligned, and a
 placeholder name never matches a coordinate array, even one called `dim_0`.
-Group reads leave unnamed arrays out. Arrays that name only some of their axes
-do not follow this decision yet (see [Known limits](#known-limits)). `read_zarr_metadata` shows both the
+Group reads leave unnamed arrays out. Since `dims :=` can replace those
+placeholder names for one query ([issue #76](https://github.com/xqlsystems/duckdb-zarr/issues/76)), the same restriction
+applies: the supplied names only relabel integer positions and never bind
+sibling coordinates. Arrays that name only some of their axes do not follow
+this decision yet (see [Known limits](#known-limits)). `read_zarr_metadata` shows both the
 declared names (`dims`) and the names an `array_path` read would use
 (`array_path_dims`), so neither column changes meaning between calls.
 
@@ -1162,6 +1182,10 @@ only the v1 API, so the port means calling the v2 functions directly.
 - Auxiliary coordinates as columns. Neither sibling exposes them (xarray-sql
   drops them, zarr-datafusion treats them as data), but xarray's own
   `to_dataframe()` does.
+- Binding a sibling coordinate array when `dims :=` names an axis of an
+  otherwise unnamed `array_path :=` read ([issue #76](https://github.com/xqlsystems/duckdb-zarr/issues/76)), so the axis could
+  read real values instead of integer positions. Deferred from the initial
+  `dims :=` naming to keep that change free of any new join-like behavior.
 
 ### Blocked on DuckDB
 
