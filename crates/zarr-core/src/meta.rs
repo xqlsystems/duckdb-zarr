@@ -8,6 +8,7 @@ use zarrs::storage::{Bytes, ReadableStorageTraits, StoreKey};
 
 use super::anndata;
 use super::consolidated_store::ConsolidatedCacheStore;
+use super::dimensions::ArrayDimensions;
 use super::tree;
 use super::types::{
     Categories, ColumnDef, ColumnEncoding, CoordArray, FillSentinel, FixedValues,
@@ -406,10 +407,10 @@ pub fn array_table(
     let declared = declared_dims(store, &arr, array_name)
         .or_else(|| anndata::axis_names_for_array(store, array_name, shape.len()));
     let chunk_shape = first_chunk_shape(&arr)?;
-    // A synthesized `dim_N` is a placeholder, not a name any coordinate array was
-    // written under, so only look up coordinates for declared names.
-    let (dims, coords) = match declared {
-        Some(dims) => {
+    let axes = ArrayDimensions::parse(array_name, shape.len(), declared, fallback_dims)?;
+    // Only metadata-declared names can identify stored coordinate arrays.
+    let (dims, coords) = match axes {
+        ArrayDimensions::Declared(dims) => {
             let coords = dims
                 .iter()
                 .filter_map(|dim| {
@@ -419,35 +420,7 @@ pub fn array_table(
                 .collect();
             (dims, coords)
         }
-        None => {
-            let dims = match fallback_dims {
-                Some(dims) => {
-                    if dims.len() != shape.len() {
-                        return Err(format!(
-                            "array '{array_name}' has {} dimensions, but dims= supplies {} names",
-                            shape.len(),
-                            dims.len()
-                        )
-                        .into());
-                    }
-                    let mut used = HashSet::new();
-                    for dim in dims {
-                        if dim.trim().is_empty() || dim.contains('\0') {
-                            return Err("dims= dimension names must be non-empty and contain no NUL characters".into());
-                        }
-                        if !used.insert(tree::fold_case(dim)) {
-                            return Err(format!(
-                                "dims= dimension names must be distinct ignoring case: '{dim}' is repeated"
-                            )
-                            .into());
-                        }
-                    }
-                    dims.to_vec()
-                }
-                None => synthesize_dim_names(shape.len()),
-            };
-            (dims, Vec::new())
-        }
+        ArrayDimensions::Positional(dims) => (dims.into_names(), Vec::new()),
     };
 
     Ok(Table {
