@@ -55,6 +55,9 @@ SELECT sql FROM read_zarr_views('test/fixtures/xarray_tutorial/era5_like.zarr', 
 
 ## Documentation
 
+The [documentation website](docs/website.md) wraps these guides in one navigable
+site, with live browser examples for biologists.
+
 - **Biology:** [AnnData annotated matrices](docs/anndata.md), including a
   cell-by-gene example and SpatialData table boundaries;
   [OME-Zarr bioimages](docs/ome-zarr.md).

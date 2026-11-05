@@ -56,3 +56,12 @@ LIMIT 10;
 Filters and aggregates over a full pyramid level scan every chunk (there is no
 sub-chunk filter pushdown yet), so keep remote exploratory queries bounded with
 `LIMIT` or use a coarse resolution level.
+
+The [duckdb-zarr for biologists browser example](../demos/biology/README.md)
+queries this original remote image at its full-resolution level `0`, with both
+channels displayed together in a rotating VTK.js volume. To avoid hundreds of
+serial chunk requests, the browser fetches the unchanged compressed objects
+in parallel and registers their original HTTPS URLs in DuckDB-Wasm memory.
+No prepared dataset or proxy is served by the site. The original Blosc/LZ4
+codec works in the tested WASM build; long unprefetched reads were transport
+latency, not evidence of a codec hang.

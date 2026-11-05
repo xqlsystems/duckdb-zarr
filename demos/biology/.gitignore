@@ -1,0 +1,6 @@
+node_modules/
+dist/
+public/data/
+public/zarr.duckdb_extension.wasm
+playwright-report/
+test-results/
