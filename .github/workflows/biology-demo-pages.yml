@@ -1,0 +1,122 @@
+#
+# Builds the existing Markdown guides and browser biology examples as one
+# cohesive documentation site, then publishes the combined GitHub Pages artifact.
+#
+# The extension is never rebuilt here: this workflow reuses the wasm_eh
+# artifact already produced by the Main Extension Distribution Pipeline.
+# Documentation changes deploy independently of Rust builds using the tested
+# run and checksum below, never a potentially incompatible "latest" artifact.
+#
+name: Documentation Pages
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - "scripts/build_docs.py"
+      - "scripts/test_docsite.py"
+      - "demos/biology/**"
+      - ".github/workflows/biology-demo-pages.yml"
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: >-
+          Optional replacement run containing the exact checksum-pinned wasm_eh
+          artifact. Leave empty to use tested run 40233921996. New binary versions
+          require updating the pin and checksum after browser verification.
+        required: false
+
+concurrency:
+  group: documentation-pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    name: Build documentation and biology examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22'
+
+      - name: Select the tested Main Distribution Pipeline run
+        id: source-run
+        env:
+          PINNED_RUN: '40233921996' # main at 473cb3b, tested with the pinned DuckDB-Wasm
+          REQUESTED_RUN: ${{ inputs.run_id }}
+        run: |
+          run_id="${REQUESTED_RUN:-$PINNED_RUN}"
+          if ! [[ "$run_id" =~ ^[0-9]+$ ]]; then
+            echo "::error::Run ID must contain only digits."
+            exit 1
+          fi
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Download that run's wasm_eh extension artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: zarr-v2.0.0-extension-wasm_eh
+          run-id: ${{ steps.source-run.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: demos/biology/public
+
+      - name: Verify the tested extension checksum
+        working-directory: demos/biology
+        run: sha256sum --check extension.sha256
+
+      - name: Install JS dependencies
+        working-directory: demos/biology
+        run: npm ci --ignore-scripts
+
+      - name: Test build inputs and artifact selection
+        run: uv run --no-project --with mkdocs==1.6.1 python -m unittest discover -s scripts -p test_docsite.py
+
+      - name: Test biology helpers
+        working-directory: demos/biology
+        run: npm run test:unit
+
+      - name: Build the combined static docsite
+        run: uv run scripts/build_docs.py
+
+      - name: Install Chromium for the real WASM reader smoke test
+        working-directory: demos/biology
+        run: npx playwright install --with-deps chromium
+
+      - name: Query the downloaded extension in the production browser build
+        working-directory: demos/biology
+        env:
+          DEMO_PREVIEW: '1'
+        run: npm test -- --grep 'real WASM reader'
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
+        with:
+          path: site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5
