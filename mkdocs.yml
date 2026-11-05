@@ -34,7 +34,7 @@ nav:
       - AnnData: anndata.md
       - OME-Zarr: ome-zarr.md
   - Reference:
-      - SQL and design: design.md
+      - How it works: design.md
       - Scientific domains: domains.md
   - Development:
       - Documentation website: website.md

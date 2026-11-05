@@ -37,6 +37,11 @@ GROUP BY month ORDER BY month;
 -- Select one array by its store-relative path (e.g. an OME-Zarr resolution level or nested label)
 SELECT * FROM read_zarr('test/fixtures/bioimage/ome_zarr/synthetic_multichannel.ome.zarr', array_path='0');
 
+-- An array without dimension names (plain zarr-python, no OME/AnnData layout) reads
+-- with positional dim_0, dim_1, ...; dims= can label those positions for this query
+SELECT sample, good FROM read_zarr('test/fixtures/xarray_tutorial/unsupported_dtype.zarr',
+  array_path := 'good', dims := ['sample']) ORDER BY sample;
+
 -- List a store's tables, then read one by name
 SELECT table_name, dims, data_vars FROM read_zarr_tables('test/fixtures/xarray_tutorial/multi_dim_group.zarr');
 SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/multi_dim_group.zarr', table_name := 'time_lat_lon') LIMIT 5;
@@ -48,7 +53,8 @@ SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/datatree.zarr', group_pat
 SELECT cell_type, COUNT(*) FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr', table_name := 'obs') GROUP BY ALL;
 
 -- Get the statements that mount every table as a view (era5.main.surface, ...),
--- then run them; docs/design.md, "Mounting a store as views", shows how from Python and the CLI
+-- then run them; docs/design.md, "Workaround: generate the views with read_zarr_views",
+-- shows how from Python and the CLI.
 SELECT sql FROM read_zarr_views('test/fixtures/xarray_tutorial/era5_like.zarr', 'era5',
   view_names := MAP {'time_latitude_longitude': 'surface'});
 ```

@@ -324,7 +324,7 @@ def main() -> None:
     # ── air_temperature_gradient (synthetic, small) ──────────────────────────
     # Tests: scale_factor/add_offset packed decoding (Tair as int16), PLUS
     # mixed chunk shapes in one table (Tair chunk [1,4,6] != dTdx chunk [2,4,6]),
-    # read on the largest-chunk work-unit grid (docs/design.md, decision 6).
+    # read on the largest-chunk work-unit grid (docs/design.md, "Mixed chunk shapes").
     # Uses a small synthetic array so the fixture stays tiny.
     print("air_temperature_gradient (synthetic, small)...")
     rng = np.random.default_rng(1)

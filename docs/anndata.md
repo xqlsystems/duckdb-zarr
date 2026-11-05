@@ -282,7 +282,20 @@ positions. For example, `array_path := 'obs/n_genes'` gives the columns `obs`
 (0 to 19) and `value`. An array inside an encoded group has no AnnData
 dimensions. Its dimensions are `dim_0`, `dim_1`, and so on. For example,
 `array_path := 'obs/cell_type/codes'` gives the integer codes in the columns
-`dim_0` and `value`, and the categories are not applied.
+`dim_0` and `value`, and the categories are not applied. Pass `dims :=` to
+replace that placeholder with a more useful name for this query:
+
+```sql
+SELECT cell, value
+FROM read_zarr('test/fixtures/anndata/pbmc_like.zarr',
+  array_path := 'obs/cell_type/codes', dims := ['cell'])
+ORDER BY cell;
+```
+
+The value is still the raw category code; it does not become a coordinate,
+and `dims :=` cannot rename the already-named `obs`/`var` dimensions of an
+ordinary AnnData table read. See [How duckdb-zarr works](design.md#arrays-without-dimension-names)
+for the full rules.
 
 `read_zarr_metadata` lists every array. The `array_path_dims` column gives the
 dimension names that `array_path :=` uses for each array. With `group_path :=`,
