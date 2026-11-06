@@ -4,6 +4,8 @@
 
 A DuckDB extension for querying Zarr-format scientific arrays with SQL.
 
+Read [How it works](design.md) for the array-to-table model and SQL reference.
+
 ## What It Does
 
 **duckdb-zarr** extends DuckDB with the ability to query Zarr arrays directly using SQL. [Zarr](https://zarr.dev/) is a format for storing chunked, compressed N-dimensional arrays, widely used in scientific computing and big data applications—particularly in climate science, astronomy, genomics, and remote sensing.
@@ -81,7 +83,10 @@ This project is related to [xarray-sql](https://github.com/alxmrs/xarray-sql) an
   own S3/HTTPS store.
 - **Climate and geoscience:** [gridded-data quick start](#basic-usage) below;
   [tested atmospheric and ocean datasets](domains.md#climate-and-geoscience).
-- **General reference:** [design and SQL interfaces](design.md) and
+- **General reference:** [How duckdb-zarr works](design.md), including how
+  [arrays become tables](design.md#from-arrays-to-tables), the
+  [SQL interface](design.md#the-sql-interface),
+  [known limits](design.md#known-limits), and [roadmap](design.md#roadmap);
   [tested scientific domains](domains.md).
 
 ## Quick Start
@@ -148,15 +153,17 @@ and cannot be read as a table. `dims := ['x', 'y']` is an alternative to
 alias of `read_zarr_tables`.
 
 For arrays without dimension names, select one explicitly with `array_path :=`.
-Its unnamed axes become integer-position columns `dim_0`, `dim_1`, and so on.
-Group tables omit these arrays rather than joining unrelated data by position.
+Its unnamed axes become integer-position columns `dim_0`, `dim_1`, and so on,
+or pass `dims :=` to label those positions yourself for this query. Group
+tables omit these arrays rather than joining unrelated data by position.
 AnnData has its own axis naming and decoded tables; see the
-[AnnData guide](anndata.md).
+[AnnData guide](anndata.md). See [arrays without dimension
+names](design.md#arrays-without-dimension-names) for the full `dims :=` rules.
 
 To mount all readable tables as views, call `read_zarr_views(store, database)`
 and execute the returned SQL statements on the same connection. It returns
 SQL; it does not execute the statements itself. See the
-[Python and CLI mounting recipes](design.md#3-mounting-multi-table-stores-attach-and-read_zarr_views).
+[Python and CLI mounting recipes](design.md#workaround-generate-the-views-with-read_zarr_views).
 
 ### OME-Zarr Features
 

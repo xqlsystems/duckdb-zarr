@@ -74,6 +74,37 @@ async function projectLogos(page, home = false) {
   }
 }
 
+/** Keep the public concepts/SQL guide discoverable through the shared docsite. */
+async function publicReference(page, expectedBase) {
+  const navigation = page.getByRole('navigation', { name: 'Documentation guides', exact: true, includeHidden: true });
+  const guide = navigation.getByRole('link', { name: 'How it works', exact: true, includeHidden: true });
+  assert.equal(await guide.count(), 1, 'Publish the concepts/SQL guide under its public-facing name.');
+  assert.equal(await guide.evaluate((link) => link.closest('ul').previousElementSibling.textContent.trim()), 'Reference');
+  await openGuide(page, 'How it works');
+  assert.equal(page.url(), expectedBase + 'design/');
+  assert.equal((await page.locator('main h1').textContent()).replace(/¶$/, ''), 'How duckdb-zarr works');
+  assert.equal(await guide.getAttribute('aria-current'), 'page');
+  for (const id of ['background', 'from-arrays-to-tables', 'the-sql-interface', 'reading-values-correctly', 'known-limits', 'roadmap']) {
+    assert.equal(await page.locator(`main h2#${id}`).count(), 1);
+    assert.equal(await page.locator(`.page-toc a[href="#${id}"]`).count(), 1);
+  }
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), 'The public reference must fit desktop and mobile layouts.');
+  await openGuide(page, 'Start here');
+  const introduction = page.locator('main');
+  const overview = introduction.locator('h1 + p + p').getByRole('link', { name: 'How it works', exact: true });
+  assert.equal(await overview.count(), 1, 'Link to How it works directly below the Start here introduction.');
+  await overview.click();
+  await page.waitForLoadState('load');
+  assert.equal(page.url(), expectedBase + 'design/');
+  await openGuide(page, 'Start here');
+  const entry = introduction.getByRole('link', { name: 'How duckdb-zarr works', exact: true });
+  assert.equal(await entry.count(), 1);
+  assert.equal(new URL(await entry.getAttribute('href'), page.url()).href, expectedBase + 'design/');
+  for (const id of ['from-arrays-to-tables', 'the-sql-interface', 'known-limits', 'roadmap']) {
+    assert.equal(await introduction.locator(`a[href="design/#${id}"]`).count(), 1);
+  }
+}
+
 /** Compare the shared navigation's typography and spacing across guide and app pages. */
 async function navigationStyles(page) {
   await projectLogos(page);
@@ -211,10 +242,15 @@ try {
   assert.equal(await page.locator('main a[href="https://github.com/xqlsystems/xarray-sql"]').count(), 1);
   assert.equal(await page.locator('main pre code').filter({ hasText: 'AVG(air) AS mean_air' }).count(), 1);
   assert.ok(search.docs.some((doc) => doc.location.startsWith('#thinking-in-arrays-and-sql')), 'The main-page introduction must be searchable.');
+  for (const id of ['the-sql-interface', 'known-limits', 'roadmap']) {
+    assert.ok(search.docs.some((doc) => doc.location === `design/#${id}`), 'The public reference sections must be searchable.');
+  }
+  await publicReference(page, base);
   const docsPalette = await page.evaluate(() => ({ color: getComputedStyle(document.documentElement).color, background: getComputedStyle(document.documentElement).backgroundColor, heading: getComputedStyle(document.querySelector('h1')).fontFamily }));
   await projectLogos(page, true);
   const docsNavigation = await navigationStyles(page);
   await page.setViewportSize({ width: 390, height: 844 });
+  await publicReference(page, base);
   await projectLogos(page, true);
   const mobileNavigation = await navigationStyles(page);
   await page.getByRole('searchbox', { name: 'Search documentation' }).fill('AnnData');
@@ -368,6 +404,7 @@ try {
     const href = await page.locator('main').getByRole('link', { name: label, exact: true }).getAttribute('href');
     assert.equal(new URL(href, page.url()).href, origin + '/' + path);
   }
+  await publicReference(page, origin + '/');
   await page.goto(base + 'domains/');
   assert.deepEqual((await page.locator('main h2').allTextContents()).slice(0, 3).map((title) => title.replace(/¶$/, '')), ['Biology', 'Climate', 'Geoscience']);
   assert.equal(await page.locator('main #climate-and-geoscience').count(), 1, 'Keep existing combined-section links working.');

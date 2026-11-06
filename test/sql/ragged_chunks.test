@@ -4,7 +4,7 @@
 #
 # zarrs pads the element buffer of a boundary chunk to the full chunk shape, with fill
 # values past the edge of the array. The scan must skip that padding, for strings as
-# well as numbers (docs/design.md, Variable-length strings). Fixture: `ragged_chunks`
+# well as numbers (docs/design.md, "Scan: from a chunk to rows"). Fixture: `ragged_chunks`
 # in scripts/generate_fixtures.py.
 #
 #   s, v  (r=5, c=3) chunks (2, 2)  ragged in both dims; s is a string array

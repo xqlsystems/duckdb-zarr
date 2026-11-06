@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- `read_zarr(array_path := ..., dims := [...])` labels the integer-position axes of an array that declares no dimension names, for that query only (#76). It does not bind a sibling coordinate array, and an array that already has declared names still requires `dims :=` to match them exactly. Supplied names must be non-empty, NUL-free and distinct ignoring case.
+
 ### Changed
 - Build and test against DuckDB 2.0.0 (`duckdb` crate `1.20000.0`) using the frozen v1.5.6 C API. The native adapter keeps `zarr_init_c_api` and emits `C_STRUCT` metadata with an API version of `v1.5.6`, rather than selecting DuckDB 2.0's incompatible v2 entrypoint. The same native binary is tested on DuckDB 1.5.6 and 2.0.0; older engines are not supported by this build.
 - Use the `v2.0-cyanoptera` extension CI tools and the explicit `lambda v: ...` SQL syntax supported by both target engines.

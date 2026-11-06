@@ -135,6 +135,18 @@ SHA-256 digest through the loader API, rather than trusting arbitrary archives.
 Stored, unencrypted, non-ZIP64 entries are supported; other ZIP formats fail
 explicitly.
 
+Both examples' SQL editors execute the edited SQL against the loaded
+extension; plotting still requires the columns used by each example. The
+sample queries already use named axes (AnnData's own axis naming and
+OME-Zarr's `multiscales` axes), so they do not need unnamed-axis labels.
+
+PR #77 adds query-local labels for otherwise unnamed axes selected with
+`array_path :=` — see [Arrays without dimension
+names](../../docs/design.md#arrays-without-dimension-names). The browser
+extension pinned above predates that change. Use a current native build for
+those examples; browser support requires updating the pinned WASM artifact
+and rerunning the browser checks first.
+
 OME sources must be public OME-NGFF Zarr v2 directories with a compatible
 `c,z,y,x` level `0` and metadata channel colors. Metadata are read from the new
 source, not inherited from the sample. Object counts, download size and render

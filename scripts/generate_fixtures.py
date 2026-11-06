@@ -3,7 +3,7 @@
 Generate Zarr v3 test fixtures from xarray tutorial datasets.
 
 Each fixture exercises one or more code paths in the Rust reader.
-See docs/design.md §Bind phase and §Type mapping for the requirements.
+See docs/design.md, "How a query runs" and "Reading values correctly", for the requirements.
 
 Usage:
     uv run scripts/generate_fixtures.py
@@ -323,9 +323,9 @@ def main() -> None:
 
     # ── air_temperature_gradient (synthetic, small) ──────────────────────────
     # Tests: scale_factor/add_offset packed decoding (Tair as int16), PLUS
-    # mismatched-chunk-shape bind error (Tair chunk [1,4,6] != dTdx chunk [2,4,6]).
-    # Uses a small synthetic array so the fixture stays tiny; the bind error fires
-    # before any chunk is read, so shape matters but actual data does not.
+    # mixed chunk shapes in one table (Tair chunk [1,4,6] != dTdx chunk [2,4,6]),
+    # read on the largest-chunk work-unit grid (docs/design.md, "Mixed chunk shapes").
+    # Uses a small synthetic array so the fixture stays tiny.
     print("air_temperature_gradient (synthetic, small)...")
     rng = np.random.default_rng(1)
     shape = (4, 4, 6)
@@ -422,7 +422,7 @@ def main() -> None:
     # array shape — (3, 5) dims with (2, 3) chunks, so the last row-chunk and
     # last col-chunk are both boundary chunks padded past the array's logical
     # bound. Exercises the zarrs_flat physical-offset math against a
-    # Vec<String> decode buffer (see docs/design.md, "Variable-length strings").
+    # Vec<String> decode buffer (see docs/design.md, "Scan: from a chunk to rows").
     print("string_var_v3_2d (synthetic)...")
     n_row, n_col = 3, 5
     row_idx = np.arange(n_row, dtype="int64")
@@ -1147,7 +1147,7 @@ def main() -> None:
     # ── ragged_chunks (synthetic) ────────────────────────────────────────────
     # Tests: boundary chunks whose extent is smaller than the nominal chunk shape —
     # every other fixture is a single chunk. zarrs pads a boundary chunk's element
-    # buffer to the full nominal shape (design.md §Variable-length strings), for
+    # buffer to the full nominal shape (design.md, "Scan: from a chunk to rows"), for
     # strings as much as numbers, and the reader's offset math must skip the padding.
     #   s, v  (r=5, c=3), chunks (2, 2): ragged in BOTH dims; s is a string array
     #   t     (i=10),     chunks (4,):   ragged 1-D string array (4, 4, 2)
