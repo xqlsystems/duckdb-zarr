@@ -120,6 +120,13 @@ make generate_fixtures
 
 Fixture generation uses [uv](https://docs.astral.sh/uv/) with the dependencies declared in `pyproject.toml`. Install uv with `pip install uv` or via your system package manager.
 
+## Benchmarks
+
+Run `make benchmark` for an opt-in native release benchmark with no network data.
+It checks all results against NumPy and saves timings plus environment details in
+`benchmark/results/latest.json`. Normal tests do not run it. See the
+[benchmark guide](benchmark/README.md) for the workload, measurement limits and CI history setup.
+
 ## Loading (once built)
 
 ```sh

@@ -1,0 +1,120 @@
+name: Native benchmarks
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - "extension-ci-tools"
+      - "Makefile"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "test/conftest.py"
+      - "test/test_benchmarks.py"
+      - "benchmark/**"
+      - ".github/workflows/benchmarks.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - "extension-ci-tools"
+      - "Makefile"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "test/conftest.py"
+      - "test/test_benchmarks.py"
+      - "benchmark/**"
+      - ".github/workflows/benchmarks.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-benchmarks-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  benchmark:
+    name: Measure native release query
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build and measure with the Makefile's DuckDB pin
+        run: make benchmark
+      - name: Save raw measurements and environment
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-benchmark
+          path: benchmark/results/latest.json
+          retention-days: 90
+          if-no-files-found: warn
+
+  history:
+    name: Record trusted main-branch history
+    needs: benchmark
+    if: >-
+      github.repository == 'xqlsystems/duckdb-zarr' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: native-benchmark
+          path: benchmark/results
+      - name: Check the one-time history branch setup
+        id: history
+        run: |
+          if git ls-remote --exit-code --heads origin refs/heads/benchmark-history > /dev/null; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            status=$?
+            if [ "$status" -ne 2 ]; then
+              exit "$status"
+            fi
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Create benchmark-history from main to enable persistent history. Raw results remain in this run's artifact."
+            echo "History skipped: benchmark-history does not exist. See benchmark/README.md." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Append measurements without a timing gate
+        if: steps.history.outputs.ready == 'true'
+        uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc # v1.22.2
+        with:
+          name: duckdb-zarr native release
+          tool: pytest
+          ref: ${{ github.sha }}
+          output-file-path: benchmark/results/latest.json
+          gh-pages-branch: benchmark-history
+          benchmark-data-dir-path: benchmark
+          github-token: ${{ github.token }}
+          auto-push: true
+          summary-always: true
+          comment-on-alert: false
+          alert-threshold: '200%'
+          fail-on-alert: false

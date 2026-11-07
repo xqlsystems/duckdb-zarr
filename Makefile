@@ -1,4 +1,4 @@
-.PHONY: check_anndata clean clean_all clippy fmt fmt-check generate_fixtures lint release-check render-community-descriptor test_http test_http_debug test_http_release test_http_real test-rust wasm_toolchain test_duckdb_v1
+.PHONY: benchmark check_anndata clean clean_all clippy fmt fmt-check generate_fixtures lint release-check render-community-descriptor test_http test_http_debug test_http_release test_http_real test-rust wasm_toolchain test_duckdb_v1
 
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
@@ -95,6 +95,17 @@ release: build_extension_library_release build_extension_with_metadata_release
 test: test_debug
 test_debug: generate_fixtures test_extension_debug
 test_release: generate_fixtures test_extension_release
+
+# Keep measurements opt-in, on the release binary and the canonical engine pin.
+# Configure before the recursive build, including when make runs with -j.
+BENCHMARK_OUTPUT ?= benchmark/results/latest.json
+benchmark: configure
+	$(MAKE) release
+	@mkdir -p "$(dir $(BENCHMARK_OUTPUT))"
+	DUCKDB_ZARR_BENCHMARK_PROFILE=release uv run --locked --group benchmark \
+		--with "duckdb==$(DUCKDB_TEST_VERSION)" python -m pytest test/test_benchmarks.py \
+		-m benchmark --benchmark-only --extension build/release/$(EXTENSION_FILENAME) \
+		--benchmark-json="$(BENCHMARK_OUTPUT)"
 
 # Run AnnData and DataTree regressions in the normal test targets (including CI).
 # Honor the shared runner's skip flag: PyPI DuckDB cannot load every build ABI

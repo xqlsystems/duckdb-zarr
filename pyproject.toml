@@ -19,11 +19,16 @@ dev = [
     "prek>=0.4.5",
     "pytest",
 ]
+benchmark = [
+    "pytest-benchmark>=5.2,<6",
+]
 
 [tool.uv]
 package = false
 
 [tool.pytest.ini_options]
+addopts = "-m 'not benchmark'"
 markers = [
     "network: reads a real public store over the internet (skipped when unreachable)",
+    "benchmark: opt-in performance measurements, excluded from normal test runs",
 ]
