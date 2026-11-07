@@ -47,6 +47,8 @@ async function htmlFiles(directory) {
 
 /** Open a direct sidebar guide, expanding the mobile menu when needed. */
 async function openGuide(page, label) {
+  // Wait for the stylesheet before deciding whether the mobile toggle is visible.
+  await page.waitForLoadState('load');
   const toggle = page.getByRole('button', { name: 'Browse guides', exact: true });
   if (await toggle.isVisible() && await toggle.getAttribute('aria-expanded') !== 'true') await toggle.click();
   await page.getByRole('navigation', { name: 'Documentation guides', exact: true }).getByRole('link', { name: label, exact: true }).click();

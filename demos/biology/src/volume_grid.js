@@ -5,20 +5,32 @@ const MAX_DIMENSION = 512;
 const MAX_VOXELS = 20_000_000;
 const MAX_TEXTURE_BYTES = 256 * 1024 * 1024;
 const HISTOGRAM_BINS = 4096;
+const LITTLE_ENDIAN = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
+
+/** Read Arrow numbers without allocating a temporary BigInt for each 64-bit value.
+ * Keep both words: truncating to 32 bits would silently move large coordinates.
+ */
+function numberAt(column) {
+  if (column.nullCount) return (row) => column.get(row);
+  const values = column.toArray();
+  if (LITTLE_ENDIAN && (values instanceof BigInt64Array || values instanceof BigUint64Array)) {
+    const view = new DataView(values.buffer, values.byteOffset, values.byteLength);
+    const high = values instanceof BigInt64Array
+      ? (offset) => view.getInt32(offset, true)
+      : (offset) => view.getUint32(offset, true);
+    return (row) => view.getUint32(row * 8, true) + high(row * 8 + 4) * 0x100000000;
+  }
+  return (row) => values[row];
+}
 
 /** Visit finite Arrow coordinates batchwise, preserving SQL null gaps and clamping negative
  * signal only for display.
  */
 function visit(table, callback) {
   for (const batch of table.batches) {
-    const columns = ['c', 'x', 'y', 'z', 'value'].map((name) => batch.getChild(name));
-    const values = columns.map((column) => column.nullCount ? null : column.toArray());
+    const [channelAt, xAt, yAt, zAt, valueAt] = ['c', 'x', 'y', 'z', 'value'].map((name) => numberAt(batch.getChild(name)));
     for (let row = 0; row < batch.numRows; row++) {
-      const rawC = values[0] ? values[0][row] : columns[0].get(row);
-      const rawX = values[1] ? values[1][row] : columns[1].get(row);
-      const rawY = values[2] ? values[2][row] : columns[2].get(row);
-      const rawZ = values[3] ? values[3][row] : columns[3].get(row);
-      const rawValue = values[4] ? values[4][row] : columns[4].get(row);
+      const rawC = channelAt(row), rawX = xAt(row), rawY = yAt(row), rawZ = zAt(row), rawValue = valueAt(row);
       if (rawC == null || rawX == null || rawY == null || rawZ == null || rawValue == null) continue;
       const c = Number(rawC), x = Number(rawX), y = Number(rawY), z = Number(rawZ), value = Number(rawValue);
       if (!Number.isSafeInteger(c) || c < 0 || !Number.isSafeInteger(x) || !Number.isSafeInteger(y) || !Number.isSafeInteger(z) || !Number.isFinite(value)) continue;
