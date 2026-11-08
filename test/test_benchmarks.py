@@ -36,10 +36,11 @@ def provenance(extension_path, store, values):
         "cache": "warm_repeated_query; no OS cache flush",
         "dataset": {
             "kind": "synthetic", "seed": 0, "shape": list(values.shape),
+            "generator": "PCG64 signed 52-bit integers scaled by 2^-52",
             "chunks": metadata["chunk_grid"]["configuration"]["chunk_shape"],
             "zarr_format": metadata["zarr_format"], "dtype": str(values.dtype),
             "codecs": metadata["codecs"],
-            "values_sha256": hashlib.sha256(values.tobytes()).hexdigest(),
+            "values_sha256": hashlib.sha256(values.astype("<f8", copy=False).tobytes()).hexdigest(),
         },
         "versions": {name: version(name) for name in (
             "duckdb", "numpy", "xarray", "zarr", "pytest-benchmark",
@@ -51,7 +52,11 @@ def provenance(extension_path, store, values):
 @pytest.fixture(scope="module")
 def grid_store(tmp_path_factory):
     """Create a deterministic local Zarr grid outside the timed query."""
-    values = np.random.default_rng(0).normal(size=(100, 50, 50))
+    rng = np.random.Generator(np.random.PCG64(0))
+    # Exact binary fractions avoid platform-specific floating distribution math.
+    values = rng.integers(
+        -(1 << 52), 1 << 52, size=(100, 50, 50), dtype=np.int64,
+    ).astype(np.float64) * (2.0 ** -52)
     store = tmp_path_factory.mktemp("benchmark") / "grid.zarr"
     grid = xr.Dataset(
         {"temperature": (("time", "lat", "lon"), values)},
@@ -93,3 +98,8 @@ def test_groupby_mean_over_time(benchmark, grid_store, extension_path):
     assert benchmark.extra_info["dataset"]["shape"] == list(values.shape)
     assert benchmark.extra_info["threads"] == 1
     assert len(benchmark.extra_info["extension_sha256"]) == 64
+    # Freeze the workload before collecting history, including across machines.
+    expected_values_hash = "88df6a125832d307bd56087bb38804f855ffe93da6d2ca4ade2fbac57317a216"
+    actual_values_hash = hashlib.sha256(values.astype("<f8", copy=False).tobytes()).hexdigest()
+    assert actual_values_hash == expected_values_hash
+    assert benchmark.extra_info["dataset"]["values_sha256"] == expected_values_hash

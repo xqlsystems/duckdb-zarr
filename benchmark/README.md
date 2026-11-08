@@ -40,6 +40,13 @@ The synthetic fixture has a fixed seed and one float64 variable on a
 10 × 25 × 25 chunks. Its actual codec configuration and data hash are
 recorded in the report.
 
+Values come from explicit PCG64 integer draws scaled by a power of two, so
+each float is exactly representable. The test checks a fixed SHA-256 of their
+little-endian float64 bytes. This avoids the different fixture hashes observed
+with normal-distribution draws on ARM macOS and Linux x86-64. Changing this
+workload requires deliberately updating that fingerprint before collecting
+new history; do not compare it with the earlier normal-distribution prototype.
+
 The benchmark runs this query with one DuckDB thread:
 
 ```sql
