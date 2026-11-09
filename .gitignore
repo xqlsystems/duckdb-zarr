@@ -24,6 +24,10 @@ demos/*/test-results/
 # Generated documentation site
 /site/
 
+# Local benchmark measurements and pytest-benchmark's optional saved runs
+/benchmark/results/
+/.benchmarks/
+
 # CCE (code-context-engine)
 # CCE local cache (per-machine, not for version control)
 .cce/
