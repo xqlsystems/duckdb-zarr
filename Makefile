@@ -11,7 +11,7 @@ USE_UNSTABLE_C_API=0
 DUCKDB_CAPI_VERSION=v1.5.6
 
 # Engine used by CI and Python tests; distinct from the frozen C API version.
-TARGET_DUCKDB_VERSION=v2.0.0
+TARGET_DUCKDB_VERSION=v2.0.1
 
 # extension-ci-tools reads this before creating configure/venv. Keep Python
 # tests on the target engine even though the binary advertises the v1 C API.
@@ -107,7 +107,7 @@ test_debug test_release:
 			pytest test/test_anndata_edge_cases.py test/test_datatree_compatibility.py test/test_unnamed_dimensions.py test/test_bounds_integration.py test/test_duckdb_compatibility.py \
 			--extension build/$(patsubst test_%,%,$@)/$(EXTENSION_NAME).duckdb_extension -v; \
 	else \
-		$(PYTHON_VENV_BIN) -m pip install --quiet pytest && \
+		$(PYTHON_VENV_BIN) -m pip install --quiet pytest 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' && \
 		$(PYTHON_VENV_BIN) -m pytest test/test_anndata_edge_cases.py test/test_datatree_compatibility.py test/test_unnamed_dimensions.py test/test_bounds_integration.py test/test_duckdb_compatibility.py \
 			--extension build/$(patsubst test_%,%,$@)/$(EXTENSION_NAME).duckdb_extension -v; \
 	fi
