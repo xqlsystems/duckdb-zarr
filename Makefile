@@ -107,7 +107,7 @@ test_debug test_release:
 			pytest test/test_anndata_edge_cases.py test/test_datatree_compatibility.py test/test_unnamed_dimensions.py test/test_bounds_integration.py test/test_duckdb_compatibility.py \
 			--extension build/$(patsubst test_%,%,$@)/$(EXTENSION_NAME).duckdb_extension -v; \
 	else \
-		$(PYTHON_VENV_BIN) -m pip install --quiet pytest && \
+		$(PYTHON_VENV_BIN) -m pip install --quiet pytest 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' && \
 		$(PYTHON_VENV_BIN) -m pytest test/test_anndata_edge_cases.py test/test_datatree_compatibility.py test/test_unnamed_dimensions.py test/test_bounds_integration.py test/test_duckdb_compatibility.py \
 			--extension build/$(patsubst test_%,%,$@)/$(EXTENSION_NAME).duckdb_extension -v; \
 	fi
