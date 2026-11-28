@@ -79,11 +79,14 @@ build and query tests. Three pieces of automation support that process:
   `.github/workflows/rust-quality.yml` runs `scripts/check_release_ready.py` on
   every PR, so the DuckDB version pins can never merge out of sync.
 - **`DuckDB Version Drift`** (`.github/workflows/duckdb-version-drift.yml`) runs
-  **daily**. Within the current minor line it opens a `chore/bump-duckdb-*` PR
-  as soon as pip `duckdb` and the matching `duckdb` crate publish a new patch.
-  When a new **minor or major** DuckDB line appears (e.g. `1.5.x → 1.6.0`) it
-  opens a `duckdb-major-bump` tracking issue instead, because that is a manual
-  migration (new CI-tools codename branch, possible source changes).
+  **daily**. Within the current minor line it prepares a `chore/bump-duckdb-*`
+  branch as soon as pip `duckdb` and the matching `duckdb` crate publish a new
+  patch. Opening its PR also requires the repository setting that allows GitHub
+  Actions to create pull requests; if that setting is disabled, a maintainer
+  must open the PR from the generated branch. When a new **minor or major**
+  DuckDB line appears (e.g. `1.5.x → 1.6.0`) it opens a `duckdb-major-bump`
+  tracking issue instead, because that is a manual migration (new CI-tools
+  codename branch, possible source changes).
 - **`ref_next`** lets you pre-stage the next line so there is *no* gap at all —
   covered below.
 
@@ -141,10 +144,13 @@ The binary therefore advertises `C_STRUCT` with `v1.5.6` metadata and exports
 `zarr_init_c_api`. Advertising `C_STRUCT_UNSTABLE` on DuckDB 2.0 instead selects
 the incompatible `zarr_init_c_api_v2` entrypoint.
 
-`TARGET_DUCKDB_VERSION=v2.0.0` is the engine used by CI and Python tests, not
-the binary's API floor. The same native build has been tested on DuckDB 1.5.6
-and 2.0.0. Older engines are below its declared API floor. Other engines and
-platforms need their own validation; accepting the metadata is not a query test.
+`TARGET_DUCKDB_VERSION=v2.0.1` is the engine used by CI and Python tests, not
+the binary's API floor. The same native build has been tested on DuckDB 1.5.6,
+2.0.0, and 2.0.1. Older engines are below its declared API floor. Other engines
+and platforms need their own validation; accepting the metadata is not a query
+test. A compatible patch release does not by itself require a new extension
+release: check that the published extension actually loads and queries data on
+the new engine before deciding to publish.
 
 A target-engine bump must update these pins in one reviewed change:
 
@@ -165,10 +171,10 @@ push changes to files under `.github/workflows/` under any `permissions` grant
 go stale. One pin site, the Makefile, keeps the automated path working.
 
 The `duckdb` crate version encodes the engine's major, minor and patch numbers:
-`v1.5.6` maps to `1.10506.0`, and the current `v2.0.0` maps to:
+`v1.5.6` maps to `1.10506.0`, and the current `v2.0.1` maps to:
 
 ```toml
-duckdb = { version = "=1.20000.0", features = ["loadable-extension"] }
+duckdb = { version = "=1.20001.0", features = ["loadable-extension"] }
 ```
 
 Do not bump `DUCKDB_CAPI_VERSION` with a routine engine update. It describes the
